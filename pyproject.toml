@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "flatworld"
 version = "0.1.0"
 description = "Taichi-based 2D/3D physics engine with FEM, rigid bodies, and mixed contact"
-readme = "Readme.md"
+readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [{ name = "Dongyu Liu" }]
