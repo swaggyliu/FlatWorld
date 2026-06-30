@@ -220,4 +220,4 @@ class MeshRigid(RigidBase):
 
         # 2D: draw edges (stored as [n0, n1, -1])
         a, b = elements[:, 0], elements[:, 1]
-        gui.lines(pos[a] - node_offset, pos[b] - node_offset, radius=2, color=color)
+        gui.lines(pos[a - node_offset], pos[b - node_offset], radius=2, color=color)
