@@ -1,4 +1,5 @@
 import taichi as ti
+from gjk import gjk_epa_collision
 
 
 # ===== 2D SAT helpers (explicit coordinates) =====
@@ -134,6 +135,48 @@ def obb2d_signed_distance_quad_vs_quad(a0, a1, a2, a3, b0, b1, b2, b3):
             n_axis = -n_axis
         signed = -best_pen
     return signed, n_axis
+
+
+@ti.func
+def obb2d_contact_quad_vs_quad(center_a, half_ext_a, rot_a, center_b, half_ext_b, rot_b):
+    """Resolve penetrating 2D OBB-OBB contact (depth, normal, point on mid-surface)."""
+    hit = 0
+    penetration = 0.0
+    normal = ti.Vector([1.0, 0.0])
+    cpoint = (center_a + center_b) * 0.5
+
+    params_a = ti.math.vec4(half_ext_a[0], half_ext_a[1], 0.0, 0.0)
+    params_b = ti.math.vec4(half_ext_b[0], half_ext_b[1], 0.0, 0.0)
+    center_a3 = ti.math.vec3(center_a[0], center_a[1], 0.0)
+    center_b3 = ti.math.vec3(center_b[0], center_b[1], 0.0)
+    rot_a3 = ti.math.mat3(
+        [[rot_a[0, 0], rot_a[0, 1], 0.0], [rot_a[1, 0], rot_a[1, 1], 0.0], [0.0, 0.0, 1.0]]
+    )
+    rot_b3 = ti.math.mat3(
+        [[rot_b[0, 0], rot_b[0, 1], 0.0], [rot_b[1, 0], rot_b[1, 1], 0.0], [0.0, 0.0, 1.0]]
+    )
+
+    has_collision, penetration_depth, contact_normal, contact_point_a, contact_point_b = gjk_epa_collision(
+        0,
+        center_a3,
+        params_a,
+        rot_a3,
+        0,
+        center_b3,
+        params_b,
+        rot_b3,
+        2,
+    )
+    if has_collision == 1:
+        hit = 1
+        n2 = ti.Vector([contact_normal[0], contact_normal[1]])
+        if n2.norm() > 1e-9:
+            normal = n2 / n2.norm()
+        else:
+            normal = (center_b - center_a).normalized(1e-9)
+        penetration = -penetration_depth
+        cpoint = (ti.Vector([contact_point_a[0], contact_point_a[1]]) + ti.Vector([contact_point_b[0], contact_point_b[1]])) * 0.5
+    return hit, penetration, normal, cpoint
 
 
 @ti.func

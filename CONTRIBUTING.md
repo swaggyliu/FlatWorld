@@ -6,7 +6,7 @@ Thank you for your interest in contributing!
 
 ```bash
 git clone <your-fork-url>
-cd miniEngine
+cd FlatWorld
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
