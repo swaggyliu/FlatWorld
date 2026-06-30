@@ -65,12 +65,12 @@ def _perp_component(vec, axis_u):
 def _add_linear_constraint_row(
     manager: ti.template(), idx_a: ti.i32, idx_b: ti.i32, axis, r_a, r_b, rhs: ti.f32, lower: ti.f32, upper: ti.f32
 ):
-    jac_a = ti.Vector.zero(ti.f32, 6)
-    jac_b = ti.Vector.zero(ti.f32, 6)
+    jac_a = ti.Vector.zero(ti.f32, 3)
+    jac_b = ti.Vector.zero(ti.f32, 3)
     ang_a = r_a[0] * axis[1] - r_a[1] * axis[0]
     ang_b = r_b[0] * axis[1] - r_b[1] * axis[0]
-    jac_a = ti.Vector([axis[0], axis[1], 0.0, 0.0, 0.0, ang_a])
-    jac_b = ti.Vector([axis[0], axis[1], 0.0, 0.0, 0.0, ang_b])
+    jac_a = ti.Vector([axis[0], axis[1], ang_a])
+    jac_b = ti.Vector([axis[0], axis[1], ang_b])
 
     manager._add_pgs_row(idx_a, idx_b, jac_a, jac_b, rhs, lower, upper, -1)
 
@@ -79,10 +79,10 @@ def _add_linear_constraint_row(
 def _add_angular_constraint_row(
     manager: ti.template(), idx_a: ti.i32, idx_b: ti.i32, axis, rhs: ti.f32, lower: ti.f32, upper: ti.f32
 ):
-    jac_a = ti.Vector.zero(ti.f32, 6)
-    jac_b = ti.Vector.zero(ti.f32, 6)
-    jac_a = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0, axis])
-    jac_b = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0, axis])
+    jac_a = ti.Vector.zero(ti.f32, 3)
+    jac_b = ti.Vector.zero(ti.f32, 3)
+    jac_a = ti.Vector([0.0, 0.0, axis])
+    jac_b = ti.Vector([0.0, 0.0, axis])
     manager._add_pgs_row(idx_a, idx_b, jac_a, jac_b, rhs, lower, upper, -1)
 
 

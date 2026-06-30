@@ -1,6 +1,6 @@
 # Flat World 物理引擎 — 理论与实现文档
 
-> **Flat World**（miniEngine）是基于 [Taichi](https://www.taichi-lang.org/) 的实时多物理场仿真平台，支持 **刚体动力学**、**有限元法（FEM）**、**弹簧-质量系统**，以及三种静态地面表示：**解析平面（Ground）**、**高度场（HeightField）**、**体素网格（Voxel）**。
+> **Flat World**（FlatWorld）是基于 [Taichi](https://www.taichi-lang.org/) 的实时多物理场仿真平台，支持 **刚体动力学**、**有限元法（FEM）**、**弹簧-质量系统**，以及三种静态地面表示：**解析平面（Ground）**、**高度场（HeightField）**、**体素网格（Voxel）**。
 
 ---
 
@@ -31,7 +31,7 @@
 ### 1.2 目录结构
 
 ```
-miniEngine/
+FlatWorld/
 ├── flatworld/                  # 核心引擎
 │   ├── explicitloop.py         # 主仿真循环（ExplicitLoop）
 │   ├── femspringmanager.py     # FEM / 弹簧统一数据管理与积分
@@ -675,4 +675,4 @@ for _ in range(60):
 
 ---
 
-*文档基于 miniEngine 当前代码库自动生成，反映 test2D 中已验证的功能。*
+*文档基于 FlatWorld 当前代码库自动生成，反映 test2D 中已验证的功能。*

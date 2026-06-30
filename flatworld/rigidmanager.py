@@ -7,7 +7,6 @@ from contact_detection import (
 )
 from definitions import *
 from mesh import *
-from gjk import gjk_epa_collision
 from joint_kernels import assemble_single_joint_rows
 import numpy as np
 from operator import pos
@@ -25,7 +24,7 @@ class RigidManager:
         """Initialize RigidManager and allocate Taichi fields for rigids and state.
 
         Args:
-            d: Dimension (2)
+            d: Spatial dimension (must be 2)
             domains: List of domain objects
             joints: List of joint objects
             bvh: Shared BVH instance from ExplicitLoop (if None, creates local one for standalone use)
@@ -33,6 +32,8 @@ class RigidManager:
             considerRigidRigidContact: If True, consider rigid-rigid contact
             use_pd: 0 = no PD, 1 = velocity PD, 2 = torque PD
         """
+
+        assert d == 2, "RigidManager is 2D-only"
 
         self.skip_spatial_hash = skip_spatial_hash
         self.use_pd = use_pd
@@ -498,8 +499,8 @@ class RigidManager:
         # Per-constraint Jacobians for body A and body B:
         #   - ground-vs-rigid uses only pgs_Jac_a (B is zero)
         #   - rigid-vs-rigid uses both pgs_Jac_a and pgs_Jac_b
-        self.pgs_Jac_a = ti.Vector.field(6, ti.f32, self.MAX_CONSTRAINTS)
-        self.pgs_Jac_b = ti.Vector.field(6, ti.f32, self.MAX_CONSTRAINTS)
+        self.pgs_Jac_a = ti.Vector.field(3, ti.f32, self.MAX_CONSTRAINTS)
+        self.pgs_Jac_b = ti.Vector.field(3, ti.f32, self.MAX_CONSTRAINTS)
         self.pgs_rhs = ti.field(ti.f32, self.MAX_CONSTRAINTS)
         self.pgs_limits = ti.Vector.field(2, ti.f32, self.MAX_CONSTRAINTS)  # [lower, upper]
         self.pgs_bodypair = ti.Vector.field(2, ti.i32, self.MAX_CONSTRAINTS)
@@ -1326,72 +1327,12 @@ class RigidManager:
     # ===========================================================================
 
     @ti.func
-    def _rigid_center_3d(self, rigid_id: ti.i32):
-        center = self.rigidParams[rigid_id, 0]
-        return ti.math.vec3(center[0], center[1], 0.0)
-
-    @ti.func
-    def _rigid_rotation_3d(self, rigid_id: ti.i32):
-        rot = self.cached_rotation_matrix[rigid_id]
-        return ti.math.mat3([[rot[0, 0], rot[0, 1], 0.0], [rot[1, 0], rot[1, 1], 0.0], [0.0, 0.0, 1.0]])
-
-    @ti.func
-    def _vec3_to_sim_dim(self, value):
-        return ti.Vector([value[0], value[1]])
-
-    @ti.func
-    def _box_convex_params(self, rigid_id: ti.i32):
-        extent = self.rigidParams[rigid_id, 1]
-        return ti.math.vec4(
-            extent[0] * 0.5,
-            extent[1] * 0.5,
-            0.0,
-            0.0,
-        )
-
-    @ti.func
-    def _segment_convex_shape(self, rigid_id: ti.i32):
-        rigid_type = self.rigidDomainIds[rigid_id][1]
-        lcdir = self.rigidParams[rigid_id, 1]
-        shape_type = 1
-        if rigid_type == RigidType.CAPSULE:
-            shape_type = 2
-        params = ti.math.vec4(
-            self.radius[rigid_id],
-            lcdir[0],
-            lcdir[1],
-            0.0,
-        )
-        return shape_type, params
-
-    @ti.func
-    def _run_convex_contact_query(self, rigid_a: ti.i32, shape_type_a: ti.i32, params_a, rigid_b: ti.i32, shape_type_b: ti.i32, params_b):
-        has_collision, penetration_depth, contact_normal, contact_point_a, contact_point_b = gjk_epa_collision(
-            shape_type_a,
-            self._rigid_center_3d(rigid_a),
-            params_a,
-            self._rigid_rotation_3d(rigid_a),
-            shape_type_b,
-            self._rigid_center_3d(rigid_b),
-            params_b,
-            self._rigid_rotation_3d(rigid_b),
-            self.d,
-        )
-
-        hit = 0
-        penetration = 0.0
-        normal = ti.Vector.zero(ti.f32, self.d)
-        cpoint = ti.Vector.zero(ti.f32, self.d)
-        if has_collision == 1:
-            normal = self._vec3_to_sim_dim(contact_normal)
-            if normal.norm() > 1e-9:
-                normal = normal.normalized()
-            else:
-                normal = (self.rigidParams[rigid_b, 0] - self.rigidParams[rigid_a, 0]).normalized(1e-9)
-            cpoint = (self._vec3_to_sim_dim(contact_point_a) + self._vec3_to_sim_dim(contact_point_b)) * 0.5
-            penetration = -penetration_depth
-            hit = 1
-        return hit, penetration, normal, cpoint
+    def _capsule_segment_endpoints(self, seg_id: ti.i32):
+        center = self.rigidParams[seg_id, 0]
+        lcdir = self.rigidParams[seg_id, 1]
+        lc = self.cached_rotation_matrix[seg_id] @ lcdir + center
+        uc = center * 2.0 - lc
+        return lc, uc
 
     @ti.func
     def detectBallBallContact_(self, ic, jc):
@@ -1464,11 +1405,18 @@ class RigidManager:
 
     @ti.func
     def detectBoxBoxContact_(self, ic, jc):
-        """Detect contacts from box `ic` vs box `jc` using GJK+EPA algorithm.
-        GJK+EPA provides accurate penetration depth and contact normal for OBB-OBB collision.
-        """
-        hit, penetration, normal_ij, cpoint = self._run_convex_contact_query(
-            ic, 0, self._box_convex_params(ic), jc, 0, self._box_convex_params(jc)
+        """Detect box-box contact via 2D OBB resolver in sat.py."""
+        center_i = self.rigidParams[ic, 0]
+        center_j = self.rigidParams[jc, 0]
+        half_i = self.rigidParams[ic, 1] * 0.5
+        half_j = self.rigidParams[jc, 1] * 0.5
+        hit, penetration, normal_ij, cpoint = obb2d_contact_quad_vs_quad(
+            center_i,
+            half_i,
+            self.cached_rotation_matrix[ic],
+            center_j,
+            half_j,
+            self.cached_rotation_matrix[jc],
         )
         if hit == 1:
             self.cacheContact(ic, jc, cpoint, -normal_ij, penetration)
@@ -1495,18 +1443,17 @@ class RigidManager:
 
     @ti.func
     def detectSegmentBoxContact_(self, seg_id, other_id):
-        """Detect contacts between a segment-like rigid (capsule) and
-        a box/ball using GJK+EPA for accurate collision detection.
-
-        This function handles:
-        - Capsule vs Box (gjk method)
-        """
-        seg_shape_type, params_seg = self._segment_convex_shape(seg_id)
-        hit, penetration, normal_seg_box, cpoint = self._run_convex_contact_query(
-            seg_id, seg_shape_type, params_seg, other_id, 0, self._box_convex_params(other_id)
-        )
-        if hit == 1:
-            self.cacheContact(other_id, seg_id, cpoint, normal_seg_box, penetration)
+        """Detect capsule vs box using 2D SAT (OBB quad vs segment), with capsule radius."""
+        a0 = self.get_box_vertex(other_id, 0)
+        a1 = self.get_box_vertex(other_id, 1)
+        a2 = self.get_box_vertex(other_id, 2)
+        a3 = self.get_box_vertex(other_id, 3)
+        lc, uc = self._capsule_segment_endpoints(seg_id)
+        signed, normal = obb2d_signed_distance_quad_vs_segment(a0, a1, a2, a3, lc, uc)
+        penetration = signed - self.radius[seg_id]
+        if penetration < 0.0:
+            cpoint = (lc + uc) * 0.5
+            self.cacheContact(other_id, seg_id, cpoint, -normal, penetration)
 
     @ti.func
     def detectSegmentBallContact_(self, seg_id, other_id):
@@ -2402,21 +2349,17 @@ class RigidManager:
         if -bias_vel > bounce_vel:
             target_vel = -bias_vel
 
-        jac_n = ti.Vector.zero(ti.f32, 6)
-        rcn_s = vectorCrossProduct(lr, normal)[0]
-        jac_n = ti.Vector([normal[0], normal[1], 0.0, 0.0, 0.0, rcn_s])
+        jac_n = ti.Vector([normal[0], normal[1], vectorCrossProduct(lr, normal)[0]])
 
         normal_row = self._add_pgs_row(
-            rid, -1, jac_n, ti.Vector.zero(ti.f32, 6), target_vel + normal.dot(ground_vel), 0.0, 1e10, -1
+            rid, -1, jac_n, ti.Vector.zero(ti.f32, 3), target_vel + normal.dot(ground_vel), 0.0, 1e10, -1
         )
         self.ground_contact_pgs_indices[idx] = ti.Vector([normal_row, -1, -1])
         if mu > 1e-12 and normal_row >= 0:
             t1 = self.ground_contact_tangent1[idx]
-            jac_t1 = ti.Vector.zero(ti.f32, 6)
-            rct1_s = vectorCrossProduct(lr, t1)[0]
-            jac_t1 = ti.Vector([t1[0], t1[1], 0.0, 0.0, 0.0, rct1_s])
+            jac_t1 = ti.Vector([t1[0], t1[1], vectorCrossProduct(lr, t1)[0]])
             rhs_t1 = t1.dot(ground_vel)
-            tangent1_row = self._add_pgs_row(rid, -1, jac_t1, ti.Vector.zero(ti.f32, 6), rhs_t1, -mu, mu, normal_row)
+            tangent1_row = self._add_pgs_row(rid, -1, jac_t1, ti.Vector.zero(ti.f32, 3), rhs_t1, -mu, mu, normal_row)
             self.ground_contact_pgs_indices[idx][1] = tangent1_row
 
 
@@ -2443,25 +2386,16 @@ class RigidManager:
         if -bias_vel > bounce_vel:
             target_vel = -bias_vel
 
-        jac_na = ti.Vector.zero(ti.f32, 6)
-        jac_nb = ti.Vector.zero(ti.f32, 6)
-        raxn_s = vectorCrossProduct(ra, normal)[0]
-        rbxn_s = vectorCrossProduct(rb, normal)[0]
-        jac_na = ti.Vector([normal[0], normal[1], 0.0, 0.0, 0.0, raxn_s])
-        jac_nb = ti.Vector([normal[0], normal[1], 0.0, 0.0, 0.0, rbxn_s])
+        jac_na = ti.Vector([normal[0], normal[1], vectorCrossProduct(ra, normal)[0]])
+        jac_nb = ti.Vector([normal[0], normal[1], vectorCrossProduct(rb, normal)[0]])
 
         normal_row = self._add_pgs_row(aid, bid, jac_na, jac_nb, target_vel, 0.0, 1e10, -1)
         self.contact_pgs_indices[idx] = ti.Vector([normal_row, -1, -1])
 
         if mu > 1e-12 and normal_row >= 0:
             t1 = self.contact_tangent1[idx]
-            jac_t1a = ti.Vector.zero(ti.f32, 6)
-            jac_t1b = ti.Vector.zero(ti.f32, 6)
-
-            raxt1_s = vectorCrossProduct(ra, t1)[0]
-            rbxt1_s = vectorCrossProduct(rb, t1)[0]
-            jac_t1a = ti.Vector([t1[0], t1[1], 0.0, 0.0, 0.0, raxt1_s])
-            jac_t1b = ti.Vector([t1[0], t1[1], 0.0, 0.0, 0.0, rbxt1_s])
+            jac_t1a = ti.Vector([t1[0], t1[1], vectorCrossProduct(ra, t1)[0]])
+            jac_t1b = ti.Vector([t1[0], t1[1], vectorCrossProduct(rb, t1)[0]])
             tangent1_row = self._add_pgs_row(aid, bid, jac_t1a, jac_t1b, 0.0, -mu, mu, normal_row)
             self.contact_pgs_indices[idx][1] = tangent1_row
 
@@ -2617,38 +2551,33 @@ class RigidManager:
             jac_a = self.pgs_Jac_a[i]
             jac_b = self.pgs_Jac_b[i]
 
-            va6 = ti.Vector.zero(ti.f32, 6)
-            vb6 = ti.Vector.zero(ti.f32, 6)
+            va3 = ti.Vector([self.V[aid][0], self.V[aid][1], self.RotV[aid][0]])
+            vb3 = ti.Vector.zero(ti.f32, 3)
 
-            massInvA = ti.Matrix.zero(ti.f32, 6, 6)
-            massInvB = ti.Matrix.zero(ti.f32, 6, 6)
+            massInvA = ti.Matrix.zero(ti.f32, 3, 3)
+            massInvB = ti.Matrix.zero(ti.f32, 3, 3)
 
             inv_mass_a = 1.0 / (self.mass[aid] + 1e-12)
             massInvA[0, 0] = inv_mass_a
             massInvA[1, 1] = inv_mass_a
-            massInvA[2, 2] = inv_mass_a
-
-            va6 = ti.Vector([self.V[aid][0], self.V[aid][1], 0.0, 0.0, 0.0, self.RotV[aid][0]])
             inv_Ia = 1.0 / (self.inertia[aid] + 1e-12)
-            massInvA[5, 5] = inv_Ia
+            massInvA[2, 2] = inv_Ia
 
-            vel = jac_a.dot(va6)
+            vel = jac_a.dot(va3)
             massInvJacA = massInvA @ jac_a
             W = jac_a.dot(massInvJacA)
 
             has_b = bid >= 0
-            massInvJacB = ti.Vector.zero(ti.f32, 6)
+            massInvJacB = ti.Vector.zero(ti.f32, 3)
             if has_b:
                 inv_mass_b = 1.0 / (self.mass[bid] + 1e-12)
                 massInvB[0, 0] = inv_mass_b
                 massInvB[1, 1] = inv_mass_b
-                massInvB[2, 2] = inv_mass_b
-
-                vb6 = ti.Vector([self.V[bid][0], self.V[bid][1], 0.0, 0.0, 0.0, self.RotV[bid][0]])
                 inv_Ib = 1.0 / (self.inertia[bid] + 1e-12)
-                massInvB[5, 5] = inv_Ib
+                massInvB[2, 2] = inv_Ib
 
-                vel -= jac_b.dot(vb6)
+                vb3 = ti.Vector([self.V[bid][0], self.V[bid][1], self.RotV[bid][0]])
+                vel -= jac_b.dot(vb3)
                 massInvJacB = massInvB @ jac_b
                 W += jac_b.dot(massInvJacB)
 
@@ -2675,13 +2604,13 @@ class RigidManager:
                 deltaA = massInvJacA * apply_lamb
 
                 self.V[aid] += ti.Vector([deltaA[0], deltaA[1]])
-                self.RotV[aid][0] += deltaA[5]
+                self.RotV[aid][0] += deltaA[2]
 
                 if has_b:
                     deltaB = massInvJacB * apply_lamb
 
                     self.V[bid] -= ti.Vector([deltaB[0], deltaB[1]])
-                    self.RotV[bid][0] -= deltaB[5]
+                    self.RotV[bid][0] -= deltaB[2]
 
     @ti.kernel
     def precompute_rigid_transforms(self):
