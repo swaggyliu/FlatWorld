@@ -931,11 +931,11 @@ class MixedContact:
             min_buf = self.femSpringManager.spatialHash.gridSize[None].max()
             query_buf = ti.max(ti.max(1e-4, min_buf), 0.001)  # TODO: why 0.016?
             print("Check query_buf: ", query_buf)
-            potentialEls, dids, numPotentials = self.femSpringManager.spatialHash.queryPointWithBuffer(
+            numPotentials = self.femSpringManager.spatialHash.queryPointWithBuffer(
                 node_coord, query_buf, target_did
             )
             for j in range(numPotentials):
-                elem_idx = potentialEls[j]
+                elem_idx = self.femSpringManager.spatialHash.queryElids[j]
                 elem_conn = self.femSpringManager.boundaryElements[elem_idx]
                 pen, normal, cp, curr_weights = detectPointToMeshBoundary(
                     node_coord, self.femSpringManager.coords, elem_conn, limit_penetration=query_buf
@@ -1146,12 +1146,12 @@ class MixedContact:
             # Phase 2: cache miss -> SH fallback
             # -------------------------------------------------------------
             if not found:
-                potentialEls, dids, numPotentials = self.femSpringManager.spatialHash.queryPointWithBuffer(
+                numPotentials = self.femSpringManager.spatialHash.queryPointWithBuffer(
                     nodeCoord, query_buf, target_did
                 )
 
                 for j in range(numPotentials):
-                    global_elem_idx = potentialEls[j]
+                    global_elem_idx = self.femSpringManager.spatialHash.queryElids[j]
                     curr_conn = self.femSpringManager.boundaryElements[global_elem_idx]
                     # lb = ti.Vector.zero(ti.f32, ti.static(self.d)) + 1e30
                     # ub = ti.Vector.zero(ti.f32, ti.static(self.d)) - 1e30
