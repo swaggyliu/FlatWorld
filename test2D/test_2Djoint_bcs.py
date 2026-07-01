@@ -160,7 +160,7 @@ def test_2Djoint_rotation(headless=False):
         frame += 1
 
         if gui is not None:
-            gui.clear(0xAAAAAA)
+            gui.clear(0x112F41)
 
             # Draw all rigid bodies
             for i, domain in enumerate(domains):

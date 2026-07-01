@@ -44,7 +44,10 @@ def should_use_gui():
     return is_display_available()
 
 
-def create_gui_if_available(title, res=(720, 720), background_color=0x000000):
+GALLERY_BG = 0x112F41
+
+
+def create_gui_if_available(title, res=(720, 720), background_color=GALLERY_BG):
     """
     Create a Taichi GUI if display is available, otherwise return None.
 

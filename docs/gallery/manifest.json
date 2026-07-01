@@ -1,0 +1,247 @@
+[
+  {
+    "slug": "fem-elastic",
+    "file": "fem-elastic.png",
+    "title_en": "FEM elastic square",
+    "title_zh": "FEM 弹性方块",
+    "source": "test2D/test_2Dfem_elastic.py"
+  },
+  {
+    "slug": "fem-contact",
+    "file": "fem-contact.png",
+    "title_en": "FEM self-contact",
+    "title_zh": "FEM 自接触",
+    "source": "test2D/test_2Dfem_contact.py"
+  },
+  {
+    "slug": "fem-bcs",
+    "file": "fem-bcs.png",
+    "title_en": "FEM boundary conditions",
+    "title_zh": "FEM 边界条件",
+    "source": "test2D/test_2Dfem_bcs.py"
+  },
+  {
+    "slug": "fem-two-domains",
+    "file": "fem-two-domains.png",
+    "title_en": "Two FEM domains",
+    "title_zh": "双 FEM 域",
+    "source": "test2D/test_2Dfem2domain_elastic.py"
+  },
+  {
+    "slug": "fem-ics",
+    "file": "fem-ics.png",
+    "title_en": "FEM initial conditions",
+    "title_zh": "FEM 初始条件",
+    "source": "test2D/test_2Dfem_ics.py"
+  },
+  {
+    "slug": "fem-analytic-contact",
+    "file": "fem-analytic-contact.png",
+    "title_en": "FEM vs analytical ground",
+    "title_zh": "FEM 与解析地面",
+    "source": "test2D/test_2Dfemanalytic_contact.py"
+  },
+  {
+    "slug": "fem-heightfield",
+    "file": "fem-heightfield.png",
+    "title_en": "FEM on height field",
+    "title_zh": "FEM 高度场接触",
+    "source": "test2D/test_2Dfem_heightfield_contact.py"
+  },
+  {
+    "slug": "fem-voxel",
+    "file": "fem-voxel.png",
+    "title_en": "FEM in voxel pit",
+    "title_zh": "FEM 体素坑接触",
+    "source": "test2D/test_2Dfem_voxel_contact.py"
+  },
+  {
+    "slug": "fem-rigid-mixed",
+    "file": "fem-rigid-mixed.png",
+    "title_en": "FEM + rigid bodies",
+    "title_zh": "FEM 与刚体混合",
+    "source": "test2D/test_2dfemrigid_contact.py"
+  },
+  {
+    "slug": "spring-mass",
+    "file": "spring-mass.png",
+    "title_en": "Spring-mass lattice",
+    "title_zh": "弹簧质点网格",
+    "source": "test2D/test_2Dspring_bcs.py"
+  },
+  {
+    "slug": "spring-mass-10k",
+    "file": "spring-mass-10k.png",
+    "title_en": "Large spring mesh (10k)",
+    "title_zh": "大规模弹簧网格",
+    "source": "test2D/test_2Dspring_10000.py"
+  },
+  {
+    "slug": "mesh-rigid",
+    "file": "mesh-rigid.png",
+    "title_en": "Mesh rigid bodies",
+    "title_zh": "网格刚体",
+    "source": "test2D/test_2Dmeshrigid.py"
+  },
+  {
+    "slug": "rigid-balls",
+    "file": "rigid-balls.png",
+    "title_en": "Ball-ball contact",
+    "title_zh": "球体接触",
+    "source": "test2D/test_2Drigid_contact.py"
+  },
+  {
+    "slug": "rigid-100-balls",
+    "file": "rigid-100-balls.png",
+    "title_en": "100 balls",
+    "title_zh": "百球堆积",
+    "source": "test2D/test_2Drigid_contact100.py"
+  },
+  {
+    "slug": "rigid-25-boxes",
+    "file": "rigid-25-boxes.png",
+    "title_en": "25 boxes",
+    "title_zh": "25 盒子碰撞",
+    "source": "test2D/test_2Drigid_contact100_boxes.py"
+  },
+  {
+    "slug": "rigid-capsules",
+    "file": "rigid-capsules.png",
+    "title_en": "Capsule crowd",
+    "title_zh": "胶囊刚体群",
+    "source": "test2D/test_2Drigid_contact100_capsules.py"
+  },
+  {
+    "slug": "rigid-ground",
+    "file": "rigid-ground.png",
+    "title_en": "Rigid on analytical planes",
+    "title_zh": "刚体解析地面",
+    "source": "test2D/test_2Drigidanalytic_contact.py"
+  },
+  {
+    "slug": "rigid-bcs",
+    "file": "rigid-bcs.png",
+    "title_en": "Rigid body BCs",
+    "title_zh": "刚体边界条件",
+    "source": "test2D/test_2Drigid_bcs.py"
+  },
+  {
+    "slug": "rigid-rotation",
+    "file": "rigid-rotation.png",
+    "title_en": "Rigid rotation",
+    "title_zh": "刚体旋转",
+    "source": "test2D/test_2Drigid_rot.py"
+  },
+  {
+    "slug": "box-friction-dynamic",
+    "file": "box-friction-dynamic.png",
+    "title_en": "Box friction (dynamic)",
+    "title_zh": "盒子摩擦（滑动）",
+    "source": "test2D/test_2Dbox_friction.py"
+  },
+  {
+    "slug": "box-friction-inclined",
+    "file": "box-friction-inclined.png",
+    "title_en": "Box on inclined plane",
+    "title_zh": "斜面盒子摩擦",
+    "source": "test2D/test_2Dbox_friction.py"
+  },
+  {
+    "slug": "domino",
+    "file": "domino.png",
+    "title_en": "Domino chain",
+    "title_zh": "多米诺骨牌",
+    "source": "test2D/test_2Ddomino.py"
+  },
+  {
+    "slug": "pendulum",
+    "file": "pendulum.png",
+    "title_en": "Revolute pendulum",
+    "title_zh": "铰接摆",
+    "source": "test2D/test_2Dpendulum_simple.py"
+  },
+  {
+    "slug": "revolute-joint",
+    "file": "revolute-joint.png",
+    "title_en": "Revolute joint",
+    "title_zh": "旋转关节",
+    "source": "test2D/test_2Drevolute_joint.py"
+  },
+  {
+    "slug": "joint-bcs",
+    "file": "joint-bcs.png",
+    "title_en": "Joint rotation BCs",
+    "title_zh": "关节旋转边界",
+    "source": "test2D/test_2Djoint_bcs.py"
+  },
+  {
+    "slug": "joint-pd-velocity",
+    "file": "joint-pd-velocity.png",
+    "title_en": "Joint PD velocity",
+    "title_zh": "关节 PD 速度控制",
+    "source": "test2D/test_2Djoint_bcs_pdvel.py"
+  },
+  {
+    "slug": "linkage",
+    "file": "linkage.png",
+    "title_en": "Four-bar linkage",
+    "title_zh": "四连杆机构",
+    "source": "test2D/test_2Dlinkage.py"
+  },
+  {
+    "slug": "robot",
+    "file": "robot.png",
+    "title_en": "2D robot arm",
+    "title_zh": "二维机械臂",
+    "source": "test2D/test_2Drobot.py"
+  },
+  {
+    "slug": "wheel-rolling",
+    "file": "wheel-rolling.png",
+    "title_en": "Cylinder wheel rolling",
+    "title_zh": "圆柱轮滚动",
+    "source": "test2D/test_2D_wheel_rolling.py"
+  },
+  {
+    "slug": "wheel-rolling-initials",
+    "file": "wheel-rolling-initials.png",
+    "title_en": "Wheel rolling (initial spin)",
+    "title_zh": "带初速的滚轮",
+    "source": "test2D/test_2Dwheel_rolling_initials.py"
+  },
+  {
+    "slug": "solar-system",
+    "file": "solar-system.png",
+    "title_en": "Solar-system rigid orbits",
+    "title_zh": "刚体轨道（太阳系）",
+    "source": "test2D/test_2Dsolar_system.py"
+  },
+  {
+    "slug": "analytical-bcs",
+    "file": "analytical-bcs.png",
+    "title_en": "Analytical domain BCs",
+    "title_zh": "解析域边界条件",
+    "source": "test2D/test_2Danalytical_bcs.py"
+  },
+  {
+    "slug": "joint-pd-force",
+    "file": "joint-pd-force.png",
+    "title_en": "Joint PD force control",
+    "title_zh": "关节 PD 力控制",
+    "source": "test2D/test_2Djoint_bcs_pdforce.py"
+  },
+  {
+    "slug": "rigid-rotation-benchmark",
+    "file": "rigid-rotation-benchmark.png",
+    "title_en": "Rigid rotation benchmark",
+    "title_zh": "刚体旋转基准",
+    "source": "test2D/test_2Drigid_rotation_benchmark.py"
+  },
+  {
+    "slug": "analytical-rotation-benchmark",
+    "file": "analytical-rotation-benchmark.png",
+    "title_en": "Analytical rotation benchmark",
+    "title_zh": "解析域旋转基准",
+    "source": "test2D/test_2Danalytical_rotation_benchmark.py"
+  }
+]

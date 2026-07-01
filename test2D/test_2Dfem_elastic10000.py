@@ -55,7 +55,7 @@ def test_2Dfem_elastic(headless=False):
             break
 
         # gui.circles(pos, radius=2, color=0xFFAA33)
-        # e2n = mesh.connectivity.to_numpy()
+        # e2n = mesh.connectivity
         # a, b, c = pos[e2n[:, 0]], pos[e2n[:, 1]], pos[e2n[:, 2]]
         # gui.triangles(a, b, c, color=0xFF0033)
         # gui.show()

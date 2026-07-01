@@ -61,7 +61,7 @@ def test_2Drigid_contact(headless=False):
     looper = ExplicitLoop(0.0, domains, useAdapativeDT=True)
 
     gui = (
-        create_gui_if_available("RIGID2D - Capsules", res=(1080, 1080), background_color=0xFFFFFF)
+        create_gui_if_available("RIGID2D - Capsules", res=(1080, 1080), background_color=0x112F41)
         if not headless
         else None
     )

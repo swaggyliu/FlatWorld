@@ -54,7 +54,7 @@ def test_2Drigid_contact(headless=False):
     frame_dt = 1.0 / 600.0
     looper = ExplicitLoop(frame_dt / 10.0, domains, useAdapativeDT=True)
 
-    gui = create_gui_if_available("RIGIDBOX", res=(1080, 1080), background_color=0xFFFFFF) if not headless else None
+    gui = create_gui_if_available("RIGIDBOX", res=(1080, 1080), background_color=0x112F41) if not headless else None
     t = 0.0
     frame = 0
     while (gui is None or gui.running) and t < 0.5:

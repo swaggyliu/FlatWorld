@@ -58,7 +58,7 @@ def test_2Dfem_voxel_contact(headless=False):
     while (gui is None or gui.running) and steps < 60:
         loop.advanceWithTime(frame_dt)
         if gui is not None:
-            gui.clear(0xFFFFFF)
+            gui.clear(0x112F41)
             # Draw FEM mesh
             loop.femSpringManager.drawMesh(gui, color=0xFF0033)
             # Draw voxel edges

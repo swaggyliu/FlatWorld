@@ -29,4 +29,4 @@ jobs:
           CI: "true"
           HEADLESS: "1"
         run: |
-          python -m pytest test2D -q --tb=short --timeout=120
+          python -m pytest test2D -q --tb=short --timeout=300

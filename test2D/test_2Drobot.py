@@ -98,7 +98,7 @@ def test_robot(headless=False, kernel_profile=False):
 
         frame += 1
         if gui is not None:
-            gui.clear(0xFFFFFF)
+            gui.clear(0x112F41)
             for i in range(7):
                 color = colors[i]
                 domains[i].draw(gui, color=color, resolution=length)
