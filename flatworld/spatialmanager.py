@@ -86,6 +86,9 @@ class SpatialHashManager:
         self.cellStart = ti.field(ti.i32, shape=self.MAX_CELLS)
         self.cellEnd = ti.field(ti.i32, shape=self.MAX_CELLS)
 
+        # Potential query results (returned by queryPoint / queryPointWithBuffer)
+        self.queryElids = ti.field(ti.i32, shape=self.MAX_QUERY)
+
     # ================================================================
     #  Reset  (call from Python before each populate cycle)
     # ================================================================
@@ -268,8 +271,6 @@ class SpatialHashManager:
     # ================================================================
     @ti.func
     def queryPoint(self, pos: ti.template(), domainID: ti.i32):
-        elids = ti.Vector([-1] * self.MAX_QUERY, ti.i32)
-        dids = ti.Vector([-1] * self.MAX_QUERY, ti.i32)
         numPotentials = 0
 
         cid = self._point_to_cell_id(pos)
@@ -280,19 +281,15 @@ class SpatialHashManager:
                 ei = self._sortedElemIdx[p]
                 if (ei >= 0 and self.domainIds[ei][0] == domainID) or (ei >= 0 and domainID == -1):
                     if numPotentials < self.MAX_QUERY:
-                        elids[numPotentials] = self.domainIds[ei][1]
-                        dids[numPotentials] = self.domainIds[ei][0]
+                        self.queryElids[numPotentials] = self.domainIds[ei][1]
                         numPotentials += 1
-        return elids, dids, numPotentials
+        return numPotentials
 
     # ================================================================
     #  queryPointWithBuffer  (multi-cell, filter, deduplicate)
     # ================================================================
     @ti.func
     def queryPointWithBuffer(self, pos: ti.template(), buffer: ti.f32, domainID: ti.i32):
-        elids = ti.Vector([-1] * self.MAX_QUERY, ti.i32)
-        dids = ti.Vector([-1] * self.MAX_QUERY, ti.i32)
-        visited = ti.Vector([-1] * self.MAX_QUERY, ti.i32)
         numPotentials = 0
 
         if self.total_cells[None] > 0:
@@ -319,16 +316,14 @@ class SpatialHashManager:
                         if (ei >= 0 and self.domainIds[ei][0] == domainID) or (ei >= 0 and domainID == -1):
                             already = False
                             for k in range(numPotentials):
-                                if visited[k] == ei:
+                                if self.queryElids[k] == self.domainIds[ei][1]:
                                     already = True
                                     break
                             if not already and numPotentials < self.MAX_QUERY:
-                                elids[numPotentials] = self.domainIds[ei][1]
-                                dids[numPotentials] = self.domainIds[ei][0]
-                                visited[numPotentials] = ei
+                                self.queryElids[numPotentials] = self.domainIds[ei][1]
                                 numPotentials += 1
            
-        return elids, dids, numPotentials
+        return numPotentials
 
     # ================================================================
     #  Pretty-print

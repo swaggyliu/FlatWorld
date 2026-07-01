@@ -47,4 +47,4 @@ include = ["flatworld*"]
 
 [tool.pytest.ini_options]
 testpaths = ["test2D"]
-timeout = 300
+timeout = 120

@@ -1230,7 +1230,6 @@ class RigidManager:
             self._detect_primitive_contacts_kernel()
         # Mesh and mixed: only compile/launch when spatialHash exists.
         # When spatialHash is None (no mesh rigids), these kernels reference
-        # spatialHash.queryPointWithBuffer which Taichi cannot compile.
         has_mesh_related_pairs = (self.num_mesh_pairs[None] + self.num_mixed_pairs[None]) > 0
         if self.spatialHash is not None and has_mesh_related_pairs:
             self.maybe_rebuild_spatial_hash()
@@ -1594,13 +1593,13 @@ class RigidManager:
         if radius < cell_size * 4.0:
 
             # Query spatial hash with radius to get candidate triangles
-            potentialEls, dids, numPotentials = self.spatialHash.queryPointWithBuffer(point, radius, mesh_idx)
+            numPotentials = self.spatialHash.queryPointWithBuffer(point, radius, mesh_idx)
 
             mesh_local_idx = self.rigid2MeshIndices[mesh_idx]
 
             # Test against each candidate triangle
             for pot_idx in range(numPotentials):
-                eidx = potentialEls[pot_idx]  # Local element ID
+                eidx = self.spatialHash.queryElids[pot_idx]
                 if eidx >= 0:
                     conn = self.meshBoundaryElements[eidx]
 
@@ -1690,13 +1689,13 @@ class RigidManager:
                 # Lazy hash: rebuilt adaptively based on displacement.
                 # Query buffer = cell_size + estimated displacement since rebuild.
                 query_buf = self._sh_contact_margin[None]
-                potentialEls, dids, numPotentials = self.spatialHash.queryPointWithBuffer(
+                numPotentials = self.spatialHash.queryPointWithBuffer(
                     coord, query_buf, elem_mesh_rigid_idx
                 )
 
                 # Test against each potential triangle
                 for pot_idx in range(numPotentials):
-                    elem_idx = potentialEls[pot_idx]  # Local element ID
+                    elem_idx = self.spatialHash.queryElids[pot_idx]
                     if elem_idx >= 0:
                         conn = self.meshBoundaryElements[elem_idx]
 
