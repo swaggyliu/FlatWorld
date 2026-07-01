@@ -60,7 +60,7 @@ def test_revolute_joint(headless=False, kernel_profile=True):
         # draw
         frame += 1
         if gui is not None:
-            gui.clear(0xFFFFFF)
+            gui.clear(0x112F41)
             for i, domain in enumerate(domains):
                 color = 0xFF0000 if i == 0 else 0x0000FF
                 domain.draw(gui, color=color, resolution=length)

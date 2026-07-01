@@ -54,6 +54,23 @@ pytest test2D/test_2Dfem_elastic.py
 
 51 test files under `test2D/` cover FEM, rigid contact, joints, friction, and all ground types.
 
+## Gallery
+
+Live-rendered screenshots from `test2D` demos:
+
+<p align="center">
+  <img src="docs/gallery/domino.png" width="220" alt="Domino chain" />
+  <img src="docs/gallery/fem-rigid-mixed.png" width="220" alt="FEM + rigid" />
+  <img src="docs/gallery/robot.png" width="220" alt="2D robot arm" />
+  <img src="docs/gallery/rigid-25-boxes.png" width="220" alt="25 boxes" />
+  <img src="docs/gallery/fem-heightfield.png" width="220" alt="FEM height field" />
+  <img src="docs/gallery/pendulum.png" width="220" alt="Pendulum" />
+</p>
+
+**35 scenes** — full catalog: [docs/gallery/README.md](docs/gallery/README.md)
+
+Regenerate locally: `python scripts/capture_gallery.py`
+
 ## Documentation
 
 - [Theory & implementation (中文)](docs/THEORY_AND_IMPLEMENTATION.md)
@@ -117,6 +134,21 @@ set HEADLESS=1          # Windows
 export HEADLESS=1       # Linux / macOS
 pytest test2D -q
 ```
+
+## 图库 Gallery
+
+`test2D` 可渲染案例的实时截图（共 35 张）：
+
+<p align="center">
+  <img src="docs/gallery/domino.png" width="220" alt="多米诺" />
+  <img src="docs/gallery/fem-rigid-mixed.png" width="220" alt="FEM 刚体混合" />
+  <img src="docs/gallery/robot.png" width="220" alt="机械臂" />
+  <img src="docs/gallery/rigid-25-boxes.png" width="220" alt="盒子碰撞" />
+  <img src="docs/gallery/fem-heightfield.png" width="220" alt="高度场" />
+  <img src="docs/gallery/pendulum.png" width="220" alt="摆" />
+</p>
+
+完整列表：[docs/gallery/README.md](docs/gallery/README.md) · 重新生成：`python scripts/capture_gallery.py`
 
 ## 文档
 

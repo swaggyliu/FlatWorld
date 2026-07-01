@@ -91,7 +91,7 @@ def test_two_body_joint(headless=False):
 
         # clear screen
         if gui is not None:
-            gui.clear(0xF0F8FF)  # light blue background
+            gui.clear(0x112F41)
 
             upper_domain.draw(gui, color=0xFF0000, resolution=800)
             lower_domain.draw(gui, color=0x0000FF, resolution=800)

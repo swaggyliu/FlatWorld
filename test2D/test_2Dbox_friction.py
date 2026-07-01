@@ -43,7 +43,7 @@ def _run_2d_box_friction(force_x, end_time=5.0, headless=True, write_output=Fals
         counter += 1
 
         if gui is not None:
-            gui.clear(0xAAAAAA)
+            gui.clear(0x112F41)
 
             # Draw all rigid bodies
             for i, domain in enumerate(domains):
@@ -90,7 +90,7 @@ def _run_2d_box_friction_inclined(angle=0.0, end_time=5.0, headless=True):
         sim_time += frame_dt
 
         if gui is not None:
-            gui.clear(0xAAAAAA)
+            gui.clear(0x112F41)
 
             # Draw all rigid bodies
             for i, domain in enumerate(domains):

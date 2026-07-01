@@ -104,7 +104,7 @@ def test_2Drigid_bcs(headless=False):
     while running:
         if not BENCHMARK_MODE:
             if gui is not None:
-                gui.clear(0xFFFFFF)
+                gui.clear(0x112F41)
 
         # advance one visual frame using adaptive substeps
         looper.advanceWithTime(frame_dt)

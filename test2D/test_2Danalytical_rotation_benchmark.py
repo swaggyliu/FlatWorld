@@ -70,7 +70,7 @@ def test_2Danalytical_rotation(headless=False):
         t += frame_dt
 
         if gui is not None:
-            gui.clear(0x222222)
+            gui.clear(0x112F41)
 
             # Draw rotating walls with different colors
             wall1.draw(gui, color=0xFF3333, resolution=720)  # Red

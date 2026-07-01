@@ -49,12 +49,12 @@ def test_2Drigid_rotation_benchmark(headless=False):
     )
 
     pivot6 = [0.3, 0.3]
-    rigid6 = BoxRigid(2, pivot6, [0.4, 0.3], [0], 0.04, 2.0)
+    rigid6 = BoxRigid(2, pivot6, [0.1, 0.03], [0], 0.04, 2.0)
     rigiddomain6 = RigidBodyDomain(
         rigid6, bcs=[EnforceRotVel([0], [pi], origin=pivot6)], considerContact=False, initials=[]
     )
     pivot7 = [0.5, 0.3]
-    rigid7 = BoxRigid(2, pivot7, [0.6, 0.3], [0], 0.04, 2.0)
+    rigid7 = BoxRigid(2, pivot7, [0.1, 0.03], [0], 0.04, 2.0)
     rigiddomain7 = RigidBodyDomain(
         rigid7, bcs=[EnforceRotAcc([0], [2 * pi], origin=pivot7)], considerContact=False, initials=[]
     )
@@ -100,7 +100,7 @@ def test_2Drigid_rotation_benchmark(headless=False):
         t += frame_dt
 
         if gui is not None:
-            gui.clear(0x222222)
+            gui.clear(0x112F41)
 
             rigiddomain1.draw(gui, color=0xFF3333, resolution=720)
             rigiddomain2.draw(gui, color=0x33FF33, resolution=720)

@@ -90,7 +90,7 @@ def test_linkage(headless=False, kernel_profile=False):
         node1 = rigiddomain1.getCurrentRefPoint()
         nodeanchor = j3.getCurrentAnchorPoint()
         if gui is not None:
-            gui.clear(0xFFFFFF)
+            gui.clear(0x112F41)
             looper.rigidManager.drawAll(gui, domains, colors, resolution=length)
 
             anchors = []
