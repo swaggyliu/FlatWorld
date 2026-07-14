@@ -1,0 +1,61 @@
+import math
+import numpy as np
+import os
+import sys
+import taichi as ti
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+from flatworld import (
+    GroundDomain,
+    BallRigid,
+    BoxRigid,
+    Elastic,
+    ExplicitLoop,
+    FemDomain,
+    Fixed,
+    FixedAll,
+    Force,
+    Gravity,
+    Mesh,
+    RigidBodyDomain,
+    SolidProp,
+)
+
+
+def edu_2d_2_15():
+
+    ti.init(offline_cache=True, arch=ti.cpu)
+    rigid1 = BoxRigid(2, [0.3 + 0.0025 * math.sqrt(3), 0.2025 + 0.1 * math.sqrt(3)], [0.4, 0.01], [-math.pi / 3], 1.0)
+    rigid2 = BoxRigid(2, [0.1, 0.6], [0.2, 0.8], [0, 0], 1.0)
+    rigid3 = BoxRigid(2, [0.6, 0.1], [0.8, 0.2], [0, 0], 1.0)
+    bcs = [Gravity([0, -10.0])]
+    rigiddomain1 = RigidBodyDomain(rigid1, bcs=[Gravity([0, -10.0])], friction=1)
+    rigiddomain2 = RigidBodyDomain(rigid2, bcs=[FixedAll([0])], friction=0)
+    rigiddomain3 = RigidBodyDomain(rigid3, bcs=[FixedAll([0])], friction=0.01)  ##greater than 0.28868
+
+    analytical1 = GroundDomain(2, (0.3, 0.4), (0, 1), bcs=[FixedAll([0])])
+    domains = [rigiddomain1, rigiddomain2, rigiddomain3]
+
+    frame_dt = 1.0 / 60.0
+    looper = ExplicitLoop(0.0, domains, useAdapativeDT=True)
+
+    gui = ti.GUI("EDU2D", res=(720, 720), background_color=0xFFFFFF)
+    t = 0.0
+    while gui.running and t < 10.0:
+        # advance exactly one visual frame using adaptive substeps
+        looper.advanceWithTime(frame_dt)
+
+        t += frame_dt
+
+        rigiddomain1.draw(gui, 0x347EA8, 720)
+        rigiddomain2.draw(gui, 0x000000, 720)
+        rigiddomain3.draw(gui, 0x000000, 720)
+
+        gui.show()
+
+
+if __name__ == "__main__":
+    edu_2d_2_15()

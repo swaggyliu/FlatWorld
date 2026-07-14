@@ -1,4 +1,4 @@
-"""2D tests for AnalyticalDomain, HeightFieldDomain, and VoxelGridDomain."""
+"""2D tests for GroundDomain, HeightFieldDomain, and VoxelGridDomain."""
 
 import os
 import sys
