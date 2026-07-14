@@ -116,7 +116,7 @@ def test_2Danalytical_rotation(headless=False):
                     print("  Result:   Failure\n")
 
             assert np.allclose(allclose, [True for i in range(3)])
-            return 1
+            assert True, "All rotation tests passed successfully."
     print(f"Simulation completed at t={t:.2f}s")
 
 

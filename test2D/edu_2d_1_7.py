@@ -1,0 +1,61 @@
+import math
+import numpy as np
+import os
+import sys
+import taichi as ti
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+from flatworld import (
+    GroundDomain,
+    BallRigid,
+    BoxRigid,
+    ExplicitLoop,
+    Fixed,
+    FixedAll,
+    Gravity,
+    RevoluteJoint,
+    RigidBodyDomain,
+)
+
+
+def edu_2d_1_7():
+
+    ti.init(offline_cache=True, arch=ti.cpu)
+    rigid1 = BallRigid(2, [0.5 + 0.1 * math.sqrt(2), 0.4], 0.1, 1.0)
+    rigid2 = BoxRigid(2, [0.3, 0.2], [0.4, 0.2], [0, 0], 1.0)
+    jointPoint1 = BallRigid(2, [0.3, 0.4], 1.0, 1.0)
+    bcs = [Gravity([0, -10.0])]
+    rigiddomain1 = RigidBodyDomain(rigid1, bcs)
+    rigiddomain2 = RigidBodyDomain(rigid2, bcs=[FixedAll([0])])
+    rigiddomain3 = RigidBodyDomain(jointPoint1, bcs=[Fixed([0])], considerContact=False)
+
+    analytical1 = GroundDomain(2, [0.3, 0.3], (1, 0), bcs=[Fixed([0])])
+    domains = [rigiddomain1, rigiddomain2, rigiddomain3, analytical1]
+
+    joint1 = RevoluteJoint(2, 0, [0.3, 0.4], [0, 0], bcs=[])
+    frame_dt = 1.0 / 60.0
+    looper = ExplicitLoop(0.0, domains, joints=[joint1], useAdapativeDT=True)
+
+    gui = ti.GUI("EDU2D", res=(720, 720), background_color=0xFFFFFF)
+    t = 0.0
+    while gui.running and t < 10.0:
+        # advance exactly one visual frame using adaptive substeps
+        looper.advanceWithTime(frame_dt)
+
+        t += frame_dt
+
+        rigiddomain1.draw(gui, 0x347EA8, 720)
+        rigiddomain2.draw(gui, 0x000000, 720)
+        analytical1.draw(gui, 0x000000, leftlength=0, rightlength=0.7, linewidth=2)
+
+        pos1 = rigiddomain1.getCurrentRefPoint()
+        gui.circle(pos1, 0x000000, 720 * 0.01)
+        gui.line([0.2, 0.3], pos1, color=0x000000, radius=2)
+        gui.show()
+
+
+if __name__ == "__main__":
+    edu_2d_1_7()

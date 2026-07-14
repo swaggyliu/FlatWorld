@@ -191,7 +191,7 @@ def test_2Drigid_bcs(headless=False):
                     print("  Result:   Failure\n")
 
             assert np.allclose(allclose, [True for i in range(11)])
-            return 1
+            assert True, "All rigid body tests passed successfully."
 
         # Benchmark mode loop control
         if BENCHMARK_MODE:
