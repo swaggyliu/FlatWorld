@@ -1,19 +1,18 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 from flatworld import GroundDomain, BoxRigid, ExplicitLoop, Force, Gravity, RigidBodyDomain
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def _run_2d_box_friction(force_x, end_time=5.0, headless=True, write_output=False):
     """Run a 2D box-on-plane friction scene and return the final position."""
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
 
     center = np.array([0.0, 0.05])
     mass = 1.0
@@ -63,7 +62,7 @@ def _run_2d_box_friction(force_x, end_time=5.0, headless=True, write_output=Fals
 
 def _run_2d_box_friction_inclined(angle=0.0, end_time=5.0, headless=True):
     """Run a 2D box-on-inclined-plane friction scene and return the final position."""
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
 
     center = np.array([0.5, 0.5 * np.tan(np.radians(angle)) + 0.05 / np.cos(np.radians(angle))])
     mass = 1.0

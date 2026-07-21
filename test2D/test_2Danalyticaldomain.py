@@ -1,27 +1,22 @@
-"""2D tests for GroundDomain, HeightFieldDomain, and VoxelGridDomain."""
+"""2D tests for GroundDomain, HeightFieldDomain, and VoxelGridDomain (Warp)."""
 
 import os
 import sys
 
 import numpy as np
 import pytest
-import taichi as ti
+from test_utils import init_sim
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-
-def _init_taichi_cpu():
-    if not ti.lang.impl.get_runtime().prog:
-        ti.init(offline_cache=True, arch=ti.cpu)
+init_sim()
 
 
 def test_analytical_domain_creation_2d():
     from flatworld import GroundDomain
     from flatworld.definitions import DomainType
-
-    _init_taichi_cpu()
 
     ad = GroundDomain(2, [0, 0.1], [0, 1])
     assert ad.type == DomainType.ANALYTICAL
@@ -30,16 +25,12 @@ def test_analytical_domain_creation_2d():
 def test_analytical_domain_get_bbox_2d():
     from flatworld import GroundDomain
 
-    _init_taichi_cpu()
-
     ad = GroundDomain(2, [0, 0.1], [0, 1])
     assert ad.getBBox() is not None
 
 
 def test_analytical_domain_in_simulation_2d():
     from flatworld import GroundDomain, BallRigid, ExplicitLoop, Gravity, RigidBodyDomain
-
-    _init_taichi_cpu()
 
     rigid = BallRigid(2, [0.5, 0.5], 0.02, 1.0)
     domain = RigidBodyDomain(rigid, [Gravity([0, -9.8])], considerContact=True)
@@ -57,8 +48,6 @@ def test_heightfield_creation_2d():
     from flatworld import HeightFieldDomain
     from flatworld.definitions import DomainType
 
-    _init_taichi_cpu()
-
     heights = np.array([0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float64)
     hf = HeightFieldDomain(2, heights, lb=[0.0, 0.0], ub=[1.0, 0.5])
     assert hf.type == DomainType.HEIGHTFIELD
@@ -66,8 +55,6 @@ def test_heightfield_creation_2d():
 
 def test_heightfield_sine_2d():
     from flatworld import HeightFieldDomain
-
-    _init_taichi_cpu()
 
     x = np.linspace(0, 1, 50)
     heights = 0.2 + 0.1 * np.sin(2 * np.pi * x)
@@ -78,8 +65,6 @@ def test_heightfield_sine_2d():
 def test_heightfield_ball_landing_2d():
     from flatworld import BallRigid, ExplicitLoop, Gravity, RigidBodyDomain
     from flatworld import HeightFieldDomain
-
-    _init_taichi_cpu()
 
     heights = np.ones(20, dtype=np.float64) * 0.2
     hf = HeightFieldDomain(2, heights, lb=[0.0, 0.0], ub=[1.0, 0.5])
@@ -99,16 +84,12 @@ def test_voxel_creation_2d():
     from flatworld import VoxelGridDomain
     from flatworld.definitions import DomainType
 
-    _init_taichi_cpu()
-
     vg = VoxelGridDomain(2, nx=5, ny=5, lb=[0.0, 0.0], ub=[1.0, 1.0])
     assert vg.type == DomainType.VOXELMAP
 
 
 def test_voxel_with_occupancy_2d():
     from flatworld import VoxelGridDomain
-
-    _init_taichi_cpu()
 
     occ = np.zeros((5, 5), dtype=np.int32)
     occ[0, :] = 1
@@ -120,8 +101,6 @@ def test_voxel_with_occupancy_2d():
 def test_voxel_ball_landing_2d():
     from flatworld import BallRigid, ExplicitLoop, Gravity, RigidBodyDomain
     from flatworld import VoxelGridDomain
-
-    _init_taichi_cpu()
 
     occ = np.zeros((10, 10), dtype=np.int32)
     occ[:3, :] = 1

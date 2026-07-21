@@ -1,66 +1,68 @@
 from definitions import *
 import numpy as np
-import taichi as ti
+import warp as wp
 
-@ti.func
-def cal2DRotationMat(theta):
+
+@wp.func
+def cal2DRotationMat(theta: float):
     """Return 2D rotation matrix for angle theta."""
-    return ti.Matrix([[ti.cos(theta), -ti.sin(theta)], [ti.sin(theta), ti.cos(theta)]])
+    c = wp.cos(theta)
+    s = wp.sin(theta)
+    return wp.mat22(c, -s, s, c)
 
 
-@ti.func
-def vectorCrossProduct(v1, v2):
-    res = ti.Vector.zero(ti.f32, v1.n)
-    res[0] = v1[0] * v2[1] - v2[0] * v1[1]
+@wp.func
+def vectorCrossProduct(v1: wp.vec2, v2: wp.vec2):
+    """2D cross product stored in the first component of a vec2 (z-component)."""
+    return wp.vec2(v1[0] * v2[1] - v2[0] * v1[1], 0.0)
 
-    return res
 
 # ---------------------------------------------------------------------------------
 # Geometry Queries
 # ---------------------------------------------------------------------------------
 
 
-@ti.func
-def planeSDFQuery(pos, origin, normal):
+@wp.func
+def planeSDFQuery(pos: wp.vec2, origin: wp.vec2, normal: wp.vec2):
     """Signed distance from point to plane (positive outside along normal)."""
     p = pos - origin
-    penetration = p.dot(normal)
+    penetration = wp.dot(p, normal)
     return penetration
 
 
-@ti.func
-def sphereSDFQuery(pos, origin, radius):
+@wp.func
+def sphereSDFQuery(pos: wp.vec2, origin: wp.vec2, radius: float):
     """Signed distance and outward normal from point to sphere surface."""
     p = pos - origin
-    penetration = p.norm() - radius
-    n = p.normalized(1e-9)
+    nlen = wp.length(p)
+    penetration = nlen - radius
+    n = p / wp.max(nlen, 1e-9)
     return penetration, n
 
 
-@ti.func
-def capsuleSDFQuery(pos, origin, lc, radius):
+@wp.func
+def capsuleSDFQuery(pos: wp.vec2, origin: wp.vec2, lc: wp.vec2, radius: float):
     """Signed distance from point to capsule (rounded cylinder) surface."""
     # Transform point to capsule local space
     p = lc
-    q = 2 * origin - lc
+    q = 2.0 * origin - lc
     dis, t, closest = calMinDisNode2Segment(pos, p, q)
     penetration = dis - radius
     normal_vec = pos - closest
-    n = normal_vec.normalized(1e-9)
+    nlen = wp.length(normal_vec)
+    n = normal_vec / wp.max(nlen, 1e-9)
     return penetration, n
 
 
-@ti.func
-def obbSDFQuery(point, obbCenter, obbExtents, rotMat):
-    """Compute signed distance and outward normal from point to OBB.
-
-    Works for both 2D and 3D based on point.n dimension.
+@wp.func
+def obbSDFQuery(point: wp.vec2, obbCenter: wp.vec2, obbExtents: wp.vec2, rotMat: wp.mat22):
+    """Compute signed distance and outward normal from point to 2D OBB.
 
     Args:
-        point: Query point position (2D or 3D vector)
+        point: Query point position
         obbCenter: OBB center position
         obbExtents: Full extents of the box (will be halved internally)
-        rotMat: Rotation matrix (2x2 for 2D, 3x3 for 3D)
+        rotMat: 2x2 rotation matrix
 
     Returns:
         (signed_distance, normal):
@@ -68,66 +70,59 @@ def obbSDFQuery(point, obbCenter, obbExtents, rotMat):
             - signed_distance < 0: point inside, negative distance to nearest surface
             - normal: always points FROM OBB TO point (outward from OBB perspective)
     """
-    d = ti.static(point.n)  # Dimension: 2 or 3
-    maxSignedDis = -1e9
-    normal = ti.Vector.zero(ti.f32, d)
-    obbExtents = 0.5 * obbExtents
+    maxSignedDis = float(-1e9)
+    normal = wp.vec2(0.0, 0.0)
+    half_ext = 0.5 * obbExtents
 
     # Transform point to local space
     localPoint = point - obbCenter
-    localPoint = rotMat.transpose() @ localPoint
+    localPoint = wp.transpose(rotMat) @ localPoint
 
-    # Compute signed distances to all faces (2*d faces total)
-    num_faces = ti.static(2 * d)
-    signedDistances = ti.Vector.zero(ti.f32, num_faces)
+    # Signed distances to all four faces
+    sd0 = localPoint[0] - half_ext[0]  # +x
+    sd1 = -localPoint[0] - half_ext[0]  # -x
+    sd2 = localPoint[1] - half_ext[1]  # +y
+    sd3 = -localPoint[1] - half_ext[1]  # -y
 
-    for i in ti.static(range(d)):
-        # Distance to positive face (normal = +axis_i)
-        signedDistances[2 * i] = localPoint[i] - obbExtents[i]
-        # Distance to negative face (normal = -axis_i)
-        signedDistances[2 * i + 1] = -localPoint[i] - obbExtents[i]
+    if sd0 > maxSignedDis:
+        maxSignedDis = sd0
+        normal = wp.vec2(1.0, 0.0)
+    if sd1 > maxSignedDis:
+        maxSignedDis = sd1
+        normal = wp.vec2(-1.0, 0.0)
+    if sd2 > maxSignedDis:
+        maxSignedDis = sd2
+        normal = wp.vec2(0.0, 1.0)
+    if sd3 > maxSignedDis:
+        maxSignedDis = sd3
+        normal = wp.vec2(0.0, -1.0)
 
-        # Track the face with maximum signed distance
-        if signedDistances[2 * i] > maxSignedDis:
-            maxSignedDis = signedDistances[2 * i]
-            normal.fill(0.0)
-            normal[i] = 1.0
-
-        if signedDistances[2 * i + 1] > maxSignedDis:
-            maxSignedDis = signedDistances[2 * i + 1]
-            normal.fill(0.0)
-            normal[i] = -1.0
-
-    # Determine if point is outside the box
     is_outside = False
-    for i in ti.static(range(d)):
-        if signedDistances[2 * i] > 0 or signedDistances[2 * i + 1] > 0:
-            is_outside = True
+    if sd0 > 0.0 or sd1 > 0.0 or sd2 > 0.0 or sd3 > 0.0:
+        is_outside = True
 
-    # Compute final distance and normal
     if is_outside:
-        # Point is outside: compute Euclidean distance to nearest surface point
         # Clamp local point to box extents to find nearest point on box
-        clamped = ti.Vector.zero(ti.f32, d)
-        for i in ti.static(range(d)):
-            if localPoint[i] < -obbExtents[i]:
-                clamped[i] = -obbExtents[i]
-            elif localPoint[i] > obbExtents[i]:
-                clamped[i] = obbExtents[i]
-            else:
-                clamped[i] = localPoint[i]
+        cx = localPoint[0]
+        if localPoint[0] < -half_ext[0]:
+            cx = -half_ext[0]
+        elif localPoint[0] > half_ext[0]:
+            cx = half_ext[0]
 
-        # Distance vector from nearest point to actual point (in local space)
+        cy = localPoint[1]
+        if localPoint[1] < -half_ext[1]:
+            cy = -half_ext[1]
+        elif localPoint[1] > half_ext[1]:
+            cy = half_ext[1]
+
+        clamped = wp.vec2(cx, cy)
         delta = localPoint - clamped
-        dist = delta.norm()
+        dist = wp.length(delta)
 
-        # Normal points from box surface to point
         if dist > 1e-9:
-            normal = delta / dist  # Local normal
-        # else: point exactly on surface, use face normal from maxSignedDis
+            normal = delta / dist
 
         maxSignedDis = dist
-    # else: point is inside, maxSignedDis and normal already set correctly
 
     # Transform normal back to world space
     normal = rotMat @ normal
@@ -135,45 +130,42 @@ def obbSDFQuery(point, obbCenter, obbExtents, rotMat):
     return maxSignedDis, normal
 
 
-@ti.func
-def calMinDisNode2Segment(pos, p, q):
+@wp.func
+def calMinDisNode2Segment(pos: wp.vec2, p: wp.vec2, q: wp.vec2):
     """Return (distance, t, closest) from point to segment [p,q], with t in [0,1]."""
-    # p, q is the start and end point of the segment
     ap = pos - p
     ab = q - p
 
-    ab_sq = ab.dot(ab)
-    # if ab_sq == 0:
-    #     return ap.norm()
+    ab_sq = wp.dot(ab, ab)
 
-    t = ap.dot(ab) / ab_sq
-    t = max(0, min(1, t))
+    t = wp.dot(ap, ab) / ab_sq
+    t = wp.max(0.0, wp.min(1.0, t))
 
     closest = p + t * ab
-    return (pos - closest).norm(), t, closest
+    return wp.length(pos - closest), t, closest
 
 
-@ti.func
-def calMinDisSegment2Segment(a, b, c, d):
-    """Return concatenated nearest points (p followed by q) between two segments."""
+@wp.func
+def calMinDisSegment2Segment(a: wp.vec2, b: wp.vec2, c: wp.vec2, d: wp.vec2):
+    """Return closest points (p, q) and parameters (sc, tc) between two segments."""
     # Robust algorithm for closest points between two segments
     # Based on the algorithm in "Real-Time Collision Detection" (Ericson).
     u = b - a
     v = d - c
     w = a - c
 
-    a_val = u.dot(u)  # squared length of segment S1
-    b_val = u.dot(v)
-    c_val = v.dot(v)  # squared length of segment S2
-    d_val = u.dot(w)
-    e_val = v.dot(w)
+    a_val = wp.dot(u, u)  # squared length of segment S1
+    b_val = wp.dot(u, v)
+    c_val = wp.dot(v, v)  # squared length of segment S2
+    d_val = wp.dot(u, w)
+    e_val = wp.dot(v, w)
 
-    SMALL_NUM = 1e-9
+    SMALL_NUM = float(1e-9)
 
     D = a_val * c_val - b_val * b_val  # denominator
 
-    sN = 0.0
-    tN = 0.0
+    sN = float(0.0)
+    tN = float(0.0)
     sD = D
     tD = D
 
@@ -220,8 +212,12 @@ def calMinDisSegment2Segment(a, b, c, d):
             sD = a_val
 
     # finally compute the parameters sc and tc
-    sc = 0.0 if abs(sN) < SMALL_NUM else sN / sD
-    tc = 0.0 if abs(tN) < SMALL_NUM else tN / tD
+    sc = float(0.0)
+    if wp.abs(sN) >= SMALL_NUM:
+        sc = sN / sD
+    tc = float(0.0)
+    if wp.abs(tN) >= SMALL_NUM:
+        tc = tN / tD
 
     # compute the closest points
     p_closest = a + sc * u
@@ -234,98 +230,82 @@ def calMinDisSegment2Segment(a, b, c, d):
 # Bounding box helpers
 # ---------------------------------------------------------------------------------
 
-# Some functions
-@ti.func
-def getBallBBox(center, radius, rotMat):
+
+@wp.func
+def getBallBBox(center: wp.vec2, radius: float, rotMat: wp.mat22):
     """Return axis-aligned bbox (lb, up) for a ball."""
-    lb = center - radius
-    up = center + radius
+    lb = center - wp.vec2(radius, radius)
+    up = center + wp.vec2(radius, radius)
     return lb, up
 
 
-@ti.func
-def getBoxBBox(center, extent, rotMat):
-    """Get box bounding box. For 2D, RotU_or_quat is a scalar angle. For 3D, it's a quaternion [w,x,y,z]."""
-    aabb_min = ti.Vector([1e9 for i in ti.static(range(center.n))])
-    aabb_max = ti.Vector([-1e9 for i in ti.static(range(center.n))])
-    shapeCoords = ti.Matrix.zero(ti.f32, 2**center.n, center.n)
-
-    """Return AABB and four corner coords for a 2D OBB (lb, ub, c0..c3)."""
+@wp.func
+def getBoxBBox(center: wp.vec2, extent: wp.vec2, rotMat: wp.mat22):
+    """Return AABB and four corner coords for a 2D OBB (lb, ub, shapeCoords 4x2)."""
     lr0 = -0.5 * (rotMat @ extent)
-    lr1 = 0.5 * (rotMat @ ti.Vector([extent[0], -extent[1]]))
-    lr2 = 0.5 * (rotMat @ ti.Vector([extent[0], extent[1]]))
-    lr3 = 0.5 * (rotMat @ ti.Vector([-extent[0], extent[1]]))
+    lr1 = 0.5 * (rotMat @ wp.vec2(extent[0], -extent[1]))
+    lr2 = 0.5 * (rotMat @ wp.vec2(extent[0], extent[1]))
+    lr3 = 0.5 * (rotMat @ wp.vec2(-extent[0], extent[1]))
 
     newCoord0 = center + lr0
     newCoord1 = center + lr1
     newCoord2 = center + lr2
     newCoord3 = center + lr3
 
-    aabb_min = ti.min(aabb_min, newCoord0)
-    aabb_max = ti.max(aabb_max, newCoord0)
-    aabb_min = ti.min(aabb_min, newCoord1)
-    aabb_max = ti.max(aabb_max, newCoord1)
-    aabb_min = ti.min(aabb_min, newCoord2)
-    aabb_max = ti.max(aabb_max, newCoord2)
-    aabb_min = ti.min(aabb_min, newCoord3)
-    aabb_max = ti.max(aabb_max, newCoord3)
+    aabb_min = wp.min(wp.min(newCoord0, newCoord1), wp.min(newCoord2, newCoord3))
+    aabb_max = wp.max(wp.max(newCoord0, newCoord1), wp.max(newCoord2, newCoord3))
 
-    shapeCoords[0, 0] = newCoord0[0]
-    shapeCoords[0, 1] = newCoord0[1]
-    shapeCoords[1, 0] = newCoord1[0]
-    shapeCoords[1, 1] = newCoord1[1]
-    shapeCoords[2, 0] = newCoord2[0]
-    shapeCoords[2, 1] = newCoord2[1]
-    shapeCoords[3, 0] = newCoord3[0]
-    shapeCoords[3, 1] = newCoord3[1]
+    shapeCoords = wp.matrix(
+        newCoord0[0],
+        newCoord0[1],
+        newCoord1[0],
+        newCoord1[1],
+        newCoord2[0],
+        newCoord2[1],
+        newCoord3[0],
+        newCoord3[1],
+        shape=(4, 2),
+        dtype=float,
+    )
 
     return aabb_min, aabb_max, shapeCoords
 
 
-@ti.func
-def getCapsuleBBox(center, lcdir, radius, RotMat):
+@wp.func
+def getCapsuleBBox(center: wp.vec2, lcdir: wp.vec2, radius: float, RotMat: wp.mat22):
     """Compute bbox for a capsule (rounded cylinder) shape."""
     axis = lcdir
-    axis_len = axis.norm()
-    dir = axis / axis_len  # This is the half of axis length
+    axis_len = wp.length(axis)
+    dir = axis / axis_len  # half-axis direction before rotation
 
     # Apply rotation to get world-space axis direction
     dir = RotMat @ dir
 
     # Endpoints of the capsule axis (centers of hemispherical caps)
-    p0 = center - dir * axis_len  # One endpoint
-    p1 = center + dir * axis_len  # Other endpoint
+    p0 = center - dir * axis_len
+    p1 = center + dir * axis_len
 
-    # For each coordinate axis, the extent is determined by:
-    # - The axis endpoints
-    # - The perpendicular radius contribution: radius * sqrt(1 - (axis_dir[i])^2)
-    # - The axial radius contribution for hemispherical caps: radius * |axis_dir[i]|
-    lb = ti.Vector.zero(ti.f32, lcdir.n)
-    ub = ti.Vector.zero(ti.f32, lcdir.n)
+    # Perpendicular + axial radius contributions per axis
+    perp0 = radius * wp.sqrt(wp.max(0.0, 1.0 - dir[0] * dir[0]))
+    axial0 = radius * wp.abs(dir[0])
+    perp1 = radius * wp.sqrt(wp.max(0.0, 1.0 - dir[1] * dir[1]))
+    axial1 = radius * wp.abs(dir[1])
 
-    for i in ti.static(range(lcdir.n)):
-        # Perpendicular component for this axis (cylindrical body)
-        perp_contrib = radius * ti.sqrt(ti.max(0.0, 1.0 - dir[i] * dir[i]))
+    coord_min0 = wp.min(p0[0], p1[0])
+    coord_max0 = wp.max(p0[0], p1[0])
+    coord_min1 = wp.min(p0[1], p1[1])
+    coord_max1 = wp.max(p0[1], p1[1])
 
-        # Axial component for hemispherical caps
-        axial_contrib = radius * ti.abs(dir[i])
-
-        # Min and max from endpoints
-        coord_min = ti.min(p0[i], p1[i])
-        coord_max = ti.max(p0[i], p1[i])
-
-        # Expand by perpendicular radius AND axial cap radius
-        lb[i] = coord_min - perp_contrib - axial_contrib
-        ub[i] = coord_max + perp_contrib + axial_contrib
+    lb = wp.vec2(coord_min0 - perp0 - axial0, coord_min1 - perp1 - axial1)
+    ub = wp.vec2(coord_max0 + perp0 + axial0, coord_max1 + perp1 + axial1)
 
     return lb, ub
 
 
 # ============================================================================================
 # ============================================================================================
-@ti.data_oriented
 class Transform:
     def __init__(self, offset, scale, quat):
-        self.offset = ti.Vector(offset)
-        self.scale = ti.Vector(scale)
-        self.quat = ti.Vector(quat)
+        self.offset = np.asarray(offset, dtype=np.float32)
+        self.scale = np.asarray(scale, dtype=np.float32)
+        self.quat = np.asarray(quat, dtype=np.float32)

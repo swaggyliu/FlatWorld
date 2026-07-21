@@ -1,10 +1,8 @@
 from definitions import *
 from numericaldomain import DomainBase
 import numpy as np
-import taichi as ti
 
 
-@ti.data_oriented
 class FemDomain(DomainBase):
 
     def __init__(self, mesh, prop, bcs=[], considerContact=True, considerGroundContact=True, initials=[], friction=0.0):
@@ -29,8 +27,9 @@ class FemDomain(DomainBase):
     def getBBox(
         self,
     ):
-        domain_idx = self.femManager.femDomainIds[self.domainIdx]
-        return self.femManager.aabb[domain_idx, 0], self.femManager.aabb[domain_idx, 1]
+        domain_idx = int(self.femManager.femDomainIds.numpy()[self.domainIdx])
+        aabb = self.femManager.aabb.numpy()
+        return aabb[domain_idx, 0], aabb[domain_idx, 1]
 
     def attach(self, femManager, domainIdx):
         self.femManager = femManager
@@ -46,13 +45,16 @@ class FemDomain(DomainBase):
         return self.mesh.numElements
 
     def getCurrentCoords(self):
-        ndStart = self.femManager.domainNodeOffset[self.domainIdx]
+        ndStart = int(self.femManager.domainNodeOffset.numpy()[self.domainIdx])
         ndEnd = ndStart + self.mesh.numNodes
-        return self.femManager.coords.to_numpy()[ndStart:ndEnd, :]
+        return self.femManager.coords.numpy()[ndStart:ndEnd, :]
 
     def draw(self, gui, color=0xFFFFFF):
-        ndStart = self.femManager.domainNodeOffset[self.domainIdx]
+        ndStart = int(self.femManager.domainNodeOffset.numpy()[self.domainIdx])
         ndEnd = ndStart + self.mesh.numNodes
-        pos = self.femManager.coords.to_numpy()[ndStart:ndEnd, :2]
+        pos = self.femManager.coords.numpy()[ndStart:ndEnd, :2]
         a, b, c = self.mesh.connectivity.T
-        gui.triangles(pos[a], pos[b], pos[c], color=color)
+        # Viewer has circles/lines (no triangles); draw edges
+        gui.lines(pos[a], pos[b], radius=1, color=color)
+        gui.lines(pos[b], pos[c], radius=1, color=color)
+        gui.lines(pos[c], pos[a], radius=1, color=color)

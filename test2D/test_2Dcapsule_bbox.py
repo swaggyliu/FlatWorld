@@ -1,17 +1,19 @@
-"""2D cylinder and capsule bounding-box tests."""
+"""2D cylinder and capsule bounding-box tests (Warp)."""
 
 import os
 import sys
 
 import numpy as np
 import pytest
-import taichi as ti
+from test_utils import init_sim
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 from flatworld import CapsuleRigid, ExplicitLoop, Gravity, RigidBodyDomain
+
+init_sim()
 
 
 def _expected_bbox_capsule(lc, uc, radius):
@@ -38,8 +40,6 @@ def _expected_bbox_capsule(lc, uc, radius):
 
 
 def test_capsule_bbox_2d():
-    ti.init(arch=ti.cpu)
-
     rigid1 = CapsuleRigid(2, [0.5, 0.3], [0.5, 0.7], [0], 0.1, 1.0)
     domain1 = RigidBodyDomain(rigid1, [Gravity([0, -10])], considerContact=True)
 
@@ -62,8 +62,6 @@ def test_capsule_bbox_2d():
 
 
 def test_capsule_bbox_inclined_2d():
-    ti.init(arch=ti.cpu)
-
     lc = [0.4, 0.3]
     uc = [0.7, 0.55]
     radius = 0.05
@@ -73,8 +71,8 @@ def test_capsule_bbox_inclined_2d():
 
     lb, ub = domain.getBBox()
     exp_lb, exp_ub = _expected_bbox_capsule(lc, uc, radius)
-    assert np.allclose(lb.to_numpy(), exp_lb, atol=1e-2)
-    assert np.allclose(ub.to_numpy(), exp_ub, atol=1e-2)
+    assert np.allclose(np.asarray(lb), exp_lb, atol=1e-2)
+    assert np.allclose(np.asarray(ub), exp_ub, atol=1e-2)
 
 
 if __name__ == "__main__":

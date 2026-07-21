@@ -2,7 +2,6 @@ from math import pi
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -24,7 +23,7 @@ from flatworld import (
     RigidBodyDomain,
 )
 from flatworld.joints import PrismaticJoint, RevoluteJoint, WeldJoint
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Djoint_rotation(headless=False):
@@ -38,7 +37,7 @@ def test_2Djoint_rotation(headless=False):
 
     The test shows various rotation behaviors through joints connecting rigid bodies.
     """
-    ti.init(offline_cache=True, arch=ti.cpu, default_fp=ti.f32)
+    init_sim()
 
     radius = 0.04
 
@@ -75,8 +74,10 @@ def test_2Djoint_rotation(headless=False):
 
     frame_dt = 1.0 / 60.0
     looper = ExplicitLoop(0.0, domains, joints=[joint1, joint2], damping=0.05, useAdapativeDT=True, use_pd=2)
-    looper.rigidManager.joint_control_target[0] = pi
-    looper.rigidManager.joint_control_target[1] = pi / 2
+    _jct = looper.rigidManager.joint_control_target.numpy()
+    _jct[0] = pi
+    _jct[1] = pi / 2
+    looper.rigidManager.joint_control_target.assign(_jct)
 
     looper.stableTime = 1e-3
     gui = create_gui_if_available("2D Joint Rotation Test", res=(800, 800)) if not headless else None
@@ -129,8 +130,8 @@ def test_2Djoint_rotation(headless=False):
 
             gui.show()
 
-    currentOrigin1 = looper.rigidManager.rigidParams[1, 0].to_numpy()
-    currentOrigin2 = looper.rigidManager.rigidParams[3, 0].to_numpy()
+    currentOrigin1 = looper.rigidManager.rigidParams.numpy()[1, 0]
+    currentOrigin2 = looper.rigidManager.rigidParams.numpy()[3, 0]
 
     print("currentOrigin1:", currentOrigin1)
     print("currentOrigin2:", currentOrigin2)
@@ -152,7 +153,7 @@ def test_2Djoint_rotation_smallMass(headless=False):
 
     The test shows various rotation behaviors through joints connecting rigid bodies.
     """
-    ti.init(offline_cache=True, arch=ti.cpu, default_fp=ti.f32)
+    init_sim()
 
     radius = 0.04
 
@@ -189,8 +190,10 @@ def test_2Djoint_rotation_smallMass(headless=False):
 
     frame_dt = 1.0 / 60.0
     looper = ExplicitLoop(0.0, domains, joints=[joint1, joint2], damping=0.05, useAdapativeDT=True, use_pd=2)
-    looper.rigidManager.joint_control_target[0] = pi
-    looper.rigidManager.joint_control_target[1] = pi / 2
+    _jct = looper.rigidManager.joint_control_target.numpy()
+    _jct[0] = pi
+    _jct[1] = pi / 2
+    looper.rigidManager.joint_control_target.assign(_jct)
 
     looper.stableTime = 1e-3
     gui = create_gui_if_available("2D Joint Rotation Test", res=(800, 800)) if not headless else None
@@ -243,8 +246,8 @@ def test_2Djoint_rotation_smallMass(headless=False):
 
             gui.show()
 
-    currentOrigin1 = looper.rigidManager.rigidParams[1, 0].to_numpy()
-    currentOrigin2 = looper.rigidManager.rigidParams[3, 0].to_numpy()
+    currentOrigin1 = looper.rigidManager.rigidParams.numpy()[1, 0]
+    currentOrigin2 = looper.rigidManager.rigidParams.numpy()[3, 0]
 
     print("currentOrigin1:", currentOrigin1)
     print("currentOrigin2:", currentOrigin2)
@@ -266,7 +269,7 @@ def test_2Djoint_rotation_smallbutSame(headless=False):
 
     The test shows various rotation behaviors through joints connecting rigid bodies.
     """
-    ti.init(offline_cache=True, arch=ti.cpu, default_fp=ti.f32)
+    init_sim()
 
     radius = 0.04
 
@@ -303,8 +306,10 @@ def test_2Djoint_rotation_smallbutSame(headless=False):
 
     frame_dt = 1.0 / 60.0
     looper = ExplicitLoop(0.0, domains, joints=[joint1, joint2], damping=0.05, useAdapativeDT=True, use_pd=2)
-    looper.rigidManager.joint_control_target[0] = pi
-    looper.rigidManager.joint_control_target[1] = pi / 2
+    _jct = looper.rigidManager.joint_control_target.numpy()
+    _jct[0] = pi
+    _jct[1] = pi / 2
+    looper.rigidManager.joint_control_target.assign(_jct)
 
     looper.stableTime = 1e-3
     gui = create_gui_if_available("2D Joint Rotation Test", res=(800, 800)) if not headless else None
@@ -357,8 +362,8 @@ def test_2Djoint_rotation_smallbutSame(headless=False):
 
             gui.show()
 
-    currentOrigin1 = looper.rigidManager.rigidParams[1, 0].to_numpy()
-    currentOrigin2 = looper.rigidManager.rigidParams[3, 0].to_numpy()
+    currentOrigin1 = looper.rigidManager.rigidParams.numpy()[1, 0]
+    currentOrigin2 = looper.rigidManager.rigidParams.numpy()[3, 0]
 
     print("currentOrigin1:", currentOrigin1)
     print("currentOrigin2:", currentOrigin2)

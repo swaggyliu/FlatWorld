@@ -1,13 +1,12 @@
-import numpy as np
-import taichi as ti
+import warp as wp
 
 # ==================== Support Functions ====================
 
 
-@ti.func
+@wp.func
 def support_box(
-    center: ti.math.vec3, extent: ti.math.vec3, rotation: ti.math.mat3, direction: ti.math.vec3
-) -> ti.math.vec3:
+    center: wp.vec3, extent: wp.vec3, rotation: wp.mat33, direction: wp.vec3
+) -> wp.vec3:
     """Support function for an oriented box (OBB).
     Args:
         center: Box center position
@@ -18,10 +17,10 @@ def support_box(
         The furthest point on the box in the given direction
     """
     # Transform direction to local space
-    local_dir = rotation.transpose() @ direction
+    local_dir = wp.transpose(rotation) @ direction
 
     # Find support point in local space (aligned box)
-    local_support = ti.math.vec3(
+    local_support = wp.vec3(
         extent.x if local_dir.x > 0.0 else -extent.x,
         extent.y if local_dir.y > 0.0 else -extent.y,
         extent.z if local_dir.z > 0.0 else -extent.z,
@@ -31,10 +30,10 @@ def support_box(
     return center + rotation @ local_support
 
 
-@ti.func
+@wp.func
 def support_capsule(
-    center: ti.math.vec3, axis: ti.math.vec3, radius: ti.f32, rotation: ti.math.mat3, direction: ti.math.vec3
-) -> ti.math.vec3:
+    center: wp.vec3, axis: wp.vec3, radius: float, rotation: wp.mat33, direction: wp.vec3
+) -> wp.vec3:
     """Support function for a capsule (cylinder with hemispherical caps).
     Args:
         center: Capsule center position
@@ -51,14 +50,14 @@ def support_capsule(
     """
     # Ensure axis is normalized
     axis_normalized = axis
-    half_height = axis.norm()
+    half_height = wp.length(axis)
     if half_height > 1e-8:
         axis_normalized = axis / half_height
 
     axis_normalized = rotation @ axis_normalized
 
     # Decompose direction into axial component
-    axial_component = direction.dot(axis_normalized)
+    axial_component = wp.dot(direction, axis_normalized)
 
     # Support along the axis (which end cap?)
     sign = 1.0 if axial_component >= 0.0 else -1.0
@@ -66,16 +65,16 @@ def support_capsule(
 
     # Support on the sphere (radial component)
     # The sphere extends in all directions by radius
-    dir_norm = direction.norm()
-    radial_support = ti.math.vec3(0.0)
+    dir_norm = wp.length(direction)
+    radial_support = wp.vec3(0.0, 0.0, 0.0)
     if dir_norm > 1e-8:
         radial_support = (direction / dir_norm) * radius
 
     return center + axial_support + radial_support
 
 
-@ti.func
-def support_ball(center: ti.math.vec3, radius: ti.f32, direction: ti.math.vec3) -> ti.math.vec3:
+@wp.func
+def support_ball(center: wp.vec3, radius: float, direction: wp.vec3) -> wp.vec3:
     """Support function for a ball (sphere).
     Args:
         center: Ball center position
@@ -87,23 +86,23 @@ def support_ball(center: ti.math.vec3, radius: ti.f32, direction: ti.math.vec3) 
     The support function for a sphere is simply:
         center + radius * normalized(direction)
     """
-    dir = direction.normalized()
+    dir = wp.normalize(direction)
     # Arbitrary direction if direction is zero
     return center + dir * radius
 
 
-@ti.func
+@wp.func
 def support_minkowski_diff(
-    shape_a_type: ti.i32,
-    center_a: ti.math.vec3,
-    params_a: ti.math.vec4,
-    rot_a: ti.math.mat3,
-    shape_b_type: ti.i32,
-    center_b: ti.math.vec3,
-    params_b: ti.math.vec4,
-    rot_b: ti.math.mat3,
-    direction: ti.math.vec3,
-) -> tuple:
+    shape_a_type: int,
+    center_a: wp.vec3,
+    params_a: wp.vec4,
+    rot_a: wp.mat33,
+    shape_b_type: int,
+    center_b: wp.vec3,
+    params_b: wp.vec4,
+    rot_b: wp.mat33,
+    direction: wp.vec3,
+):
     """Support function for Minkowski difference A - B.
     Shape types: 0=Box, 2=Capsule, 3=Ball
     For Box: params = (extent_x, extent_y, extent_z, 0)
@@ -115,25 +114,25 @@ def support_minkowski_diff(
         - witness_a: support point on shape A
         - witness_b: support point on shape B
     """
-    support_a = ti.math.vec3(0.0)
-    support_b = ti.math.vec3(0.0)
+    support_a = wp.vec3(0.0, 0.0, 0.0)
+    support_b = wp.vec3(0.0, 0.0, 0.0)
 
     # Get support point from shape A
     if shape_a_type == 0:  # Box
-        support_a = support_box(center_a, ti.math.vec3(params_a.x, params_a.y, params_a.z), rot_a, direction)
+        support_a = support_box(center_a, wp.vec3(params_a.x, params_a.y, params_a.z), rot_a, direction)
     elif shape_a_type == 2:  # Capsule
         support_a = support_capsule(
-            center_a, ti.math.vec3(params_a[1], params_a[2], params_a[3]), params_a[0], rot_a, direction
+            center_a, wp.vec3(params_a[1], params_a[2], params_a[3]), params_a[0], rot_a, direction
         )
     else:  # Ball (shape_a_type == 3)
         support_a = support_ball(center_a, params_a[0], direction)
 
     # Get support point from shape B in opposite direction
     if shape_b_type == 0:  # Box
-        support_b = support_box(center_b, ti.math.vec3(params_b.x, params_b.y, params_b.z), rot_b, -direction)
+        support_b = support_box(center_b, wp.vec3(params_b.x, params_b.y, params_b.z), rot_b, -direction)
     elif shape_b_type == 2:  # Capsule
         support_b = support_capsule(
-            center_b, ti.math.vec3(params_b[1], params_b[2], params_b[3]), params_b[0], rot_b, -direction
+            center_b, wp.vec3(params_b[1], params_b[2], params_b[3]), params_b[0], rot_b, -direction
         )
     else:  # Ball (shape_b_type == 3)
         support_b = support_ball(center_b, params_b[0], -direction)
@@ -141,30 +140,30 @@ def support_minkowski_diff(
     return support_a - support_b, support_a, support_b
 
 
-@ti.func
-def triple_product(a, b, c):
+@wp.func
+def triple_product(a: wp.vec3, b: wp.vec3, c: wp.vec3):
     """triple product：(a × b) × c"""
-    return b * a.dot(c) - a * b.dot(c)
+    return b * wp.dot(a, c) - a * wp.dot(b, c)
 
 
 # ==================== Core GJK Logic ====================
 
 
-@ti.func
+@wp.func
 def run_gjk(
-    shape_a_type: ti.i32,
-    center_a: ti.math.vec3,
-    params_a: ti.math.vec4,
-    rot_a: ti.math.mat3,
-    shape_b_type: ti.i32,
-    center_b: ti.math.vec3,
-    params_b: ti.math.vec4,
-    rot_b: ti.math.mat3,
-    simplex: ti.template(),
-    witness_a: ti.template(),
-    witness_b: ti.template(),
-    d: ti.i32,
-) -> tuple:
+    shape_a_type: int,
+    center_a: wp.vec3,
+    params_a: wp.vec4,
+    rot_a: wp.mat33,
+    shape_b_type: int,
+    center_b: wp.vec3,
+    params_b: wp.vec4,
+    rot_b: wp.mat33,
+    simplex: wp.array(dtype=float, ndim=2),
+    witness_a: wp.array(dtype=float, ndim=2),
+    witness_b: wp.array(dtype=float, ndim=2),
+    d: int,
+):
     """
     Core GJK loop logic shared by gjk_collision and gjk_epa_collision.
     Updates simplex and witness points in place.
@@ -172,15 +171,15 @@ def run_gjk(
     """
     # Initial direction
     direction = center_b - center_a
-    if direction.norm() < 1e-10:
-        direction = ti.math.vec3(1.0, 0.0, 0.0)
+    if wp.length(direction) < 1e-10:
+        direction = wp.vec3(1.0, 0.0, 0.0)
     else:
-        direction = direction.normalized()
+        direction = wp.normalize(direction)
 
-    simplex_size = 0
+    simplex_size = int(0)
     max_iter = 64
-    has_collision = 0
-    should_continue = 1
+    has_collision = int(0)
+    should_continue = int(1)
 
     for iteration in range(max_iter):
         if should_continue == 1:
@@ -190,7 +189,7 @@ def run_gjk(
 
             # CRITICAL: For first iteration, always add the point even if it doesn't pass origin
             # The initial direction might be wrong, so we need at least one point to start
-            if simplex_size > 0 and p.dot(direction) < 0.0:
+            if simplex_size > 0 and wp.dot(p, direction) < 0.0:
                 # After first point, if new point doesn't pass origin, no collision
                 should_continue = 0
             else:
@@ -207,7 +206,7 @@ def run_gjk(
                 simplex_size += 1
 
                 if simplex_size == 1:
-                    direction = -p.normalized()
+                    direction = -wp.normalize(p)
                 elif simplex_size == 2:
                     simplex_size, direction, contains = handle_line_gjk(simplex, witness_a, witness_b, direction)
                     if contains == 1:
@@ -219,8 +218,8 @@ def run_gjk(
                         has_collision = 1
                         should_continue = 0
 
-                if should_continue == 1 and direction.norm() < 1e-10:
-                    direction = ti.math.vec3(1.0, 0.0, 0.0)
+                if should_continue == 1 and wp.length(direction) < 1e-10:
+                    direction = wp.vec3(1.0, 0.0, 0.0)
 
     return has_collision, simplex_size
 
@@ -228,18 +227,18 @@ def run_gjk(
 # ==================== GJK Algorithm ====================
 
 
-@ti.func
+@wp.func
 def gjk_collision(
-    shape_a_type: ti.i32,
-    center_a: ti.math.vec3,
-    params_a: ti.math.vec4,
-    rot_a: ti.math.mat3,
-    shape_b_type: ti.i32,
-    center_b: ti.math.vec3,
-    params_b: ti.math.vec4,
-    rot_b: ti.math.mat3,
-    d: ti.i32,
-) -> ti.i32:
+    shape_a_type: int,
+    center_a: wp.vec3,
+    params_a: wp.vec4,
+    rot_a: wp.mat33,
+    shape_b_type: int,
+    center_b: wp.vec3,
+    params_b: wp.vec4,
+    rot_b: wp.mat33,
+    d: int,
+) -> int:
     """
     GJK collision detection algorithm.
     Args:
@@ -247,10 +246,10 @@ def gjk_collision(
     Returns: 1 if collision detected, 0 otherwise
     """
     # Simplex storage (max 4 points for 3D)
-    simplex = ti.Matrix.zero(ti.f32, 4, 3)
+    simplex = wp.zeros(shape=(4, 3), dtype=float)
     # Dummy witness storage for GJK only
-    witness_a = ti.Matrix.zero(ti.f32, 4, 3)
-    witness_b = ti.Matrix.zero(ti.f32, 4, 3)
+    witness_a = wp.zeros(shape=(4, 3), dtype=float)
+    witness_b = wp.zeros(shape=(4, 3), dtype=float)
 
     collision_detected, _ = run_gjk(
         shape_a_type,
@@ -270,39 +269,42 @@ def gjk_collision(
     return collision_detected
 
 
-@ti.func
+@wp.func
 def handle_line_gjk(
-    simplex: ti.template(), witness_a: ti.template(), witness_b: ti.template(), direction: ti.math.vec3
-) -> tuple:
+    simplex: wp.array(dtype=float, ndim=2),
+    witness_a: wp.array(dtype=float, ndim=2),
+    witness_b: wp.array(dtype=float, ndim=2),
+    direction: wp.vec3,
+):
     """Handle line segment simplex for GJK. Returns (size, direction, contains_origin).
 
     CRITICAL: If origin is ON the line segment (degenerate case), this indicates collision!
     This happens when cylinder caps or flat surfaces create coplanar Minkowski difference.
     """
-    a = ti.math.vec3(simplex[1, 0], simplex[1, 1], simplex[1, 2])
-    b = ti.math.vec3(simplex[0, 0], simplex[0, 1], simplex[0, 2])
+    a = wp.vec3(simplex[1, 0], simplex[1, 1], simplex[1, 2])
+    b = wp.vec3(simplex[0, 0], simplex[0, 1], simplex[0, 2])
 
     ab = b - a
     ao = -a
 
-    new_size = 2
+    new_size = int(2)
     new_dir = direction
-    contains = 0
+    contains = int(0)
 
-    if ab.dot(ao) > 0.0:
+    if wp.dot(ab, ao) > 0.0:
         new_dir = triple_product(ab, ao, ab)
 
         # CRITICAL FIX: If triple product is nearly zero, origin is ON the line segment
         # This is a degenerate case indicating collision (e.g., cap-to-cap contact)
-        if new_dir.norm() < 1e-6:
+        if wp.length(new_dir) < 1e-6:
             # Origin is on or very close to the line segment
             # Check distance from origin to line
-            ab_len = ab.norm()
+            ab_len = wp.length(ab)
             if ab_len > 1e-10:
                 # Project origin onto line segment
-                t = ti.max(0.0, ti.min(1.0, ao.dot(ab) / (ab_len * ab_len)))
+                t = wp.max(0.0, wp.min(1.0, wp.dot(ao, ab) / (ab_len * ab_len)))
                 closest_point = a + ab * t
-                dist_to_line = closest_point.norm()
+                dist_to_line = wp.length(closest_point)
 
                 # If origin is very close to the line segment, we have collision
                 if dist_to_line < 1e-6:
@@ -312,7 +314,7 @@ def handle_line_gjk(
                     new_dir = ao
             else:
                 # Degenerate line (a == b), check if origin is at this point
-                if ao.norm() < 1e-6:
+                if wp.length(ao) < 1e-6:
                     contains = 1
                 else:
                     new_dir = ao
@@ -329,18 +331,22 @@ def handle_line_gjk(
         new_dir = ao
 
     # Normalize direction if we're continuing
-    if contains == 0 and new_dir.norm() > 1e-10:
-        new_dir = new_dir.normalized()
+    if contains == 0 and wp.length(new_dir) > 1e-10:
+        new_dir = wp.normalize(new_dir)
     elif contains == 0:
-        new_dir = ti.math.vec3(1.0, 0.0, 0.0)
+        new_dir = wp.vec3(1.0, 0.0, 0.0)
 
     return new_size, new_dir, contains
 
 
-@ti.func
+@wp.func
 def handle_triangle_gjk(
-    simplex: ti.template(), witness_a: ti.template(), witness_b: ti.template(), direction: ti.math.vec3, d: ti.i32
-) -> ti.template():
+    simplex: wp.array(dtype=float, ndim=2),
+    witness_a: wp.array(dtype=float, ndim=2),
+    witness_b: wp.array(dtype=float, ndim=2),
+    direction: wp.vec3,
+    d: int,
+):
     """Handle triangle simplex for GJK. Returns (size, direction, contains_origin).
 
     Args:
@@ -351,25 +357,25 @@ def handle_triangle_gjk(
     CRITICAL: If origin is ON the triangle (coplanar, degenerate case), this indicates collision!
     This happens when cylinder caps or flat surfaces create coplanar Minkowski difference.
     """
-    a = ti.math.vec3(simplex[2, 0], simplex[2, 1], simplex[2, 2])
-    b = ti.math.vec3(simplex[1, 0], simplex[1, 1], simplex[1, 2])
-    c = ti.math.vec3(simplex[0, 0], simplex[0, 1], simplex[0, 2])
+    a = wp.vec3(simplex[2, 0], simplex[2, 1], simplex[2, 2])
+    b = wp.vec3(simplex[1, 0], simplex[1, 1], simplex[1, 2])
+    c = wp.vec3(simplex[0, 0], simplex[0, 1], simplex[0, 2])
 
     ab = b - a
     ac = c - a
     ao = -a
 
-    abc = ab.cross(ac)
-    abc_norm = abc.norm()
+    abc = wp.cross(ab, ac)
+    abc_norm = wp.length(abc)
 
-    new_size = 3
+    new_size = int(3)
     new_dir = direction
-    contains = 0
+    contains = int(0)
 
     # Check which region origin is in
-    if abc.cross(ac).dot(ao) > 0.0:
+    if wp.dot(wp.cross(abc, ac), ao) > 0.0:
         # Origin is on the outside of AC edge
-        if ac.dot(ao) > 0.0:
+        if wp.dot(ac, ao) > 0.0:
             # Region AC: origin is closest to AC edge
             simplex[0, 0] = c.x
             simplex[0, 1] = c.y
@@ -397,9 +403,9 @@ def handle_triangle_gjk(
             new_size = 1
             new_dir = ao
     else:
-        if ab.cross(abc).dot(ao) > 0.0:
+        if wp.dot(wp.cross(ab, abc), ao) > 0.0:
             # Origin is on the outside of AB edge
-            if ab.dot(ao) > 0.0:
+            if wp.dot(ab, ao) > 0.0:
                 # Region AB: origin is closest to AB edge
                 simplex[0, 0] = b.x
                 simplex[0, 1] = b.y
@@ -432,10 +438,10 @@ def handle_triangle_gjk(
             contains = 1
 
     # Normalize direction if continuing
-    if contains == 0 and new_dir.norm() > 1e-10:
-        new_dir = new_dir.normalized()
+    if contains == 0 and wp.length(new_dir) > 1e-10:
+        new_dir = wp.normalize(new_dir)
     elif contains == 0:
-        new_dir = ti.math.vec3(1.0, 0.0, 0.0)
+        new_dir = wp.vec3(1.0, 0.0, 0.0)
 
     return new_size, new_dir, contains
 
@@ -443,22 +449,22 @@ def handle_triangle_gjk(
 # ==================== EPA Algorithm ====================
 
 
-@ti.func
+@wp.func
 def epa_penetration(
-    shape_a_type: ti.i32,
-    center_a: ti.math.vec3,
-    params_a: ti.math.vec4,
-    rot_a: ti.math.mat3,
-    shape_b_type: ti.i32,
-    center_b: ti.math.vec3,
-    params_b: ti.math.vec4,
-    rot_b: ti.math.mat3,
-    simplex: ti.template(),
-    simplex_witness_a: ti.template(),
-    simplex_witness_b: ti.template(),
-    simplex_size: ti.i32,
-    d: ti.i32,
-) -> ti.template():
+    shape_a_type: int,
+    center_a: wp.vec3,
+    params_a: wp.vec4,
+    rot_a: wp.mat33,
+    shape_b_type: int,
+    center_b: wp.vec3,
+    params_b: wp.vec4,
+    rot_b: wp.mat33,
+    simplex: wp.array(dtype=float, ndim=2),
+    simplex_witness_a: wp.array(dtype=float, ndim=2),
+    simplex_witness_b: wp.array(dtype=float, ndim=2),
+    simplex_size: int,
+    d: int,
+):
     """
     EPA (Expanding Polytope Algorithm) for penetration depth calculation.
     Args:
@@ -469,28 +475,27 @@ def epa_penetration(
         d: Dimension (2 for 2D, 3 for 3D)
     Returns: (penetration_depth, contact_normal, contact_point_on_A, contact_point_on_B, success)
     """
-    # Use ti.static for compile-time constants
-    max_vertices = ti.static(32)
-    max_faces = ti.static(64)
-    max_iter = ti.static(32)
+    max_vertices = 32
+    max_faces = 64
+    max_iter = 32
 
-    penetration_depth = 0.0
-    contact_normal = ti.math.vec3(0.0, 0.0, 1.0)
+    penetration_depth = float(0.0)
+    contact_normal = wp.vec3(0.0, 0.0, 1.0)
     contact_point_a = center_a
     contact_point_b = center_b
-    success = 1
+    success = int(1)
 
     # ==================== 2D EPA: Polygon expansion ====================
     if d == 2:
         # In 2D, EPA works with edges of a polygon (not faces of a polyhedron)
         # Simplex is a triangle (3 points) in 2D
-        vertices_2d = ti.Matrix.zero(ti.f32, max_vertices, 2)
-        num_vertices = 0
+        vertices_2d = wp.zeros(shape=(max_vertices, 2), dtype=float)
+        num_vertices = int(0)
 
         # Store witness points on A and B for each Minkowski vertex
         # This enables barycentric interpolation for accurate contact points
-        witness_a = ti.Matrix.zero(ti.f32, max_vertices, 3)
-        witness_b = ti.Matrix.zero(ti.f32, max_vertices, 3)
+        witness_a = wp.zeros(shape=(max_vertices, 3), dtype=float)
+        witness_b = wp.zeros(shape=(max_vertices, 3), dtype=float)
 
         # Initialize with simplex vertices (only x, y) and their witness points
         for i in range(simplex_size):
@@ -508,10 +513,10 @@ def epa_penetration(
             num_vertices += 1
 
         # Edges storage (each edge has 2 vertex indices)
-        edges = ti.Matrix.zero(ti.i32, max_vertices, 2)
-        edge_normals = ti.Matrix.zero(ti.f32, max_vertices, 2)
-        edge_distances = ti.Vector.zero(ti.f32, max_vertices)
-        num_edges = 0
+        edges = wp.zeros(shape=(max_vertices, 2), dtype=int)
+        edge_normals = wp.zeros(shape=(max_vertices, 2), dtype=float)
+        edge_distances = wp.zeros(shape=(max_vertices,), dtype=float)
+        num_edges = int(0)
 
         # Initialize triangle edges (in CCW order)
         if simplex_size == 3:
@@ -525,33 +530,33 @@ def epa_penetration(
             idx_a = edges[i, 0]
             idx_b = edges[i, 1]
 
-            va = ti.math.vec2(vertices_2d[idx_a, 0], vertices_2d[idx_a, 1])
-            vb = ti.math.vec2(vertices_2d[idx_b, 0], vertices_2d[idx_b, 1])
+            va2 = wp.vec2(vertices_2d[idx_a, 0], vertices_2d[idx_a, 1])
+            vb2 = wp.vec2(vertices_2d[idx_b, 0], vertices_2d[idx_b, 1])
 
-            edge = vb - va
+            edge = vb2 - va2
             # 2D perpendicular: (x, y) -> (-y, x)
-            normal_2d = ti.math.vec2(-edge.y, edge.x)
-            normal_len = normal_2d.norm()
+            normal_2d = wp.vec2(-edge.y, edge.x)
+            normal_len = wp.length(normal_2d)
 
             if normal_len > 1e-10:
                 normal_2d = normal_2d / normal_len
 
             # Ensure normal points away from origin (outward)
             # In EPA, origin is inside the polygon, so normal.dot(vertex) should be positive
-            if normal_2d.dot(va) < 0.0:
+            if wp.dot(normal_2d, va2) < 0.0:
                 normal_2d = -normal_2d
 
             edge_normals[i, 0] = normal_2d.x
             edge_normals[i, 1] = normal_2d.y
             # Distance from origin to edge (should be positive)
-            edge_distances[i] = normal_2d.dot(va)
+            edge_distances[i] = wp.dot(normal_2d, va2)
 
         # EPA iterations for 2D
-        epa_continue = 1
+        epa_continue = int(1)
         for iteration in range(max_iter):
             if epa_continue == 1:
                 # Find closest edge
-                closest_edge = 0
+                closest_edge = int(0)
                 min_distance = edge_distances[0]
 
                 for i in range(1, num_edges):
@@ -560,21 +565,21 @@ def epa_penetration(
                         closest_edge = i
 
                 # Get support point in direction of closest edge normal
-                search_dir_2d = ti.math.vec2(edge_normals[closest_edge, 0], edge_normals[closest_edge, 1])
-                search_dir_3d = ti.math.vec3(search_dir_2d.x, search_dir_2d.y, 0.0)
+                search_dir_2d = wp.vec2(edge_normals[closest_edge, 0], edge_normals[closest_edge, 1])
+                search_dir_3d = wp.vec3(search_dir_2d.x, search_dir_2d.y, 0.0)
 
                 support_point, support_a_new, support_b_new = support_minkowski_diff(
                     shape_a_type, center_a, params_a, rot_a, shape_b_type, center_b, params_b, rot_b, search_dir_3d
                 )
-                support_point_2d = ti.math.vec2(support_point.x, support_point.y)
+                support_point_2d = wp.vec2(support_point.x, support_point.y)
 
                 # Check if we've found the edge
-                support_distance = support_point_2d.dot(search_dir_2d)
+                support_distance = wp.dot(support_point_2d, search_dir_2d)
 
                 if support_distance - min_distance < 1e-4:
                     # Converged
                     penetration_depth = min_distance
-                    contact_normal = ti.math.vec3(search_dir_2d.x, search_dir_2d.y, 0.0)
+                    contact_normal = wp.vec3(search_dir_2d.x, search_dir_2d.y, 0.0)
                     epa_continue = 0
                 elif num_vertices >= max_vertices:
                     # Vertex limit reached
@@ -616,25 +621,25 @@ def epa_penetration(
                         idx_a = edges[i, 0]
                         idx_b = edges[i, 1]
 
-                        va = ti.math.vec2(vertices_2d[idx_a, 0], vertices_2d[idx_a, 1])
-                        vb = ti.math.vec2(vertices_2d[idx_b, 0], vertices_2d[idx_b, 1])
+                        va2 = wp.vec2(vertices_2d[idx_a, 0], vertices_2d[idx_a, 1])
+                        vb2 = wp.vec2(vertices_2d[idx_b, 0], vertices_2d[idx_b, 1])
 
-                        edge = vb - va
-                        normal_2d = ti.math.vec2(-edge.y, edge.x)
-                        normal_len = normal_2d.norm()
+                        edge = vb2 - va2
+                        normal_2d = wp.vec2(-edge.y, edge.x)
+                        normal_len = wp.length(normal_2d)
 
                         if normal_len > 1e-10:
                             normal_2d = normal_2d / normal_len
 
-                        if normal_2d.dot(va) < 0.0:
+                        if wp.dot(normal_2d, va2) < 0.0:
                             normal_2d = -normal_2d
 
                         edge_normals[i, 0] = normal_2d.x
                         edge_normals[i, 1] = normal_2d.y
-                        edge_distances[i] = ti.abs(normal_2d.dot(va))
+                        edge_distances[i] = wp.abs(wp.dot(normal_2d, va2))
 
         # Compute contact points for 2D using barycentric coordinates
-        closest_edge = 0
+        closest_edge = int(0)
         min_distance = edge_distances[0]
         for i in range(1, num_edges):
             if edge_distances[i] < min_distance:
@@ -645,28 +650,28 @@ def epa_penetration(
         idx_a = edges[closest_edge, 0]
         idx_b = edges[closest_edge, 1]
 
-        va_2d = ti.math.vec2(vertices_2d[idx_a, 0], vertices_2d[idx_a, 1])
-        vb_2d = ti.math.vec2(vertices_2d[idx_b, 0], vertices_2d[idx_b, 1])
+        va_2d = wp.vec2(vertices_2d[idx_a, 0], vertices_2d[idx_a, 1])
+        vb_2d = wp.vec2(vertices_2d[idx_b, 0], vertices_2d[idx_b, 1])
 
         # Project origin onto the closest edge to find barycentric coordinates
         # In 2D, we have an edge (line segment), so we need parameter t ∈ [0,1]
         # v = (1-t) * va + t * vb, where v is the closest point to origin
         edge_vec = vb_2d - va_2d
-        edge_len_sq = edge_vec.dot(edge_vec)
+        edge_len_sq = wp.dot(edge_vec, edge_vec)
 
-        t = 0.0  # Barycentric coordinate
+        t = float(0.0)  # Barycentric coordinate
         if edge_len_sq > 1e-10:
-            t = ti.max(0.0, ti.min(1.0, ((-va_2d).dot(edge_vec)) / edge_len_sq))
+            t = wp.max(0.0, wp.min(1.0, (wp.dot(-va_2d, edge_vec)) / edge_len_sq))
 
         # Barycentric weights for the edge
         c1 = 1.0 - t  # Weight for vertex idx_a
         c2 = t  # Weight for vertex idx_b
 
         # Get witness points on A and B for each Minkowski vertex
-        wa1 = ti.math.vec3(witness_a[idx_a, 0], witness_a[idx_a, 1], witness_a[idx_a, 2])
-        wb1 = ti.math.vec3(witness_b[idx_a, 0], witness_b[idx_a, 1], witness_b[idx_a, 2])
-        wa2 = ti.math.vec3(witness_a[idx_b, 0], witness_a[idx_b, 1], witness_a[idx_b, 2])
-        wb2 = ti.math.vec3(witness_b[idx_b, 0], witness_b[idx_b, 1], witness_b[idx_b, 2])
+        wa1 = wp.vec3(witness_a[idx_a, 0], witness_a[idx_a, 1], witness_a[idx_a, 2])
+        wb1 = wp.vec3(witness_b[idx_a, 0], witness_b[idx_a, 1], witness_b[idx_a, 2])
+        wa2 = wp.vec3(witness_a[idx_b, 0], witness_a[idx_b, 1], witness_a[idx_b, 2])
+        wb2 = wp.vec3(witness_b[idx_b, 0], witness_b[idx_b, 1], witness_b[idx_b, 2])
 
         # Compute contact points using barycentric interpolation
         # A* = c1*A1 + c2*A2
@@ -677,12 +682,12 @@ def epa_penetration(
     # ==================== 3D EPA: Polyhedron expansion ====================
     else:
         # Polytope vertices
-        vertices = ti.Matrix.zero(ti.f32, max_vertices, 3)
-        num_vertices = 0
+        vertices = wp.zeros(shape=(max_vertices, 3), dtype=float)
+        num_vertices = int(0)
 
         # Store witness points on A and B for each Minkowski vertex
-        witness_a = ti.Matrix.zero(ti.f32, max_vertices, 3)
-        witness_b = ti.Matrix.zero(ti.f32, max_vertices, 3)
+        witness_a = wp.zeros(shape=(max_vertices, 3), dtype=float)
+        witness_b = wp.zeros(shape=(max_vertices, 3), dtype=float)
 
         # Initialize with simplex vertices and their witness points from GJK
         for i in range(simplex_size):
@@ -701,10 +706,10 @@ def epa_penetration(
             num_vertices += 1
 
         # Faces storage
-        faces = ti.Matrix.zero(ti.i32, max_faces, 3)  # Each face has 3 vertex indices
-        face_normals = ti.Matrix.zero(ti.f32, max_faces, 3)
-        face_distances = ti.Vector.zero(ti.f32, max_faces)
-        num_faces = 0
+        faces = wp.zeros(shape=(max_faces, 3), dtype=int)  # Each face has 3 vertex indices
+        face_normals = wp.zeros(shape=(max_faces, 3), dtype=float)
+        face_distances = wp.zeros(shape=(max_faces,), dtype=float)
+        num_faces = int(0)
 
         # Initialize tetrahedron faces
         if simplex_size == 4:
@@ -732,20 +737,20 @@ def epa_penetration(
             idx_b = faces[i, 1]
             idx_c = faces[i, 2]
 
-            va = ti.math.vec3(vertices[idx_a, 0], vertices[idx_a, 1], vertices[idx_a, 2])
-            vb = ti.math.vec3(vertices[idx_b, 0], vertices[idx_b, 1], vertices[idx_b, 2])
-            vc = ti.math.vec3(vertices[idx_c, 0], vertices[idx_c, 1], vertices[idx_c, 2])
+            va = wp.vec3(vertices[idx_a, 0], vertices[idx_a, 1], vertices[idx_a, 2])
+            vb = wp.vec3(vertices[idx_b, 0], vertices[idx_b, 1], vertices[idx_b, 2])
+            vc = wp.vec3(vertices[idx_c, 0], vertices[idx_c, 1], vertices[idx_c, 2])
 
             ab = vb - va
             ac = vc - va
-            normal = ab.cross(ac)
-            normal_len = normal.norm()
+            normal = wp.cross(ab, ac)
+            normal_len = wp.length(normal)
 
             if normal_len > 1e-10:
                 normal = normal / normal_len
 
             # Ensure normal points outward (away from origin)
-            if normal.dot(va) < 0.0:
+            if wp.dot(normal, va) < 0.0:
                 normal = -normal
                 # Swap b and c to maintain winding
                 faces[i, 1] = idx_c
@@ -754,14 +759,14 @@ def epa_penetration(
             face_normals[i, 0] = normal.x
             face_normals[i, 1] = normal.y
             face_normals[i, 2] = normal.z
-            face_distances[i] = ti.abs(normal.dot(va))
+            face_distances[i] = wp.abs(wp.dot(normal, va))
 
         # EPA iterations for 3D
-        epa_continue = 1
+        epa_continue = int(1)
         for iteration in range(max_iter):
             if epa_continue == 1:
                 # Find closest face
-                closest_face = 0
+                closest_face = int(0)
                 min_distance = face_distances[0]
 
                 for i in range(1, num_faces):
@@ -770,7 +775,7 @@ def epa_penetration(
                         closest_face = i
 
                 # Get support point in direction of closest face normal
-                search_dir = ti.math.vec3(
+                search_dir = wp.vec3(
                     face_normals[closest_face, 0], face_normals[closest_face, 1], face_normals[closest_face, 2]
                 )
 
@@ -779,7 +784,7 @@ def epa_penetration(
                 )
 
                 # Check if we've found the edge
-                support_distance = support_point.dot(search_dir)
+                support_distance = wp.dot(support_point, search_dir)
 
                 if support_distance - min_distance < 1e-4:
                     # Converged
@@ -809,17 +814,17 @@ def epa_penetration(
 
                     # Expand polytope: remove faces visible from new point and add new faces
                     # Mark visible faces
-                    visible = ti.Vector.zero(ti.i32, max_faces)
+                    visible = wp.zeros(shape=(max_faces,), dtype=int)
                     for i in range(num_faces):
-                        normal = ti.math.vec3(face_normals[i, 0], face_normals[i, 1], face_normals[i, 2])
-                        va = ti.math.vec3(vertices[faces[i, 0], 0], vertices[faces[i, 0], 1], vertices[faces[i, 0], 2])
-                        if normal.dot(support_point - va) > 0.0:
+                        normal = wp.vec3(face_normals[i, 0], face_normals[i, 1], face_normals[i, 2])
+                        va = wp.vec3(vertices[faces[i, 0], 0], vertices[faces[i, 0], 1], vertices[faces[i, 0], 2])
+                        if wp.dot(normal, support_point - va) > 0.0:
                             visible[i] = 1
 
                     # Find boundary edges and create new faces
                     # (Simplified: rebuild faces from scratch)
-                    new_faces = ti.Matrix.zero(ti.i32, max_faces, 3)
-                    new_num_faces = 0
+                    new_faces = wp.zeros(shape=(max_faces, 3), dtype=int)
+                    new_num_faces = int(0)
 
                     # Keep non-visible faces
                     for i in range(num_faces):
@@ -839,11 +844,11 @@ def epa_penetration(
                                 edge_end = faces[i, (j + 1) % 3]
 
                                 # Check if this edge is on the boundary (only in one visible face)
-                                is_boundary = 1
+                                is_boundary = int(1)
                                 for k in range(num_faces):
                                     if k != i and visible[k] == 1:
                                         # Check if edge is shared
-                                        edge_found = 0
+                                        edge_found = int(0)
                                         for m in range(3):
                                             e_start = faces[k, m]
                                             e_end = faces[k, (m + 1) % 3]
@@ -875,31 +880,29 @@ def epa_penetration(
                         idx_b = faces[i, 1]
                         idx_c = faces[i, 2]
 
-                        va = ti.math.vec3(vertices[idx_a, 0], vertices[idx_a, 1], vertices[idx_a, 2])
-                        vb = ti.math.vec3(vertices[idx_b, 0], vertices[idx_b, 1], vertices[idx_b, 2])
-                        vc = ti.math.vec3(vertices[idx_c, 0], vertices[idx_c, 1], vertices[idx_c, 2])
+                        va = wp.vec3(vertices[idx_a, 0], vertices[idx_a, 1], vertices[idx_a, 2])
+                        vb = wp.vec3(vertices[idx_b, 0], vertices[idx_b, 1], vertices[idx_b, 2])
+                        vc = wp.vec3(vertices[idx_c, 0], vertices[idx_c, 1], vertices[idx_c, 2])
 
                         ab = vb - va
                         ac = vc - va
-                        normal = ab.cross(ac)
-                        normal_len = normal.norm()
+                        normal = wp.cross(ab, ac)
+                        normal_len = wp.length(normal)
 
                         if normal_len > 1e-10:
                             normal = normal / normal_len
 
-                        if normal.dot(va) < 0.0:
+                        if wp.dot(normal, va) < 0.0:
                             normal = -normal
 
                         face_normals[i, 0] = normal.x
                         face_normals[i, 1] = normal.y
                         face_normals[i, 2] = normal.z
-                        face_distances[i] = ti.abs(normal.dot(va))
-            # else:
-            #     print("EPA terminated at iteration:", iteration)
+                        face_distances[i] = wp.abs(wp.dot(normal, va))
 
         # Compute contact points for 3D using barycentric coordinates
         # Find closest face (already computed by EPA)
-        closest_face = 0
+        closest_face = int(0)
         min_distance = face_distances[0]
         for i in range(1, num_faces):
             if face_distances[i] < min_distance:
@@ -911,9 +914,9 @@ def epa_penetration(
         idx_b = faces[closest_face, 1]
         idx_c = faces[closest_face, 2]
 
-        pa = ti.math.vec3(vertices[idx_a, 0], vertices[idx_a, 1], vertices[idx_a, 2])
-        pb = ti.math.vec3(vertices[idx_b, 0], vertices[idx_b, 1], vertices[idx_b, 2])
-        pc = ti.math.vec3(vertices[idx_c, 0], vertices[idx_c, 1], vertices[idx_c, 2])
+        pa = wp.vec3(vertices[idx_a, 0], vertices[idx_a, 1], vertices[idx_a, 2])
+        pb = wp.vec3(vertices[idx_b, 0], vertices[idx_b, 1], vertices[idx_b, 2])
+        pc = wp.vec3(vertices[idx_c, 0], vertices[idx_c, 1], vertices[idx_c, 2])
 
         # Project origin onto the closest face triangle to find barycentric coordinates
         # v = c1*pa + c2*pb + c3*pc, where c1 + c2 + c3 = 1
@@ -921,14 +924,14 @@ def epa_penetration(
         ac = pc - pa
         ap = -pa  # Vector from pa to origin
 
-        d1 = ab.dot(ap)
-        d2 = ac.dot(ap)
+        d1 = wp.dot(ab, ap)
+        d2 = wp.dot(ac, ap)
 
         # Compute barycentric coordinates using Voronoi regions
         # Initialize with vertex A
-        c1 = 1.0
-        c2 = 0.0
-        c3 = 0.0
+        c1 = float(1.0)
+        c2 = float(0.0)
+        c3 = float(0.0)
 
         if d1 <= 0.0 and d2 <= 0.0:
             # Vertex region A
@@ -937,8 +940,8 @@ def epa_penetration(
             c3 = 0.0
         else:
             bp = -pb
-            d3 = ab.dot(bp)
-            d4 = ac.dot(bp)
+            d3 = wp.dot(ab, bp)
+            d4 = wp.dot(ac, bp)
 
             if d3 >= 0.0 and d4 <= d3:
                 # Vertex region B
@@ -946,8 +949,8 @@ def epa_penetration(
                 c2 = 1.0
                 c3 = 0.0
             else:
-                vc = d1 * d4 - d3 * d2
-                if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+                bary_vc = d1 * d4 - d3 * d2
+                if bary_vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
                     # Edge region AB
                     v = d1 / (d1 - d3)
                     c1 = 1.0 - v
@@ -955,8 +958,8 @@ def epa_penetration(
                     c3 = 0.0
                 else:
                     cp = -pc
-                    d5 = ab.dot(cp)
-                    d6 = ac.dot(cp)
+                    d5 = wp.dot(ab, cp)
+                    d6 = wp.dot(ac, cp)
 
                     if d6 >= 0.0 and d5 <= d6:
                         # Vertex region C
@@ -964,16 +967,16 @@ def epa_penetration(
                         c2 = 0.0
                         c3 = 1.0
                     else:
-                        vb = d5 * d2 - d1 * d6
-                        if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+                        bary_vb = d5 * d2 - d1 * d6
+                        if bary_vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
                             # Edge region AC
                             w = d2 / (d2 - d6)
                             c1 = 1.0 - w
                             c2 = 0.0
                             c3 = w
                         else:
-                            va = d3 * d6 - d5 * d4
-                            if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+                            bary_va = d3 * d6 - d5 * d4
+                            if bary_va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
                                 # Edge region BC
                                 w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
                                 c1 = 0.0
@@ -981,20 +984,20 @@ def epa_penetration(
                                 c3 = w
                             else:
                                 # Inside face region
-                                denom = 1.0 / (va + vb + vc)
-                                v = vb * denom
-                                w = vc * denom
+                                denom = 1.0 / (bary_va + bary_vb + bary_vc)
+                                v = bary_vb * denom
+                                w = bary_vc * denom
                                 c1 = 1.0 - v - w
                                 c2 = v
                                 c3 = w
 
         # Get witness points on A and B for each Minkowski vertex
-        wa1 = ti.math.vec3(witness_a[idx_a, 0], witness_a[idx_a, 1], witness_a[idx_a, 2])
-        wb1 = ti.math.vec3(witness_b[idx_a, 0], witness_b[idx_a, 1], witness_b[idx_a, 2])
-        wa2 = ti.math.vec3(witness_a[idx_b, 0], witness_a[idx_b, 1], witness_a[idx_b, 2])
-        wb2 = ti.math.vec3(witness_b[idx_b, 0], witness_b[idx_b, 1], witness_b[idx_b, 2])
-        wa3 = ti.math.vec3(witness_a[idx_c, 0], witness_a[idx_c, 1], witness_a[idx_c, 2])
-        wb3 = ti.math.vec3(witness_b[idx_c, 0], witness_b[idx_c, 1], witness_b[idx_c, 2])
+        wa1 = wp.vec3(witness_a[idx_a, 0], witness_a[idx_a, 1], witness_a[idx_a, 2])
+        wb1 = wp.vec3(witness_b[idx_a, 0], witness_b[idx_a, 1], witness_b[idx_a, 2])
+        wa2 = wp.vec3(witness_a[idx_b, 0], witness_a[idx_b, 1], witness_a[idx_b, 2])
+        wb2 = wp.vec3(witness_b[idx_b, 0], witness_b[idx_b, 1], witness_b[idx_b, 2])
+        wa3 = wp.vec3(witness_a[idx_c, 0], witness_a[idx_c, 1], witness_a[idx_c, 2])
+        wb3 = wp.vec3(witness_b[idx_c, 0], witness_b[idx_c, 1], witness_b[idx_c, 2])
 
         # Compute contact points using barycentric interpolation
         # Each Minkowski vertex M_i = A_i - B_i has witness points (A_i, B_i)
@@ -1007,18 +1010,18 @@ def epa_penetration(
 # ==================== Combined GJK+EPA ====================
 
 
-@ti.func
+@wp.func
 def gjk_epa_collision(
-    shape_a_type: ti.i32,
-    center_a: ti.math.vec3,
-    params_a: ti.math.vec4,
-    rot_a: ti.math.mat3,
-    shape_b_type: ti.i32,
-    center_b: ti.math.vec3,
-    params_b: ti.math.vec4,
-    rot_b: ti.math.mat3,
-    d: ti.i32,
-) -> ti.template():
+    shape_a_type: int,
+    center_a: wp.vec3,
+    params_a: wp.vec4,
+    rot_a: wp.mat33,
+    shape_b_type: int,
+    center_b: wp.vec3,
+    params_b: wp.vec4,
+    rot_b: wp.mat33,
+    d: int,
+):
     """
     Combined GJK+EPA collision detection and penetration depth calculation.
     Args:
@@ -1027,16 +1030,16 @@ def gjk_epa_collision(
             - In 3D: tetrahedron simplex (4 points) is needed to confirm collision
     Returns: (has_collision, penetration_depth, contact_normal, contact_point_a, contact_point_b)
     """
-    has_collision = 0
-    penetration_depth = 0.0
-    contact_normal = ti.math.vec3(0.0, 0.0, 1.0)
+    has_collision = int(0)
+    penetration_depth = float(0.0)
+    contact_normal = wp.vec3(0.0, 0.0, 1.0)
     contact_point_a = center_a
     contact_point_b = center_b
 
-    simplex = ti.Matrix.zero(ti.f32, 4, 3)
+    simplex = wp.zeros(shape=(4, 3), dtype=float)
     # CRITICAL: Store witness points during GJK phase
-    simplex_witness_a = ti.Matrix.zero(ti.f32, 4, 3)
-    simplex_witness_b = ti.Matrix.zero(ti.f32, 4, 3)
+    simplex_witness_a = wp.zeros(shape=(4, 3), dtype=float)
+    simplex_witness_b = wp.zeros(shape=(4, 3), dtype=float)
 
     has_collision, simplex_size = run_gjk(
         shape_a_type,
@@ -1071,4 +1074,3 @@ def gjk_epa_collision(
         )
 
     return has_collision, penetration_depth, contact_normal, contact_point_a, contact_point_b
-

@@ -378,7 +378,7 @@ GALLERY_ENTRIES: list[dict] = [
 def capture_one(entry: dict) -> bool:
     slug = entry["slug"]
     output = GALLERY_DIR / f"{slug}.png"
-    print(f"[gallery] Capturing {slug} -> {output.name}")
+    print(f"[gallery] Capturing {slug} -> {output.name}", flush=True)
 
     cmd = [
         sys.executable,
@@ -397,7 +397,11 @@ def capture_one(entry: dict) -> bool:
         json.dumps(entry.get("kwargs", {})),
     ]
 
-    result = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        print(f"[gallery] TIMEOUT {slug}", flush=True)
+        return False
     if result.returncode != 0:
         print(result.stdout)
         print(result.stderr)
@@ -405,7 +409,7 @@ def capture_one(entry: dict) -> bool:
     if not output.exists():
         print(f"[gallery] Missing output for {slug}")
         return False
-    print(f"[gallery] OK {slug}")
+    print(f"[gallery] OK {slug}", flush=True)
     return True
 
 

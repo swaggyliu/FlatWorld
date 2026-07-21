@@ -1,80 +1,114 @@
-"""2D SAT collision tests."""
+"""2D SAT collision tests (Warp)."""
 
 import os
 import sys
-import taichi as ti
+
+import warp as wp
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from flatworld.sat import obb2d_signed_distance_quad_vs_circle, obb2d_signed_distance_quad_vs_quad, obb2d_signed_distance_quad_vs_segment
+from test_utils import init_sim
+from flatworld.sat import (
+    obb2d_signed_distance_quad_vs_circle,
+    obb2d_signed_distance_quad_vs_quad,
+    obb2d_signed_distance_quad_vs_segment,
+)
+
+init_sim()
 
 
-if not ti.lang.impl.get_runtime().prog:
-    ti.init(offline_cache=True, arch=ti.cpu)
-
-
-@ti.kernel
-def _test_2d_quad_vs_quad_overlap() -> ti.f32:
-    sd, _ = obb2d_signed_distance_quad_vs_quad(
-        ti.Vector([0.0, 0.0]), ti.Vector([1.0, 0.0]), ti.Vector([1.0, 1.0]), ti.Vector([0.0, 1.0]),
-        ti.Vector([0.5, 0.0]), ti.Vector([1.5, 0.0]), ti.Vector([1.5, 1.0]), ti.Vector([0.5, 1.0]),
+@wp.kernel
+def _k_quad_vs_quad_overlap(out: wp.array(dtype=float)):
+    sd, _n = obb2d_signed_distance_quad_vs_quad(
+        wp.vec2(0.0, 0.0),
+        wp.vec2(1.0, 0.0),
+        wp.vec2(1.0, 1.0),
+        wp.vec2(0.0, 1.0),
+        wp.vec2(0.5, 0.0),
+        wp.vec2(1.5, 0.0),
+        wp.vec2(1.5, 1.0),
+        wp.vec2(0.5, 1.0),
     )
-    return sd
+    out[0] = sd
 
 
-@ti.kernel
-def _test_2d_quad_vs_quad_separated() -> ti.f32:
-    sd, _ = obb2d_signed_distance_quad_vs_quad(
-        ti.Vector([0.0, 0.0]), ti.Vector([1.0, 0.0]), ti.Vector([1.0, 1.0]), ti.Vector([0.0, 1.0]),
-        ti.Vector([3.0, 0.0]), ti.Vector([4.0, 0.0]), ti.Vector([4.0, 1.0]), ti.Vector([3.0, 1.0]),
+@wp.kernel
+def _k_quad_vs_quad_separated(out: wp.array(dtype=float)):
+    sd, _n = obb2d_signed_distance_quad_vs_quad(
+        wp.vec2(0.0, 0.0),
+        wp.vec2(1.0, 0.0),
+        wp.vec2(1.0, 1.0),
+        wp.vec2(0.0, 1.0),
+        wp.vec2(3.0, 0.0),
+        wp.vec2(4.0, 0.0),
+        wp.vec2(4.0, 1.0),
+        wp.vec2(3.0, 1.0),
     )
-    return sd
+    out[0] = sd
 
 
-@ti.kernel
-def _test_2d_quad_vs_circle_inside() -> ti.f32:
-    sd, _ = obb2d_signed_distance_quad_vs_circle(
-        ti.Vector([0.0, 0.0]), ti.Vector([2.0, 0.0]), ti.Vector([2.0, 2.0]), ti.Vector([0.0, 2.0]),
-        ti.Vector([1.0, 1.0]), 0.3,
+@wp.kernel
+def _k_quad_vs_circle_inside(out: wp.array(dtype=float)):
+    sd, _n = obb2d_signed_distance_quad_vs_circle(
+        wp.vec2(0.0, 0.0),
+        wp.vec2(2.0, 0.0),
+        wp.vec2(2.0, 2.0),
+        wp.vec2(0.0, 2.0),
+        wp.vec2(1.0, 1.0),
+        0.3,
     )
-    return sd
+    out[0] = sd
 
 
-@ti.kernel
-def _test_2d_quad_vs_circle_outside() -> ti.f32:
-    sd, _ = obb2d_signed_distance_quad_vs_circle(
-        ti.Vector([0.0, 0.0]), ti.Vector([1.0, 0.0]), ti.Vector([1.0, 1.0]), ti.Vector([0.0, 1.0]),
-        ti.Vector([5.0, 5.0]), 0.5,
+@wp.kernel
+def _k_quad_vs_circle_outside(out: wp.array(dtype=float)):
+    sd, _n = obb2d_signed_distance_quad_vs_circle(
+        wp.vec2(0.0, 0.0),
+        wp.vec2(1.0, 0.0),
+        wp.vec2(1.0, 1.0),
+        wp.vec2(0.0, 1.0),
+        wp.vec2(5.0, 5.0),
+        0.5,
     )
-    return sd
+    out[0] = sd
 
 
-@ti.kernel
-def _test_2d_quad_vs_segment_intersect() -> ti.f32:
-    sd, _ = obb2d_signed_distance_quad_vs_segment(
-        ti.Vector([0.0, 0.0]), ti.Vector([1.0, 0.0]), ti.Vector([1.0, 1.0]), ti.Vector([0.0, 1.0]),
-        ti.Vector([0.5, -0.5]), ti.Vector([0.5, 0.5]),
+@wp.kernel
+def _k_quad_vs_segment_intersect(out: wp.array(dtype=float)):
+    sd, _n = obb2d_signed_distance_quad_vs_segment(
+        wp.vec2(0.0, 0.0),
+        wp.vec2(1.0, 0.0),
+        wp.vec2(1.0, 1.0),
+        wp.vec2(0.0, 1.0),
+        wp.vec2(0.5, -0.5),
+        wp.vec2(0.5, 0.5),
     )
-    return sd
+    out[0] = sd
+
+
+def _run(kernel) -> float:
+    out = wp.zeros(1, dtype=float)
+    wp.launch(kernel, dim=1, inputs=[out])
+    return float(out.numpy()[0])
 
 
 def test_sat2d_quad_overlap():
-    assert _test_2d_quad_vs_quad_overlap() < 0
+    assert _run(_k_quad_vs_quad_overlap) < 0
 
 
 def test_sat2d_quad_separated():
-    assert _test_2d_quad_vs_quad_separated() > 0
+    assert _run(_k_quad_vs_quad_separated) > 0
 
 
 def test_sat2d_quad_circle_inside():
-    assert _test_2d_quad_vs_circle_inside() < 0
+    assert _run(_k_quad_vs_circle_inside) < 0
 
 
 def test_sat2d_quad_circle_outside():
-    assert _test_2d_quad_vs_circle_outside() > 0
+    assert _run(_k_quad_vs_circle_outside) > 0
 
 
 def test_sat2d_quad_segment_intersect():
-    assert _test_2d_quad_vs_segment_intersect() < 0
+    assert _run(_k_quad_vs_segment_intersect) < 0

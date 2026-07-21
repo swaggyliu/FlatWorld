@@ -5,7 +5,7 @@
 
 **English** | [中文](#flat-world-中文)
 
-Taichi-accelerated 2D/3D physics engine with **explicit FEM**, **impulse-based rigid bodies**, and **batched mixed-domain contact** (analytical ground, height fields, voxel maps).
+Warp-accelerated 2D/3D physics engine with **explicit FEM**, **impulse-based rigid bodies**, and **batched mixed-domain contact** (analytical ground, height fields, voxel maps).
 
 ## Features
 
@@ -25,11 +25,11 @@ pip install -e .
 ```
 
 ```python
-import taichi as ti
 import numpy as np
 from flatworld import Mesh, FemDomain, SolidProp, Elastic, Gravity, ExplicitLoop, GroundDomain
+from flatworld.wp_init import ensure_warp
 
-ti.init(arch=ti.cpu)
+ensure_warp()
 
 conn = np.array([[0, 1, 3], [0, 3, 2]], dtype=np.int32)
 coords = np.array([[0.5, 0.5], [0.7, 0.5], [0.5, 0.7], [0.7, 0.7]], dtype=np.float32)
@@ -93,7 +93,7 @@ FlatWorld/
 
 | Package | License |
 |---------|---------|
-| [Taichi](https://github.com/taichi-dev/taichi) | Apache-2.0 |
+| [NVIDIA Warp](https://github.com/NVIDIA/warp) | Apache-2.0 |
 | numpy, scipy | BSD |
 | meshio | MIT |
 | tetgen, pymeshlab, usd-core | See respective projects |
@@ -108,7 +108,7 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 # Flat World (中文)
 
-基于 **Taichi** 的实时物理仿真引擎，支持刚体、有限元（FEM）、弹簧-质量系统，以及三种地面表示（解析平面、高度场、体素网格）。
+基于 **NVIDIA Warp** 的实时物理仿真引擎，支持刚体、有限元（FEM）、弹簧-质量系统，以及三种地面表示（解析平面、高度场、体素网格）。
 
 ## 功能概览
 

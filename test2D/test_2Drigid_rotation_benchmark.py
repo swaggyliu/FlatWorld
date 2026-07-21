@@ -2,7 +2,6 @@ import math
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -19,12 +18,12 @@ from flatworld import (
     ExplicitLoop,
     RigidBodyDomain,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Drigid_rotation_benchmark(headless=False):
 
-    ti.init(offline_cache=True, arch=ti.cpu, debug=False)
+    init_sim()
     pi = math.pi
     pivot1 = [0.2, 0.7]
     rigid1 = BallRigid(2, pivot1, 0.04, 0.01)
@@ -123,7 +122,7 @@ def test_2Drigid_rotation_benchmark(headless=False):
             # RigidBodyDomain doesn't expose runtime angle directly. Query the RigidManager
             # orientation (2D stored as scalar in quat[index][0]) and convert to a unit normal.
             mgr = looper.rigidManager
-            quat_arr = mgr.quat.to_numpy()
+            quat_arr = mgr.quat.numpy()
             idx1 = int(rigiddomain1.ndOffset)
             idx2 = int(rigiddomain2.ndOffset)
             idx4 = int(rigiddomain4.ndOffset)
@@ -132,14 +131,14 @@ def test_2Drigid_rotation_benchmark(headless=False):
             idx7 = int(rigiddomain7.ndOffset)
             idx8 = int(rigiddomain8.ndOffset)
             idx9 = int(rigiddomain9.ndOffset)
-            angle1 = float(quat_arr[idx1][0])
-            angle2 = float(quat_arr[idx2][0])
-            angle4 = float(quat_arr[idx4][0])
-            angle5 = float(quat_arr[idx5][0])
-            angle6 = float(quat_arr[idx6][0])
-            angle7 = float(quat_arr[idx7][0])
-            angle8 = float(quat_arr[idx8][0])
-            angle9 = float(quat_arr[idx9][0])
+            angle1 = float(quat_arr[idx1])
+            angle2 = float(quat_arr[idx2])
+            angle4 = float(quat_arr[idx4])
+            angle5 = float(quat_arr[idx5])
+            angle6 = float(quat_arr[idx6])
+            angle7 = float(quat_arr[idx7])
+            angle8 = float(quat_arr[idx8])
+            angle9 = float(quat_arr[idx9])
             pos1 = np.array([math.cos(angle1), math.sin(angle1)])
             pos2 = np.array([math.cos(angle2), math.sin(angle2)])
             pos4 = np.array([math.cos(angle4), math.sin(angle4)])

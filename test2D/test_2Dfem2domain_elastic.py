@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -9,7 +8,7 @@ sys.path.append(parent_dir)
 
 import argparse
 from flatworld import Elastic, ExplicitLoop, FemDomain, Gravity, Mesh, SolidProp
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def get_domains() -> list[FemDomain]:
@@ -31,7 +30,7 @@ def get_domains() -> list[FemDomain]:
 
 
 def test_2Dfem2domain_elastic(headless=False):
-    ti.init(offline_cache=True, arch=ti.gpu)
+    init_sim()
 
     conn1 = np.array([[0, 2, 1]], dtype=np.int32)
     coords1 = np.array([[0.5, 0.5], [0.5, 0.7], [0.7, 0.7]], dtype=np.float32)
@@ -57,7 +56,7 @@ def test_2Dfem2domain_elastic(headless=False):
     while gui is None or gui.running:
         looper.advanceWithTime(frame_dt)
         t += frame_dt
-        pos = looper.femSpringManager.coords.to_numpy()
+        pos = looper.femSpringManager.coords.numpy()
 
         if gui is not None:
             looper.femSpringManager.drawMesh(gui, 0xFF0033)

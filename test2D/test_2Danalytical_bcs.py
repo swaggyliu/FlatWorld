@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -20,11 +19,11 @@ from flatworld import (
     InitialVel,
     SolidProp,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2DAnalytical_bcs(headless=False):
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
 
     bc0 = EnforceVel([0], [0, 5.0])
     bc1 = EnforceAcc([0], [0, -50.0])

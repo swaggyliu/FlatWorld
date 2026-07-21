@@ -1,27 +1,1415 @@
-# Here we assume all the domain the nodeIds and elementIds are arrange as 1...n
+"""RigidManager — batched 2D rigid-body simulation (NVIDIA Warp).
+
+Public API: substep, detect_all_contacts, solve_pgs, precompute_rigid_transforms,
+drawAll, processDomains_, processJoints, etc.
+
+PGS is serial: solve_pgs launches a dim=1 kernel that loops constraints forward
+and backward. Joint rows use joint_kernels.assemble_single_joint_rows with the
+explicit-array signature.
+"""
+from __future__ import annotations
+
 from bvh import CollisionDetector
 from contact_detection import (
     detectPointToAnalyticalPlane,
     detectPointToMeshBoundary,
     detectPointToPrimitive,
+    detect_point_to_mesh_boundary_np,
+    detect_point_to_primitive_np,
 )
 from definitions import *
 from mesh import *
-from joint_kernels import assemble_single_joint_rows
+from joint_kernels import assemble_single_joint_rows, vec6f
 import numpy as np
 from operator import pos
 from rigid import *
 from sat import *
-from spatialmanager import SpatialHashManager
-import taichi as ti
+from spatialmanager import (
+    SpatialHashManager,
+    add_element,
+    set_bounds,
+    query_point,
+    query_point_with_buffer,
+)
+import warp as wp
 from utils import *
 import time
+from wp_init import ensure_warp
+
+ensure_warp()
+
+mat28 = wp.types.matrix(shape=(2, 8), dtype=wp.float32)
 
 
-@ti.data_oriented
+def _assign_scalar(arr: wp.array, value):
+    np_arr = arr.numpy()
+    if arr.dtype == wp.vec2:
+        a = np.asarray(value, dtype=np.float32).reshape(-1)
+        np_arr[0] = (float(a[0]), float(a[1]) if a.size > 1 else 0.0)
+    else:
+        np_arr[0] = value
+    arr.assign(np_arr)
+
+
+def _patch_array(arr: wp.array, index, value):
+    np_arr = arr.numpy()
+    # Host Warp arrays: coerce Python/numpy scalars and vec2-like values.
+    if arr.dtype is float or arr.dtype == wp.float32:
+        value = _as_float(value)
+    elif arr.dtype == wp.vec2:
+        a = np.asarray(value, dtype=np.float32).reshape(-1)
+        value = (float(a[0]), float(a[1]) if a.size > 1 else 0.0)
+    np_arr[index] = value
+    arr.assign(np_arr)
+
+
+def _patch_slice(arr: wp.array, start: int, values: np.ndarray):
+    np_arr = arr.numpy()
+    n = len(values)
+    np_arr[start : start + n] = values
+    arr.assign(np_arr)
+
+
+def _fill_array(arr: wp.array, value):
+    arr.fill_(value)
+
+
+def _as_float(v) -> float:
+    if hasattr(v, "__len__") and not isinstance(v, (str, bytes)):
+        a = np.asarray(v, dtype=np.float32).reshape(-1)
+        return float(a[0])
+    return float(v)
+
+
+def _as_vec2(v):
+    a = np.asarray(v, dtype=np.float32).reshape(-1)
+    return wp.vec2(float(a[0]), float(a[1]) if a.size > 1 else 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Serial PGS (dim=1) — critical path kept as real Warp kernels
+# ---------------------------------------------------------------------------
+
+@wp.func
+def _solve_pgs_single(
+    i: int,
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    inertia: wp.array(dtype=float),
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    pgs_Jac_a: wp.array(dtype=wp.vec3),
+    pgs_Jac_b: wp.array(dtype=wp.vec3),
+    pgs_rhs: wp.array(dtype=float),
+    pgs_limits: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+    pgs_parent_row: wp.array(dtype=int),
+):
+    bodypair = pgs_bodypair[i]
+    aid = bodypair[0]
+    bid = bodypair[1]
+    if aid >= 0:
+        jac_a = pgs_Jac_a[i]
+        jac_b = pgs_Jac_b[i]
+        va3 = wp.vec3(V[aid][0], V[aid][1], RotV[aid])
+        vb3 = wp.vec3(0.0, 0.0, 0.0)
+        inv_mass_a = 1.0 / (mass[aid] + 1e-12)
+        inv_Ia = 1.0 / (inertia[aid] + 1e-12)
+        massInvJacA = wp.vec3(jac_a[0] * inv_mass_a, jac_a[1] * inv_mass_a, jac_a[2] * inv_Ia)
+        vel = wp.dot(jac_a, va3)
+        W = wp.dot(jac_a, massInvJacA)
+        has_b = bid >= 0
+        massInvJacB = wp.vec3(0.0, 0.0, 0.0)
+        if has_b:
+            inv_mass_b = 1.0 / (mass[bid] + 1e-12)
+            inv_Ib = 1.0 / (inertia[bid] + 1e-12)
+            vb3 = wp.vec3(V[bid][0], V[bid][1], RotV[bid])
+            vel = vel - wp.dot(jac_b, vb3)
+            massInvJacB = wp.vec3(jac_b[0] * inv_mass_b, jac_b[1] * inv_mass_b, jac_b[2] * inv_Ib)
+            W = W + wp.dot(jac_b, massInvJacB)
+        rhs = pgs_rhs[i] - vel
+        delta_lamb = rhs / (W + 1e-12)
+        old_lamb = pgs_lambda[i]
+        new_lamb = old_lamb + delta_lamb
+        parent = pgs_parent_row[i]
+        if parent >= 0:
+            fric_lim_low = pgs_limits[i][0] * pgs_lambda[parent]
+            fric_lim_upper = pgs_limits[i][1] * pgs_lambda[parent]
+            new_lamb = wp.max(fric_lim_low, wp.min(fric_lim_upper, new_lamb))
+        else:
+            lower = pgs_limits[i][0]
+            upper = pgs_limits[i][1]
+            new_lamb = wp.max(lower, wp.min(upper, new_lamb))
+        apply_lamb = new_lamb - old_lamb
+        pgs_lambda[i] = new_lamb
+        if apply_lamb != 0.0:
+            deltaA = massInvJacA * apply_lamb
+            V[aid] = V[aid] + wp.vec2(deltaA[0], deltaA[1])
+            RotV[aid] = RotV[aid] + deltaA[2]
+            if has_b:
+                deltaB = massInvJacB * apply_lamb
+                V[bid] = V[bid] - wp.vec2(deltaB[0], deltaB[1])
+                RotV[bid] = RotV[bid] - deltaB[2]
+
+
+@wp.kernel
+def _solve_pgs_kernel(
+    pgs_iters: int,
+    numConstraints: wp.array(dtype=int),
+    max_constraints: int,
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    inertia: wp.array(dtype=float),
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    pgs_Jac_a: wp.array(dtype=wp.vec3),
+    pgs_Jac_b: wp.array(dtype=wp.vec3),
+    pgs_rhs: wp.array(dtype=float),
+    pgs_limits: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+    pgs_parent_row: wp.array(dtype=int),
+):
+    """Serial PGS — single thread loops all constraints forward then backward."""
+    tid = wp.tid()
+    if tid != 0:
+        return
+    n_constraints = int(wp.min(numConstraints[0], max_constraints))
+    for _iter in range(pgs_iters):
+        for i in range(n_constraints):
+            _solve_pgs_single(
+                i, V, RotV, mass, inertia, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+                pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+            )
+        for i in range(n_constraints):
+            k = n_constraints - 1 - i
+            _solve_pgs_single(
+                k, V, RotV, mass, inertia, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+                pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+            )
+
+
+@wp.kernel
+def _assemble_joint_constraints_wp(
+    dt: float,
+    numAnchors: int,
+    max_constraints: int,
+    joint_type: wp.array(dtype=int),
+    joint_id_a: wp.array(dtype=int),
+    joint_id_b: wp.array(dtype=int),
+    joint_params: wp.array(dtype=vec6f),
+    joint_has_motor: wp.array(dtype=int),
+    joint_motor_target_mode: wp.array(dtype=int),
+    joint_motor_target_vel: wp.array(dtype=float),
+    joint_q0_rel_inv: wp.array(dtype=float),
+    joint_axis: wp.array(dtype=wp.vec2),
+    joint_l1: wp.array(dtype=wp.vec2),
+    joint_l2: wp.array(dtype=wp.vec2),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    quat: wp.array(dtype=float),
+    quat_initial: wp.array(dtype=float),
+    RotV: wp.array(dtype=float),
+    numConstraints: wp.array(dtype=int),
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    pgs_Jac_a: wp.array(dtype=wp.vec3),
+    pgs_Jac_b: wp.array(dtype=wp.vec3),
+    pgs_rhs: wp.array(dtype=float),
+    pgs_limits: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+    pgs_parent_row: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    for j_idx in range(numAnchors):
+        assemble_single_joint_rows(
+            dt, j_idx, max_constraints,
+            joint_type, joint_id_a, joint_id_b, joint_params,
+            joint_has_motor, joint_motor_target_mode, joint_motor_target_vel,
+            joint_q0_rel_inv, joint_axis, joint_l1, joint_l2,
+            rigidParams, quat, quat_initial, RotV,
+            numConstraints, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+            pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+        )
+
+
+@wp.kernel
+def _precompute_rigid_transforms_wp(
+    num_total: int,
+    quat: wp.array(dtype=float),
+    visual_angle: wp.array(dtype=float),
+    inertia: wp.array(dtype=float),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    cached_inertia_inv_2d: wp.array(dtype=float),
+):
+    i = wp.tid()
+    if i >= num_total:
+        return
+    cached_rotation_matrix[i] = cal2DRotationMat(quat[i] + visual_angle[i])
+    I = inertia[i]
+    if I > 0.0:
+        cached_inertia_inv_2d[i] = 1.0 / I
+    else:
+        cached_inertia_inv_2d[i] = 1.0 / 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Critical-path kernels for rigid substep / AABB (ball + ground and beyond)
+# ---------------------------------------------------------------------------
+
+RIGID_TYPE_BALL = 0b00001
+RIGID_TYPE_BOX = 0b00010
+RIGID_TYPE_CAPSULE = 0b01000
+RIGID_TYPE_MESH = 0b10000
+
+CONTACT_BALLBALL = 0b00001
+CONTACT_BOXBALL = 0b00011
+CONTACT_CAPSULEBALL = 0b01001
+CONTACT_BOXBOX = 0b00010
+CONTACT_CAPSULEBOX = 0b01010
+CONTACT_CAPSULECAPSULE = 0b01000
+
+BC_ATYPE = 0b000000100
+BC_FORCETYPE = 0b000001000
+BC_GRAVITY = 0b000010000
+BC_ROTATYPE = 0b010000000
+BC_TORQUETYPE = 0b100000000
+BC_VTYPE = 0b000000010
+BC_UTYPE = 0b000000001
+BC_RTYPE = 0b000100000
+BC_ROTVTYPE = 0b001000000
+
+
+@wp.func
+def _mask_allows_pair_func(
+    idx_a: int,
+    idx_b: int,
+    category_bits: wp.array(dtype=wp.uint32),
+    collide_bits: wp.array(dtype=wp.uint32),
+):
+    allow_ab = (collide_bits[idx_a] & category_bits[idx_b]) != wp.uint32(0)
+    allow_ba = (collide_bits[idx_b] & category_bits[idx_a]) != wp.uint32(0)
+    return 1 if (allow_ab and allow_ba) else 0
+
+
+@wp.kernel
+def _classify_collision_pairs_wp(
+    pairs: wp.array(dtype=wp.vec2i),
+    num_pairs: int,
+    num_rigids: int,
+    max_collision_pairs: int,
+    max_ground_pairs: int,
+    domainToRigid: wp.array(dtype=int),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    compound_count: wp.array(dtype=int),
+    rigid_env_id: wp.array(dtype=int),
+    category_bits: wp.array(dtype=wp.uint32),
+    collide_bits: wp.array(dtype=wp.uint32),
+    num_primitive_pairs: wp.array(dtype=int),
+    num_ball_ball_pairs: wp.array(dtype=int),
+    num_box_box_pairs: wp.array(dtype=int),
+    num_box_ball_pairs: wp.array(dtype=int),
+    num_seg_point_pairs: wp.array(dtype=int),
+    num_seg_ball_pairs: wp.array(dtype=int),
+    num_seg_seg_pairs: wp.array(dtype=int),
+    num_mesh_pairs: wp.array(dtype=int),
+    num_mixed_pairs: wp.array(dtype=int),
+    num_groundprim_pairs: wp.array(dtype=int),
+    num_groundmesh_pairs: wp.array(dtype=int),
+    primitive_pairs_buffer: wp.array(dtype=wp.vec2i),
+    ball_ball_pairs_buffer: wp.array(dtype=wp.vec2i),
+    box_box_pairs_buffer: wp.array(dtype=wp.vec2i),
+    box_ball_pairs_buffer: wp.array(dtype=wp.vec2i),
+    seg_point_pairs_buffer: wp.array(dtype=wp.vec2i),
+    seg_ball_pairs_buffer: wp.array(dtype=wp.vec2i),
+    seg_seg_pairs_buffer: wp.array(dtype=wp.vec2i),
+    mesh_pairs_buffer: wp.array(dtype=wp.vec2i),
+    mixed_pairs_buffer: wp.array(dtype=wp.vec2i),
+    groundprim_pairs_buffer: wp.array(dtype=wp.vec2i),
+    groundmesh_pairs_buffer: wp.array(dtype=wp.vec2i),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+
+    num_primitive_pairs[0] = 0
+    num_ball_ball_pairs[0] = 0
+    num_box_box_pairs[0] = 0
+    num_box_ball_pairs[0] = 0
+    num_seg_point_pairs[0] = 0
+    num_seg_ball_pairs[0] = 0
+    num_seg_seg_pairs[0] = 0
+    num_mesh_pairs[0] = 0
+    num_mixed_pairs[0] = 0
+    num_groundprim_pairs[0] = 0
+    num_groundmesh_pairs[0] = 0
+
+    for i in range(num_pairs):
+        domain_a = pairs[i][0]
+        domain_b = pairs[i][1]
+        rigid_a = domainToRigid[domain_a]
+        rigid_b = domainToRigid[domain_b]
+
+        if rigid_a < 0 or rigid_b < 0:
+            continue
+        if _mask_allows_pair_func(rigid_a, rigid_b, category_bits, collide_bits) == 0:
+            continue
+
+        is_anal_a = rigid_a >= num_rigids
+        is_anal_b = rigid_b >= num_rigids
+        type_a = rigidDomainIds[rigid_a][1]
+        type_b = rigidDomainIds[rigid_b][1]
+        is_mesh_a = (type_a == RIGID_TYPE_MESH) and (compound_count[rigid_a] == 0)
+        is_mesh_b = (type_b == RIGID_TYPE_MESH) and (compound_count[rigid_b] == 0)
+
+        if is_anal_a or is_anal_b:
+            if is_anal_a and not is_anal_b:
+                if is_mesh_b:
+                    idx = int(wp.atomic_add(num_groundmesh_pairs, 0, 1))
+                    if idx < max_ground_pairs:
+                        groundmesh_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+                else:
+                    idx = int(wp.atomic_add(num_groundprim_pairs, 0, 1))
+                    if idx < max_ground_pairs:
+                        groundprim_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+            elif is_anal_b and not is_anal_a:
+                if is_mesh_a:
+                    idx = int(wp.atomic_add(num_groundmesh_pairs, 0, 1))
+                    if idx < max_ground_pairs:
+                        groundmesh_pairs_buffer[idx] = wp.vec2i(rigid_b, rigid_a)
+                else:
+                    idx = int(wp.atomic_add(num_groundprim_pairs, 0, 1))
+                    if idx < max_ground_pairs:
+                        groundprim_pairs_buffer[idx] = wp.vec2i(rigid_b, rigid_a)
+        else:
+            consider = 1
+            env_a = rigid_env_id[rigid_a]
+            env_b = rigid_env_id[rigid_b]
+            if env_a >= 0 and env_b >= 0 and env_a != env_b:
+                consider = 0
+
+            if consider == 1:
+                if is_mesh_a and is_mesh_b:
+                    idx = int(wp.atomic_add(num_mesh_pairs, 0, 1))
+                    if idx < max_collision_pairs:
+                        mesh_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+                elif is_mesh_a or is_mesh_b:
+                    idx = int(wp.atomic_add(num_mixed_pairs, 0, 1))
+                    if idx < max_collision_pairs:
+                        mixed_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+                else:
+                    contact_type = type_a | type_b
+                    if contact_type == CONTACT_BALLBALL:
+                        idx = int(wp.atomic_add(num_ball_ball_pairs, 0, 1))
+                        if idx < max_collision_pairs:
+                            ball_ball_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+                    elif contact_type == CONTACT_BOXBOX:
+                        idx = int(wp.atomic_add(num_box_box_pairs, 0, 1))
+                        if idx < max_collision_pairs:
+                            box_box_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+                    elif contact_type == CONTACT_BOXBALL:
+                        idx = int(wp.atomic_add(num_box_ball_pairs, 0, 1))
+                        if idx < max_collision_pairs:
+                            r_a = rigid_a
+                            r_b = rigid_b
+                            if type_a == RIGID_TYPE_BALL:
+                                r_a = rigid_b
+                                r_b = rigid_a
+                            box_ball_pairs_buffer[idx] = wp.vec2i(r_a, r_b)
+                    elif contact_type == CONTACT_CAPSULEBOX:
+                        idx = int(wp.atomic_add(num_seg_point_pairs, 0, 1))
+                        if idx < max_collision_pairs:
+                            r_a = rigid_a
+                            r_b = rigid_b
+                            if type_a == RIGID_TYPE_BOX:
+                                r_a = rigid_b
+                                r_b = rigid_a
+                            seg_point_pairs_buffer[idx] = wp.vec2i(r_a, r_b)
+                    elif contact_type == CONTACT_CAPSULEBALL:
+                        idx = int(wp.atomic_add(num_seg_ball_pairs, 0, 1))
+                        if idx < max_collision_pairs:
+                            r_a = rigid_a
+                            r_b = rigid_b
+                            if type_a == RIGID_TYPE_BALL:
+                                r_a = rigid_b
+                                r_b = rigid_a
+                            seg_ball_pairs_buffer[idx] = wp.vec2i(r_a, r_b)
+                    elif contact_type == CONTACT_CAPSULECAPSULE:
+                        idx = int(wp.atomic_add(num_seg_seg_pairs, 0, 1))
+                        if idx < max_collision_pairs:
+                            seg_seg_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+
+                    idx = int(wp.atomic_add(num_primitive_pairs, 0, 1))
+                    if idx < max_collision_pairs:
+                        primitive_pairs_buffer[idx] = wp.vec2i(rigid_a, rigid_b)
+
+
+@wp.func
+def _cache_contact_func(
+    aid: int,
+    bid: int,
+    cpoint: wp.vec2,
+    normal: wp.vec2,
+    depth: float,
+    max_contacts: int,
+    restitution_velocity_threshold: float,
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    num_contacts: wp.array(dtype=int),
+    contact_rigid_a: wp.array(dtype=int),
+    contact_rigid_b: wp.array(dtype=int),
+    contact_point: wp.array(dtype=wp.vec2),
+    contact_normal: wp.array(dtype=wp.vec2),
+    contact_depth: wp.array(dtype=float),
+    contact_bounce_vel: wp.array(dtype=float),
+    contact_tangent1: wp.array(dtype=wp.vec2),
+    contact_count_per_rigid: wp.array(dtype=int),
+    contact_env_count: wp.array(dtype=int),
+    contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_cc_per_env: int,
+):
+    idx = int(wp.atomic_add(num_contacts, 0, 1))
+    if idx < max_contacts:
+        contact_rigid_a[idx] = aid
+        contact_rigid_b[idx] = bid
+        contact_point[idx] = cpoint
+        contact_normal[idx] = normal
+        contact_depth[idx] = depth
+        wp.atomic_add(contact_count_per_rigid, aid, 1)
+        wp.atomic_add(contact_count_per_rigid, bid, 1)
+        ra = cpoint - rigidParams[aid, 0]
+        rb = cpoint - rigidParams[bid, 0]
+        e = 0.5 * (contactParams[aid][1] + contactParams[bid][1])
+        va = V[aid] + wp.vec2(-ra[1], ra[0]) * RotV[aid]
+        vb = V[bid] + wp.vec2(-rb[1], rb[0]) * RotV[bid]
+        vn_pre = wp.dot(va - vb, normal)
+        if vn_pre < -restitution_velocity_threshold:
+            contact_bounce_vel[idx] = -e * vn_pre
+        else:
+            contact_bounce_vel[idx] = 0.0
+        contact_tangent1[idx] = wp.vec2(-normal[1], normal[0])
+        env_id = wp.max(rigid_env_id[aid], 0)
+        if env_id < max_envs_alloc:
+            local_i = int(wp.atomic_add(contact_env_count, env_id, 1))
+            if local_i < max_cc_per_env:
+                contact_env_idx[env_id * max_cc_per_env + local_i] = idx
+
+
+@wp.kernel
+def _detect_primitive_contacts_wp(
+    num_pairs: int,
+    max_contacts: int,
+    restitution_velocity_threshold: float,
+    max_envs_alloc: int,
+    max_cc_per_env: int,
+    primitive_pairs_buffer: wp.array(dtype=wp.vec2i),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    radius: wp.array(dtype=float),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    num_contacts: wp.array(dtype=int),
+    contact_rigid_a: wp.array(dtype=int),
+    contact_rigid_b: wp.array(dtype=int),
+    contact_point: wp.array(dtype=wp.vec2),
+    contact_normal: wp.array(dtype=wp.vec2),
+    contact_depth: wp.array(dtype=float),
+    contact_bounce_vel: wp.array(dtype=float),
+    contact_tangent1: wp.array(dtype=wp.vec2),
+    contact_count_per_rigid: wp.array(dtype=int),
+    contact_env_count: wp.array(dtype=int),
+    contact_env_idx: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+
+    for i in range(num_pairs):
+        pair = primitive_pairs_buffer[i]
+        rigid_a = pair[0]
+        rigid_b = pair[1]
+        type_a = rigidDomainIds[rigid_a][1]
+        type_b = rigidDomainIds[rigid_b][1]
+        contact_type = type_a | type_b
+
+        if contact_type == CONTACT_BALLBALL:
+            rad = radius[rigid_a] + radius[rigid_b]
+            p = rigidParams[rigid_a, 0] - rigidParams[rigid_b, 0]
+            l = wp.length(p)
+            if l < rad and l > 1e-12:
+                n = p / l
+                cpoint_mid = (rigidParams[rigid_a, 0] + rigidParams[rigid_b, 0]) * 0.5
+                _cache_contact_func(
+                    rigid_a,
+                    rigid_b,
+                    cpoint_mid,
+                    n,
+                    l - rad,
+                    max_contacts,
+                    restitution_velocity_threshold,
+                    rigidParams,
+                    V,
+                    RotV,
+                    contactParams,
+                    rigid_env_id,
+                    num_contacts,
+                    contact_rigid_a,
+                    contact_rigid_b,
+                    contact_point,
+                    contact_normal,
+                    contact_depth,
+                    contact_bounce_vel,
+                    contact_tangent1,
+                    contact_count_per_rigid,
+                    contact_env_count,
+                    contact_env_idx,
+                    max_envs_alloc,
+                    max_cc_per_env,
+                )
+
+        elif contact_type == CONTACT_BOXBOX:
+            hit, penetration, normal_ij, cpoint = obb2d_contact_quad_vs_quad(
+                rigidParams[rigid_a, 0],
+                rigidParams[rigid_a, 1] * 0.5,
+                cached_rotation_matrix[rigid_a],
+                rigidParams[rigid_b, 0],
+                rigidParams[rigid_b, 1] * 0.5,
+                cached_rotation_matrix[rigid_b],
+            )
+            if hit == 1:
+                _cache_contact_func(
+                    rigid_a,
+                    rigid_b,
+                    cpoint,
+                    -normal_ij,
+                    penetration,
+                    max_contacts,
+                    restitution_velocity_threshold,
+                    rigidParams,
+                    V,
+                    RotV,
+                    contactParams,
+                    rigid_env_id,
+                    num_contacts,
+                    contact_rigid_a,
+                    contact_rigid_b,
+                    contact_point,
+                    contact_normal,
+                    contact_depth,
+                    contact_bounce_vel,
+                    contact_tangent1,
+                    contact_count_per_rigid,
+                    contact_env_count,
+                    contact_env_idx,
+                    max_envs_alloc,
+                    max_cc_per_env,
+                )
+
+        elif contact_type == CONTACT_BOXBALL:
+            box_idx = rigid_a
+            ball_idx = rigid_b
+            if type_a == RIGID_TYPE_BALL:
+                box_idx = rigid_b
+                ball_idx = rigid_a
+            pos = rigidParams[ball_idx, 0]
+            l, n, _c = detectPointToPrimitive(
+                pos,
+                rigidDomainIds[box_idx][1],
+                rigidParams[box_idx, 0],
+                rigidParams[box_idx, 1],
+                cached_rotation_matrix[box_idx],
+                radius[box_idx],
+            )
+            l = l - radius[ball_idx]
+            if l < 0.0:
+                nlen = wp.length(n)
+                if nlen > 1e-9:
+                    n = n / nlen
+                else:
+                    diff = pos - rigidParams[box_idx, 0]
+                    dlen = wp.length(diff)
+                    n = diff / (dlen + 1e-9)
+                cpoint = pos - n * radius[ball_idx]
+                _cache_contact_func(
+                    ball_idx,
+                    box_idx,
+                    cpoint,
+                    n,
+                    l,
+                    max_contacts,
+                    restitution_velocity_threshold,
+                    rigidParams,
+                    V,
+                    RotV,
+                    contactParams,
+                    rigid_env_id,
+                    num_contacts,
+                    contact_rigid_a,
+                    contact_rigid_b,
+                    contact_point,
+                    contact_normal,
+                    contact_depth,
+                    contact_bounce_vel,
+                    contact_tangent1,
+                    contact_count_per_rigid,
+                    contact_env_count,
+                    contact_env_idx,
+                    max_envs_alloc,
+                    max_cc_per_env,
+                )
+
+        elif contact_type == CONTACT_CAPSULECAPSULE:
+            center1 = rigidParams[rigid_a, 0]
+            lc1 = cached_rotation_matrix[rigid_a] @ rigidParams[rigid_a, 1] + center1
+            uc1 = center1 * 2.0 - lc1
+            r1 = radius[rigid_a]
+            center2 = rigidParams[rigid_b, 0]
+            lc2 = cached_rotation_matrix[rigid_b] @ rigidParams[rigid_b, 1] + center2
+            uc2 = center2 * 2.0 - lc2
+            r2 = radius[rigid_b]
+            p, q, _t1, _t2 = calMinDisSegment2Segment(lc1, uc1, lc2, uc2)
+            pq = q - p
+            dis = wp.length(pq)
+            normal = wp.vec2(1.0, 0.0)
+            if dis > 1e-9:
+                normal = pq / dis
+            penetration = dis - (r1 + r2)
+            if penetration < 0.0:
+                cpoint_mid = (p + q) * 0.5
+                _cache_contact_func(
+                    rigid_a,
+                    rigid_b,
+                    cpoint_mid,
+                    -normal,
+                    penetration,
+                    max_contacts,
+                    restitution_velocity_threshold,
+                    rigidParams,
+                    V,
+                    RotV,
+                    contactParams,
+                    rigid_env_id,
+                    num_contacts,
+                    contact_rigid_a,
+                    contact_rigid_b,
+                    contact_point,
+                    contact_normal,
+                    contact_depth,
+                    contact_bounce_vel,
+                    contact_tangent1,
+                    contact_count_per_rigid,
+                    contact_env_count,
+                    contact_env_idx,
+                    max_envs_alloc,
+                    max_cc_per_env,
+                )
+
+
+@wp.func
+def _cache_ground_contact_func(
+    rid: int,
+    cpoint: wp.vec2,
+    normal: wp.vec2,
+    ground_vel: wp.vec2,
+    depth: float,
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    idx = int(wp.atomic_add(num_ground_contacts, 0, 1))
+    if idx < max_ground_contacts:
+        ground_contact_rigid[idx] = rid
+        ground_contact_point[idx] = cpoint
+        ground_contact_normal[idx] = normal
+        ground_contact_vel[idx] = ground_vel
+        ground_contact_depth[idx] = depth
+        lr = cpoint - rigidParams[rid, 0]
+        e = contactParams[rid][1]
+        tlr = wp.vec2(-lr[1], lr[0])
+        v_point = V[rid] + tlr * RotV[rid]
+        vn_pre = wp.dot(v_point - ground_vel, normal)
+        if vn_pre < -restitution_velocity_threshold:
+            ground_contact_bounce_vel[idx] = -e * vn_pre
+        else:
+            ground_contact_bounce_vel[idx] = 0.0
+        ground_contact_tangent1[idx] = wp.vec2(-normal[1], normal[0])
+        env_id = wp.max(rigid_env_id[rid], 0)
+        if env_id < max_envs_alloc:
+            local_i = int(wp.atomic_add(ground_contact_env_count, env_id, 1))
+            if local_i < max_gc_per_env:
+                ground_contact_env_idx[env_id * max_gc_per_env + local_i] = idx
+
+
+@wp.func
+def _write_primitive_aabb(
+    rigid_id: int,
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    radius: wp.array(dtype=float),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+):
+    rigid_type = rigidDomainIds[rigid_id][1]
+    if rigid_type == RIGID_TYPE_MESH:
+        return
+    center = rigidParams[rigid_id, 0]
+    rotMat = cached_rotation_matrix[rigid_id]
+    lb = wp.vec2(0.0, 0.0)
+    ub = wp.vec2(0.0, 0.0)
+    primary = rigidParams[rigid_id, 1]
+    r = radius[rigid_id]
+    if rigid_type == RIGID_TYPE_BALL:
+        lb, ub = getBallBBox(center, r, rotMat)
+    elif rigid_type == RIGID_TYPE_BOX:
+        info = getBoxBBox(center, primary, rotMat)
+        lb = info[0]
+        ub = info[1]
+    elif rigid_type == RIGID_TYPE_CAPSULE:
+        lb, ub = getCapsuleBBox(center, primary, r, rotMat)
+    domain_idx = rigidDomainIds[rigid_id][0]
+    aabb[domain_idx, 0] = lb
+    aabb[domain_idx, 1] = ub
+
+
+@wp.kernel
+def _update_bbox_wp(
+    num_rigids: int,
+    num_analytical: int,
+    moving_analytical: int,
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    radius: wp.array(dtype=float),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    for i in range(num_rigids):
+        _write_primitive_aabb(i, rigidDomainIds, rigidParams, radius, cached_rotation_matrix, aabb)
+
+    if moving_analytical == 1:
+        buffer = 0.1
+        large_span = 100.0
+        for i in range(num_analytical):
+            idx = i + num_rigids
+            normal_local = rigidParams[idx, 1]
+            normal_world = cached_rotation_matrix[idx] @ normal_local
+            p = rigidParams[idx, 0]
+            tangent = wp.vec2(-normal_world[1], normal_world[0])
+            lo_raw = p - tangent * large_span - normal_world * buffer
+            hi_raw = p + tangent * large_span + normal_world * buffer
+            lb = wp.vec2(wp.min(lo_raw[0], hi_raw[0]), wp.min(lo_raw[1], hi_raw[1]))
+            ub = wp.vec2(wp.max(lo_raw[0], hi_raw[0]), wp.max(lo_raw[1], hi_raw[1]))
+            domain_idx = rigidDomainIds[idx][0]
+            aabb[domain_idx, 0] = lb
+            aabb[domain_idx, 1] = ub
+
+
+@wp.kernel
+def _rigid_step_wp(
+    dt: float,
+    damping: float,
+    num_rigids: int,
+    num_analytical: int,
+    bcNodes: wp.array(dtype=int),
+    bcGValues: wp.array(dtype=wp.vec2),
+    bcTValues: wp.array(dtype=wp.vec2),
+    bcRValues: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    inertia: wp.array(dtype=float),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    accumulated_impulse: wp.array(dtype=wp.vec2),
+    accumulated_rotational_impulse: wp.array(dtype=float),
+    quat: wp.array(dtype=float),
+    visual_angle: wp.array(dtype=float),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    cached_inertia_inv_2d: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+
+    n_total = num_rigids + num_analytical
+    for i in range(n_total):
+        cached_rotation_matrix[i] = cal2DRotationMat(quat[i] + visual_angle[i])
+        I = inertia[i]
+        if I > 0.0:
+            cached_inertia_inv_2d[i] = 1.0 / I
+        else:
+            cached_inertia_inv_2d[i] = 1.0 / 1e-6
+
+    for i in range(num_rigids):
+        bc_type = bcNodes[i]
+        if (bc_type & BC_ATYPE) != 0:
+            accumulated_impulse[i] = wp.vec2(0.0, 0.0)
+        else:
+            if (bc_type & BC_GRAVITY) != 0:
+                accumulated_impulse[i] = accumulated_impulse[i] + mass[i] * bcGValues[i] * dt
+            if (bc_type & BC_FORCETYPE) != 0:
+                accumulated_impulse[i] = accumulated_impulse[i] + bcTValues[i] * dt
+        if (bc_type & BC_ROTATYPE) != 0:
+            accumulated_rotational_impulse[i] = 0.0
+        elif (bc_type & BC_TORQUETYPE) != 0:
+            accumulated_rotational_impulse[i] = accumulated_rotational_impulse[i] + bcRValues[i] * dt
+
+        V[i] = V[i] + accumulated_impulse[i] / mass[i]
+        RotV[i] = RotV[i] + accumulated_rotational_impulse[i] / (inertia[i] + 1e-6)
+        damp_factor = wp.max(0.0, 1.0 - damping * dt)
+        V[i] = V[i] * damp_factor
+        RotV[i] = RotV[i] * damp_factor
+
+    for i in range(n_total):
+        bc_type = bcNodes[i]
+        if (bc_type & BC_ATYPE) != 0:
+            V[i] = V[i] + bcTValues[i] * dt
+        if (bc_type & BC_ROTATYPE) != 0:
+            RotV[i] = RotV[i] + bcRValues[i] * dt
+
+
+@wp.kernel
+def _update_u_and_bbox_wp(
+    dt: float,
+    update_bbox: int,
+    num_rigids: int,
+    num_analytical: int,
+    moving_analytical: int,
+    bcNodes: wp.array(dtype=int),
+    bcTValues: wp.array(dtype=wp.vec2),
+    bcRValues: wp.array(dtype=float),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    U: wp.array(dtype=wp.vec2),
+    quat: wp.array(dtype=float),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    accumulated_impulse: wp.array(dtype=wp.vec2),
+    accumulated_rotational_impulse: wp.array(dtype=float),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    radius: wp.array(dtype=float),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+
+    n_total = num_rigids + num_analytical
+    for i in range(n_total):
+        bc_type = bcNodes[i]
+        if (bc_type & BC_VTYPE) != 0:
+            V[i] = bcTValues[i]
+        elif (bc_type & BC_UTYPE) != 0:
+            V[i] = wp.vec2(0.0, 0.0)
+        elif (bc_type & BC_RTYPE) != 0:
+            V[i] = wp.vec2(0.0, 0.0)
+            RotV[i] = 0.0
+        if (bc_type & BC_ROTVTYPE) != 0:
+            RotV[i] = bcRValues[i]
+
+        du = V[i] * dt
+        U[i] = U[i] + du
+        rigidParams[i, 0] = rigidParams[i, 0] + du
+        quat[i] = quat[i] + RotV[i] * dt
+        if quat[i] > 3.141592653589793:
+            quat[i] = quat[i] - 2.0 * 3.141592653589793
+        elif quat[i] < -3.141592653589793:
+            quat[i] = quat[i] + 2.0 * 3.141592653589793
+
+    for i in range(n_total):
+        accumulated_impulse[i] = wp.vec2(0.0, 0.0)
+        accumulated_rotational_impulse[i] = 0.0
+
+    if update_bbox == 1:
+        for i in range(num_rigids):
+            _write_primitive_aabb(i, rigidDomainIds, rigidParams, radius, cached_rotation_matrix, aabb)
+        if moving_analytical == 1:
+            buffer = 0.1
+            large_span = 100.0
+            for i in range(num_analytical):
+                idx = i + num_rigids
+                normal_local = rigidParams[idx, 1]
+                normal_world = cached_rotation_matrix[idx] @ normal_local
+                p = rigidParams[idx, 0]
+                tangent = wp.vec2(-normal_world[1], normal_world[0])
+                lo_raw = p - tangent * large_span - normal_world * buffer
+                hi_raw = p + tangent * large_span + normal_world * buffer
+                lb = wp.vec2(wp.min(lo_raw[0], hi_raw[0]), wp.min(lo_raw[1], hi_raw[1]))
+                ub = wp.vec2(wp.max(lo_raw[0], hi_raw[0]), wp.max(lo_raw[1], hi_raw[1]))
+                domain_idx = rigidDomainIds[idx][0]
+                aabb[domain_idx, 0] = lb
+                aabb[domain_idx, 1] = ub
+
+
+@wp.kernel
+def _generate_ground_pairs_wp(
+    num_rigids: int,
+    num_analytical: int,
+    max_ground_pairs: int,
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    compound_count: wp.array(dtype=int),
+    category_bits: wp.array(dtype=wp.uint32),
+    collide_bits: wp.array(dtype=wp.uint32),
+    num_primitive_pairs: wp.array(dtype=int),
+    num_ball_ball_pairs: wp.array(dtype=int),
+    num_box_box_pairs: wp.array(dtype=int),
+    num_box_ball_pairs: wp.array(dtype=int),
+    num_seg_point_pairs: wp.array(dtype=int),
+    num_seg_ball_pairs: wp.array(dtype=int),
+    num_seg_seg_pairs: wp.array(dtype=int),
+    num_mesh_pairs: wp.array(dtype=int),
+    num_mixed_pairs: wp.array(dtype=int),
+    num_groundprim_pairs: wp.array(dtype=int),
+    num_groundmesh_pairs: wp.array(dtype=int),
+    groundprim_pairs_buffer: wp.array(dtype=wp.vec2i),
+    groundmesh_pairs_buffer: wp.array(dtype=wp.vec2i),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    num_primitive_pairs[0] = 0
+    num_ball_ball_pairs[0] = 0
+    num_box_box_pairs[0] = 0
+    num_box_ball_pairs[0] = 0
+    num_seg_point_pairs[0] = 0
+    num_seg_ball_pairs[0] = 0
+    num_seg_seg_pairs[0] = 0
+    num_mesh_pairs[0] = 0
+    num_mixed_pairs[0] = 0
+    num_groundprim_pairs[0] = 0
+    num_groundmesh_pairs[0] = 0
+
+    for i in range(num_rigids):
+        type_i = rigidDomainIds[i][1]
+        is_mesh_i = (type_i == RIGID_TYPE_MESH) and (compound_count[i] == 0)
+        for j in range(num_analytical):
+            anal_idx = num_rigids + j
+            if _mask_allows_pair_func(anal_idx, i, category_bits, collide_bits) == 0:
+                continue
+            if is_mesh_i:
+                idx = int(wp.atomic_add(num_groundmesh_pairs, 0, 1))
+                if idx < max_ground_pairs:
+                    groundmesh_pairs_buffer[idx] = wp.vec2i(anal_idx, i)
+            else:
+                idx = int(wp.atomic_add(num_groundprim_pairs, 0, 1))
+                if idx < max_ground_pairs:
+                    groundprim_pairs_buffer[idx] = wp.vec2i(anal_idx, i)
+
+
+@wp.kernel
+def _reset_contact_caches_wp(
+    num_rigids: int,
+    num_analytical: int,
+    num_envs: int,
+    num_contacts: wp.array(dtype=int),
+    num_ground_contacts: wp.array(dtype=int),
+    prev_num_contacts: wp.array(dtype=int),
+    prev_num_ground_contacts: wp.array(dtype=int),
+    numConstraints: wp.array(dtype=int),
+    contact_count_per_rigid: wp.array(dtype=int),
+    contact_env_count: wp.array(dtype=int),
+    ground_contact_env_count: wp.array(dtype=int),
+    contact_force: wp.array(dtype=wp.vec2),
+    contact_pgs_indices: wp.array(dtype=wp.vec3i),
+    contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_force: wp.array(dtype=wp.vec2),
+    ground_contact_pgs_indices: wp.array(dtype=wp.vec3i),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    prev_nc = num_contacts[0]
+    prev_ngc = num_ground_contacts[0]
+    prev_num_contacts[0] = prev_nc
+    prev_num_ground_contacts[0] = prev_ngc
+    num_contacts[0] = 0
+    num_ground_contacts[0] = 0
+    numConstraints[0] = 0
+    n_envs = wp.max(num_envs, 1)
+    for i in range(n_envs):
+        ground_contact_env_count[i] = 0
+        contact_env_count[i] = 0
+    total_nodes = num_rigids + num_analytical
+    for rid in range(total_nodes):
+        contact_count_per_rigid[rid] = 0
+    for j in range(prev_nc):
+        contact_force[j] = wp.vec2(0.0, 0.0)
+        contact_pgs_indices[j] = wp.vec3i(-1, -1, -1)
+        contact_bounce_vel[j] = 0.0
+    for k in range(prev_ngc):
+        ground_contact_force[k] = wp.vec2(0.0, 0.0)
+        ground_contact_pgs_indices[k] = wp.vec3i(-1, -1, -1)
+        ground_contact_bounce_vel[k] = 0.0
+
+
+@wp.func
+def _get_box_vertex_func(
+    rigid_idx: int,
+    v_idx: int,
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+):
+    center = rigidParams[rigid_idx, 0]
+    extent = rigidParams[rigid_idx, 1]
+    sx = -1.0 if (v_idx == 0 or v_idx == 3) else 1.0
+    sy = -1.0 if (v_idx == 0 or v_idx == 1) else 1.0
+    local_pos = 0.5 * wp.vec2(sx * extent[0], sy * extent[1])
+    return center + cached_rotation_matrix[rigid_idx] @ local_pos
+
+
+@wp.kernel
+def _detect_analytical_prim_contacts_wp(
+    num_pairs: int,
+    contact_margin: float,
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    use_aabb_early_out: wp.array(dtype=int),
+    groundprim_pairs_buffer: wp.array(dtype=wp.vec2i),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    radius: wp.array(dtype=float),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+    compound_count: wp.array(dtype=int),
+    compound_offset: wp.array(dtype=int),
+    compound_local_pos: wp.array(dtype=wp.vec2),
+    compound_radius: wp.array(dtype=float),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    for p in range(num_pairs):
+        anal_idx = groundprim_pairs_buffer[p][0]
+        rigid_idx = groundprim_pairs_buffer[p][1]
+        planepoint = rigidParams[anal_idx, 0]
+        normal = rigidParams[anal_idx, 1]
+        anal_vel = V[anal_idx]
+        run_narrow = True
+        if use_aabb_early_out[0] == 1:
+            domain_idx = rigidDomainIds[rigid_idx][0]
+            bbox_min = aabb[domain_idx, 0]
+            bbox_max = aabb[domain_idx, 1]
+            support = wp.vec2(
+                bbox_max[0] if normal[0] < 0.0 else bbox_min[0],
+                bbox_max[1] if normal[1] < 0.0 else bbox_min[1],
+            )
+            min_dist = wp.dot(support - planepoint, normal)
+            run_narrow = min_dist <= contact_margin
+        if not run_narrow:
+            continue
+
+        n_sub = compound_count[rigid_idx]
+        if n_sub > 0:
+            base = compound_offset[rigid_idx]
+            parent_center = rigidParams[rigid_idx, 0]
+            R = cached_rotation_matrix[rigid_idx]
+            for k in range(n_sub):
+                local_p = compound_local_pos[base + k]
+                r_sub = compound_radius[base + k]
+                world_p = R @ local_p + parent_center
+                d_sub, _, _ = detectPointToAnalyticalPlane(world_p, planepoint, normal)
+                if d_sub < r_sub + contact_margin:
+                    cpoint = world_p - normal * r_sub
+                    depth = d_sub - r_sub
+                    _cache_ground_contact_func(
+                        rigid_idx, cpoint, normal, anal_vel, depth, max_ground_contacts,
+                        restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                        rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                        ground_contact_point, ground_contact_normal, ground_contact_vel,
+                        ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                        ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+                    )
+        else:
+            rtype = rigidDomainIds[rigid_idx][1]
+            if rtype == RIGID_TYPE_BALL:
+                center = rigidParams[rigid_idx, 0]
+                r = radius[rigid_idx]
+                d, _, _ = detectPointToAnalyticalPlane(center, planepoint, normal)
+                if d < r + contact_margin:
+                    cpoint = center - normal * r
+                    depth = d - r
+                    _cache_ground_contact_func(
+                        rigid_idx, cpoint, normal, anal_vel, depth, max_ground_contacts,
+                        restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                        rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                        ground_contact_point, ground_contact_normal, ground_contact_vel,
+                        ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                        ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+                    )
+            elif rtype == RIGID_TYPE_CAPSULE:
+                center = rigidParams[rigid_idx, 0]
+                lcdir = rigidParams[rigid_idx, 1]
+                lc = cached_rotation_matrix[rigid_idx] @ lcdir + center
+                uc = center * 2.0 - lc
+                r = radius[rigid_idx]
+                for ep in range(2):
+                    test_p = lc if ep == 0 else uc
+                    d_ep, _, _ = detectPointToAnalyticalPlane(test_p, planepoint, normal)
+                    if d_ep < r + contact_margin:
+                        cpoint = test_p - normal * r
+                        depth = d_ep - r
+                        _cache_ground_contact_func(
+                            rigid_idx, cpoint, normal, anal_vel, depth, max_ground_contacts,
+                            restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                            ground_contact_point, ground_contact_normal, ground_contact_vel,
+                            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+                        )
+            elif rtype == RIGID_TYPE_BOX:
+                # Check all 4 box vertices against the plane (same as host detectAnalaytical2Rigid).
+                for vi in range(4):
+                    pos = _get_box_vertex_func(rigid_idx, vi, rigidParams, cached_rotation_matrix)
+                    d_v, _, _ = detectPointToAnalyticalPlane(pos, planepoint, normal)
+                    if d_v < contact_margin:
+                        _cache_ground_contact_func(
+                            rigid_idx, pos, normal, anal_vel, d_v, max_ground_contacts,
+                            restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                            ground_contact_point, ground_contact_normal, ground_contact_vel,
+                            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+                        )
+
+
+@wp.func
+def _add_pgs_row_func(
+    aid: int,
+    bid: int,
+    jac_a: wp.vec3,
+    jac_b: wp.vec3,
+    rhs: float,
+    lower: float,
+    upper: float,
+    parent_row: int,
+    max_constraints: int,
+    numConstraints: wp.array(dtype=int),
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    pgs_Jac_a: wp.array(dtype=wp.vec3),
+    pgs_Jac_b: wp.array(dtype=wp.vec3),
+    pgs_rhs: wp.array(dtype=float),
+    pgs_limits: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+    pgs_parent_row: wp.array(dtype=int),
+):
+    ci = int(wp.atomic_add(numConstraints, 0, 1))
+    if ci < max_constraints:
+        pgs_bodypair[ci] = wp.vec2i(aid, bid)
+        pgs_Jac_a[ci] = jac_a
+        pgs_Jac_b[ci] = jac_b
+        pgs_rhs[ci] = rhs
+        pgs_limits[ci] = wp.vec2(lower, upper)
+        pgs_lambda[ci] = 0.0
+        pgs_parent_row[ci] = parent_row
+        return ci
+    return -1
+
+
+@wp.kernel
+def _assemble_ground_contact_constraints_wp(
+    dt: float,
+    contact_erp: float,
+    max_constraints: int,
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_pgs_indices: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    contactParams: wp.array(dtype=wp.vec2),
+    numConstraints: wp.array(dtype=int),
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    pgs_Jac_a: wp.array(dtype=wp.vec3),
+    pgs_Jac_b: wp.array(dtype=wp.vec3),
+    pgs_rhs: wp.array(dtype=float),
+    pgs_limits: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+    pgs_parent_row: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    n = num_ground_contacts[0]
+    for idx in range(n):
+        rid = ground_contact_rigid[idx]
+        cpoint = ground_contact_point[idx]
+        normal = ground_contact_normal[idx]
+        ground_vel = ground_contact_vel[idx]
+        depth = ground_contact_depth[idx]
+        lr = cpoint - rigidParams[rid, 0]
+        mu = contactParams[rid][0]
+        bounce_vel = ground_contact_bounce_vel[idx]
+        bias_vel = 0.0
+        if depth < 0.0 and contact_erp > 0.0:
+            bias_vel = wp.max(contact_erp * depth / dt, -5.0)
+        target_vel = bounce_vel
+        if -bias_vel > bounce_vel:
+            target_vel = -bias_vel
+        jac_n = wp.vec3(normal[0], normal[1], vectorCrossProduct(lr, normal)[0])
+        normal_row = _add_pgs_row_func(
+            rid, -1, jac_n, wp.vec3(0.0, 0.0, 0.0), target_vel + wp.dot(normal, ground_vel),
+            0.0, 1e10, -1, max_constraints, numConstraints, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+            pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+        )
+        t1_row = -1
+        if mu > 1e-12 and normal_row >= 0:
+            t1 = ground_contact_tangent1[idx]
+            jac_t1 = wp.vec3(t1[0], t1[1], vectorCrossProduct(lr, t1)[0])
+            rhs_t1 = wp.dot(t1, ground_vel)
+            t1_row = _add_pgs_row_func(
+                rid, -1, jac_t1, wp.vec3(0.0, 0.0, 0.0), rhs_t1, -mu, mu, normal_row,
+                max_constraints, numConstraints, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+                pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+            )
+        ground_contact_pgs_indices[idx] = wp.vec3i(normal_row, t1_row, -1)
+
+
+@wp.kernel
+def _assemble_pair_contact_constraints_wp(
+    dt: float,
+    contact_erp: float,
+    max_constraints: int,
+    num_contacts: wp.array(dtype=int),
+    contact_rigid_a: wp.array(dtype=int),
+    contact_rigid_b: wp.array(dtype=int),
+    contact_point: wp.array(dtype=wp.vec2),
+    contact_normal: wp.array(dtype=wp.vec2),
+    contact_depth: wp.array(dtype=float),
+    contact_bounce_vel: wp.array(dtype=float),
+    contact_tangent1: wp.array(dtype=wp.vec2),
+    contact_pgs_indices: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    contactParams: wp.array(dtype=wp.vec2),
+    numConstraints: wp.array(dtype=int),
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    pgs_Jac_a: wp.array(dtype=wp.vec3),
+    pgs_Jac_b: wp.array(dtype=wp.vec3),
+    pgs_rhs: wp.array(dtype=float),
+    pgs_limits: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+    pgs_parent_row: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    n = num_contacts[0]
+    for idx in range(n):
+        aid = contact_rigid_a[idx]
+        bid = contact_rigid_b[idx]
+        cpoint = contact_point[idx]
+        normal = contact_normal[idx]
+        depth = contact_depth[idx]
+        ra = cpoint - rigidParams[aid, 0]
+        rb = cpoint - rigidParams[bid, 0]
+        mu = 0.5 * (contactParams[aid][0] + contactParams[bid][0])
+        bounce_vel = contact_bounce_vel[idx]
+        bias_vel = 0.0
+        if depth < 0.0 and contact_erp > 0.0:
+            bias_vel = wp.max(contact_erp * depth / dt, -5.0)
+        target_vel = bounce_vel
+        if -bias_vel > bounce_vel:
+            target_vel = -bias_vel
+        jac_na = wp.vec3(normal[0], normal[1], vectorCrossProduct(ra, normal)[0])
+        jac_nb = wp.vec3(normal[0], normal[1], vectorCrossProduct(rb, normal)[0])
+        normal_row = _add_pgs_row_func(
+            aid, bid, jac_na, jac_nb, target_vel, 0.0, 1e10, -1,
+            max_constraints, numConstraints, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+            pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+        )
+        t1_row = -1
+        if mu > 1e-12 and normal_row >= 0:
+            t1 = contact_tangent1[idx]
+            jac_t1a = wp.vec3(t1[0], t1[1], vectorCrossProduct(ra, t1)[0])
+            jac_t1b = wp.vec3(t1[0], t1[1], vectorCrossProduct(rb, t1)[0])
+            t1_row = _add_pgs_row_func(
+                aid, bid, jac_t1a, jac_t1b, 0.0, -mu, mu, normal_row,
+                max_constraints, numConstraints, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+                pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+            )
+        contact_pgs_indices[idx] = wp.vec3i(normal_row, t1_row, -1)
+
+
+@wp.kernel
+def _compute_contact_forces_wp(
+    dt: float,
+    num_ground_contacts: wp.array(dtype=int),
+    num_contacts: wp.array(dtype=int),
+    ground_contact_pgs_indices: wp.array(dtype=wp.vec3i),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_force: wp.array(dtype=wp.vec2),
+    contact_pgs_indices: wp.array(dtype=wp.vec3i),
+    contact_normal: wp.array(dtype=wp.vec2),
+    contact_tangent1: wp.array(dtype=wp.vec2),
+    contact_force: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    if tid != 0:
+        return
+    dt_inv = 1.0 / (dt + 1e-12)
+    ng = num_ground_contacts[0]
+    for idx in range(ng):
+        pgs_indices = ground_contact_pgs_indices[idx]
+        lambda_n = pgs_lambda[pgs_indices[0]] if pgs_indices[0] >= 0 else 0.0
+        lambda_t1 = pgs_lambda[pgs_indices[1]] if pgs_indices[1] >= 0 else 0.0
+        force = lambda_n * ground_contact_normal[idx] + lambda_t1 * ground_contact_tangent1[idx]
+        ground_contact_force[idx] = force * dt_inv
+    nc = num_contacts[0]
+    for idx in range(nc):
+        pgs_indices = contact_pgs_indices[idx]
+        lambda_n = pgs_lambda[pgs_indices[0]] if pgs_indices[0] >= 0 else 0.0
+        lambda_t1 = pgs_lambda[pgs_indices[1]] if pgs_indices[1] >= 0 else 0.0
+        force = lambda_n * contact_normal[idx] + lambda_t1 * contact_tangent1[idx]
+        contact_force[idx] = force * dt_inv
+
+
 class RigidManager:
     def __init__(self, d, domains, joints, bvh=None, skip_spatial_hash=False, considerRigidRigidContact=True, use_pd=0):
-        """Initialize RigidManager and allocate Taichi fields for rigids and state.
+        """Initialize RigidManager and allocate Warp arrays for rigids and state.
 
         Args:
             d: Spatial dimension (must be 2)
@@ -72,18 +1460,18 @@ class RigidManager:
         self.numDomains = len(domains)
         # keep a reference to domain objects for host-side operations (mesh handling)
         self.domains = domains
-        self.rigidDomainIds = ti.Vector.field(3, ti.i32, self.MAX_NODES)
-        self.category_bits = ti.field(ti.u32, self.MAX_NODES)
-        self.collide_bits = ti.field(ti.u32, self.MAX_NODES)
-        self.category_bits.fill(COLLISION_CATEGORY_ROBOT)
-        self.collide_bits.fill(COLLISION_MASK_ALL)
+        self.rigidDomainIds = wp.zeros(self.MAX_NODES, dtype=wp.vec3i)
+        self.category_bits = wp.zeros(self.MAX_NODES, dtype=wp.uint32)
+        self.collide_bits = wp.zeros(self.MAX_NODES, dtype=wp.uint32)
+        _fill_array(self.category_bits, COLLISION_CATEGORY_ROBOT)
+        _fill_array(self.collide_bits, COLLISION_MASK_ALL)
         maxDomains = max(len(domains), self.MAX_NODES)
-        self.domainToRigid = ti.field(ti.i32, maxDomains)
-        self.domainToRigid.fill(-1)
+        self.domainToRigid = wp.zeros(maxDomains, dtype=int)
+        _fill_array(self.domainToRigid, -1)
         # Packed per-rigid parameters: rows hold different vector groups per-rigid.
         # row 0: reference point (current coords)
         # row 1: primary shape params (extents, endpoint1 (for capsule), normal for analytical domain etc.)
-        self.rigidParams = ti.Vector.field(self.d, ti.f32, (self.MAX_NODES, 2))
+        self.rigidParams = wp.zeros((self.MAX_NODES, 2), dtype=wp.vec2)
 
         self.numRigids = 0
         self.numAnalytical = 0
@@ -93,8 +1481,8 @@ class RigidManager:
         self.numRigidGroundContact = 0
         # When 0, ground narrow-phase skips AABB early-out so stale AABBs
         # cannot suppress first-contact detection in no-collision fast path.
-        self._ground_use_aabb_early_out = ti.field(ti.i32, shape=())
-        self._ground_use_aabb_early_out[None] = 1
+        self._ground_use_aabb_early_out = wp.zeros(1, dtype=int)
+        _assign_scalar(self._ground_use_aabb_early_out, 1)
         self.hasHeightFieldOrVoxel = False  # Set True if any HeightField/Voxel domains exist
 
         self.contact_erp = 0.2  # Baumgarte error reduction parameter for ground contacts
@@ -102,10 +1490,10 @@ class RigidManager:
         self.skip_bvh = False  # When True, skip BVH broadphase and use direct ground pair generation
         self.control_dt = 1.0 / 60.0  # default: 60 Hz control
         # These are nodal data
-        self.bcNodes = ti.field(ti.i32, self.MAX_NODES)
-        self.bcGValues = ti.Vector.field(self.d, ti.float32, self.MAX_NODES)
-        self.bcTValues = ti.Vector.field(self.d, ti.float32, self.MAX_NODES)
-        self.bcRValues = ti.Vector.field(1, ti.float32, self.MAX_NODES)
+        self.bcNodes = wp.zeros(self.MAX_NODES, dtype=int)
+        self.bcGValues = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
+        self.bcTValues = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
+        self.bcRValues = wp.zeros(self.MAX_NODES, dtype=float)
 
         # Mesh rigid storage - boundary elements only for contact detection
         # Dynamic resizing based on pre-scan results (count_mesh_nodes is calculated above)
@@ -115,27 +1503,27 @@ class RigidManager:
             self.MAX_BOUNDARY_ELEMENTS = max(count_mesh_elems + 8192, 8192)
 
             # Boundary node coordinates (world space and local)
-            self.meshBoundaryCoords = ti.Vector.field(self.d, ti.float32, self.MAX_BOUNDARY_NODES)
+            self.meshBoundaryCoords = wp.zeros(self.MAX_BOUNDARY_NODES, dtype=wp.vec2)
             # Boundary element connectivity (edges for 2D, triangles for 3D)
             # For 2D: each element has 2 node indices
             # For 3D: each element has 3 node indices
-            self.meshBoundaryElements = ti.Vector.field(3, ti.i32, self.MAX_BOUNDARY_ELEMENTS)
+            self.meshBoundaryElements = wp.zeros(self.MAX_BOUNDARY_ELEMENTS, dtype=wp.vec3i)
             # Cached per-element AABBs (updated once per substep)
-            self.meshElemLB = ti.Vector.field(self.d, ti.f32, self.MAX_BOUNDARY_ELEMENTS)
-            self.meshElemUB = ti.Vector.field(self.d, ti.f32, self.MAX_BOUNDARY_ELEMENTS)
-            self.meshElemMarginBase = ti.field(ti.f32, self.MAX_BOUNDARY_ELEMENTS)
+            self.meshElemLB = wp.zeros(self.MAX_BOUNDARY_ELEMENTS, dtype=wp.vec2)
+            self.meshElemUB = wp.zeros(self.MAX_BOUNDARY_ELEMENTS, dtype=wp.vec2)
+            self.meshElemMarginBase = wp.zeros(self.MAX_BOUNDARY_ELEMENTS, dtype=float)
 
             # Per-mesh bookkeeping
-            self.meshBoundaryNodeCount = ti.field(ti.i32, self.MAX_MESH)  # number of boundary nodes per mesh
-            self.meshBoundaryNodeOffset = ti.field(ti.i32, self.MAX_MESH)  # starting index in meshBoundaryCoords
-            self.meshBoundaryElementCount = ti.field(ti.i32, self.MAX_MESH)  # number of boundary elements per mesh
-            self.meshBoundaryElementOffset = ti.field(ti.i32, self.MAX_MESH)  # starting index in meshBoundaryElements
+            self.meshBoundaryNodeCount = wp.zeros(self.MAX_MESH, dtype=int)  # number of boundary nodes per mesh
+            self.meshBoundaryNodeOffset = wp.zeros(self.MAX_MESH, dtype=int)  # starting index in meshBoundaryCoords
+            self.meshBoundaryElementCount = wp.zeros(self.MAX_MESH, dtype=int)  # number of boundary elements per mesh
+            self.meshBoundaryElementOffset = wp.zeros(self.MAX_MESH, dtype=int)  # starting index in meshBoundaryElements
 
             # Index mappings
-            self.mesh2RigidIndices = ti.field(ti.i32, self.MAX_MESH)
-            self.mesh2RigidIndices.fill(-1)
-            self.rigid2MeshIndices = ti.field(ti.i32, self.MAX_NODES)
-            self.rigid2MeshIndices.fill(-1)
+            self.mesh2RigidIndices = wp.zeros(self.MAX_MESH, dtype=int)
+            _fill_array(self.mesh2RigidIndices, -1)
+            self.rigid2MeshIndices = wp.zeros(self.MAX_NODES, dtype=int)
+            _fill_array(self.rigid2MeshIndices, -1)
 
             # ==== MESH INSTANCING: Geometry Pool (shared boundary data) ====
             # Pool storage for unique mesh geometries
@@ -149,79 +1537,79 @@ class RigidManager:
             self.MAX_POOL_ELEMENTS = count_mesh_elems + 8192
 
             # Pool boundary data (same structure as existing, but deduplicated)
-            self.pool_boundary_lrs = ti.Vector.field(self.d, ti.float32, self.MAX_POOL_NODES)
-            self.pool_boundary_elements = ti.Vector.field(3, ti.i32, self.MAX_POOL_ELEMENTS)
+            self.pool_boundary_lrs = wp.zeros(self.MAX_POOL_NODES, dtype=wp.vec2)
+            self.pool_boundary_elements = wp.zeros(self.MAX_POOL_ELEMENTS, dtype=wp.vec3i)
 
             # Per-geometry bookkeeping in pool
-            self.pool_node_count = ti.field(ti.i32, self.MAX_POOL_GEOMETRIES)
-            self.pool_node_offset = ti.field(ti.i32, self.MAX_POOL_GEOMETRIES)
-            self.pool_elem_count = ti.field(ti.i32, self.MAX_POOL_GEOMETRIES)
-            self.pool_elem_offset = ti.field(ti.i32, self.MAX_POOL_GEOMETRIES)
+            self.pool_node_count = wp.zeros(self.MAX_POOL_GEOMETRIES, dtype=int)
+            self.pool_node_offset = wp.zeros(self.MAX_POOL_GEOMETRIES, dtype=int)
+            self.pool_elem_count = wp.zeros(self.MAX_POOL_GEOMETRIES, dtype=int)
+            self.pool_elem_offset = wp.zeros(self.MAX_POOL_GEOMETRIES, dtype=int)
 
             # Hash-based deduplication lookup (Python-side dict for Phase 1)
             self.pool_hash_to_id = {}  # maps mesh_hash -> pool_geometry_id
 
             # ==== MESH INSTANCING: Instance Manager (per-rigid transforms) ====
             # Maps each mesh rigid to its pool geometry + transform
-            self.instance_pool_id = ti.field(ti.i32, self.MAX_NODES)  # rigid_idx -> pool_geom_id
-            self.instance_pool_id.fill(-1)  # -1 = not using pool (legacy path)
+            self.instance_pool_id = wp.zeros(self.MAX_NODES, dtype=int)  # rigid_idx -> pool_geom_id
+            _fill_array(self.instance_pool_id, -1)  # -1 = not using pool (legacy path)
 
             self.total_pool_nodes = 0
             self.total_pool_elements = 0
 
             # Transform storage for mesh rigids (scale component)
-            self.meshRigidScale = ti.Vector.field(self.d, ti.float32, self.MAX_NODES)
+            self.meshRigidScale = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
             # Initialize scale to [1,1,1] for all rigids
             for i in range(self.MAX_NODES):
-                self.meshRigidScale[i] = ti.Vector([1.0 for _ in range(self.d)])
+                _patch_array(self.meshRigidScale, i, wp.vec2(1.0, 1.0))
 
             # Transform storage for mesh rigids (offset component)
-            self.meshRigidOffset = ti.Vector.field(self.d, ti.float32, self.MAX_NODES)
+            self.meshRigidOffset = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
             # Initialize offset to [0,0,0] for all rigids
             for i in range(self.MAX_NODES):
-                self.meshRigidOffset[i] = ti.Vector([0.0 for _ in range(self.d)])
+                _patch_array(self.meshRigidOffset, i, wp.vec2(0.0, 0.0))
 
             # Active mesh mask for spatial hash population optimization
-            self.mesh_active = ti.field(ti.i32, self.MAX_MESH)
-            self.mesh_active.fill(0)
+            self.mesh_active = wp.zeros(self.MAX_MESH, dtype=int)
+            _fill_array(self.mesh_active, 0)
 
         else:
             self.MAX_BOUNDARY_NODES = 1
             self.MAX_BOUNDARY_ELEMENTS = 1
 
             # Use 1-element fields to prevent compilation errors when no mesh rigids exist
-            self.meshBoundaryCoords = ti.Vector.field(self.d, ti.float32, 1)
-            self.meshBoundaryElements = ti.Vector.field(3, ti.i32, 1)
-            self.meshElemLB = ti.Vector.field(self.d, ti.f32, 1)
-            self.meshElemUB = ti.Vector.field(self.d, ti.f32, 1)
-            self.meshElemMarginBase = ti.field(ti.f32, 1)
-            self.meshBoundaryNodeCount = ti.field(ti.i32, 1)
-            self.meshBoundaryNodeOffset = ti.field(ti.i32, 1)
-            self.meshBoundaryElementCount = ti.field(ti.i32, 1)
-            self.meshBoundaryElementOffset = ti.field(ti.i32, 1)
-            self.mesh2RigidIndices = ti.field(ti.i32, 1)
-            self.meshRigidScale = ti.Vector.field(self.d, ti.float32, 1)
-            self.meshRigidOffset = ti.Vector.field(self.d, ti.float32, 1)
-            self.mesh_active = ti.field(ti.i32, 1)
+            self.meshBoundaryCoords = wp.zeros(1, dtype=wp.vec2)
+            self.meshBoundaryElements = wp.zeros(1, dtype=wp.vec3i)
+            self.meshElemLB = wp.zeros(1, dtype=wp.vec2)
+            self.meshElemUB = wp.zeros(1, dtype=wp.vec2)
+            self.meshElemMarginBase = wp.zeros(1, dtype=float)
+            self.meshBoundaryNodeCount = wp.zeros(1, dtype=int)
+            self.meshBoundaryNodeOffset = wp.zeros(1, dtype=int)
+            self.meshBoundaryElementCount = wp.zeros(1, dtype=int)
+            self.meshBoundaryElementOffset = wp.zeros(1, dtype=int)
+            self.mesh2RigidIndices = wp.zeros(1, dtype=int)
+            self.meshRigidScale = wp.zeros(1, dtype=wp.vec2)
+            self.meshRigidOffset = wp.zeros(1, dtype=wp.vec2)
+            self.mesh_active = wp.zeros(1, dtype=int)
 
-            self.rigid2MeshIndices = ti.field(ti.i32, 1)
+            self.rigid2MeshIndices = wp.zeros(1, dtype=int)
 
             # Mesh instancing fields (even when no mesh rigids exist)
             self.MAX_POOL_GEOMETRIES = 1
             self.num_pool_geometries = 0
 
-            self.pool_boundary_lrs = ti.Vector.field(self.d, ti.float32, 1)
-            self.pool_boundary_elements = ti.Vector.field(3, ti.i32, 1)
+            self.pool_boundary_lrs = wp.zeros(1, dtype=wp.vec2)
+            self.pool_boundary_elements = wp.zeros(1, dtype=wp.vec3i)
 
-            self.pool_node_count = ti.field(ti.i32, 1)
-            self.pool_node_offset = ti.field(ti.i32, 1)
-            self.pool_elem_count = ti.field(ti.i32, 1)
-            self.pool_elem_offset = ti.field(ti.i32, 1)
+            self.pool_node_count = wp.zeros(1, dtype=int)
+            self.pool_node_offset = wp.zeros(1, dtype=int)
+            self.pool_elem_count = wp.zeros(1, dtype=int)
+            self.pool_elem_offset = wp.zeros(1, dtype=int)
 
             self.pool_hash_to_id = {}
 
-            self.instance_pool_id = ti.field(ti.i32, self.MAX_NODES)
-            self.instance_pool_id.fill(-1)
+            self.instance_pool_id = wp.zeros(self.MAX_NODES, dtype=int)
+            _fill_array(self.instance_pool_id, -1)
 
             self.total_pool_nodes = 0
             self.total_pool_elements = 0
@@ -237,8 +1625,8 @@ class RigidManager:
 
         # Environment ID for collision filtering (batched training)
         # -1 means no env (e.g., ground, single robot), >= 0 means belongs to env_id
-        self.rigid_env_id = ti.field(ti.i32, self.MAX_NODES)
-        self.rigid_env_id.fill(-1)  # Default: no env filtering
+        self.rigid_env_id = wp.zeros(self.MAX_NODES, dtype=int)
+        _fill_array(self.rigid_env_id, -1)  # Default: no env filtering
 
         self.num_envs = 0
         self.joints_per_env = 0
@@ -246,17 +1634,17 @@ class RigidManager:
         self.totalBoundaryNodes = 0
         self.totalBoundaryElements = 0
 
-        self.U = ti.Vector.field(self.d, ti.float32, self.MAX_NODES)
-        self.V = ti.Vector.field(self.d, ti.f32, self.MAX_NODES)
-        self.accumulated_impulse = ti.Vector.field(self.d, ti.float32, self.MAX_NODES)
+        self.U = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
+        self.V = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
+        self.accumulated_impulse = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
         # Rotation representation: 2D uses scalar angle, 3D uses quaternion
-        self.quat = ti.Vector.field(1, ti.f32, self.MAX_NODES)  # angle for 2D
-        self.quat_initial = ti.Vector.field(1, ti.f32, self.MAX_NODES)  # initial orientation snapshot
-        self.RotV = ti.Vector.field(1, ti.f32, self.MAX_NODES)
-        self.accumulated_rotational_impulse = ti.Vector.field(1, ti.float32, self.MAX_NODES)
+        self.quat = wp.zeros(self.MAX_NODES, dtype=float)  # angle for 2D
+        self.quat_initial = wp.zeros(self.MAX_NODES, dtype=float)  # initial orientation snapshot
+        self.RotV = wp.zeros(self.MAX_NODES, dtype=float)
+        self.accumulated_rotational_impulse = wp.zeros(self.MAX_NODES, dtype=float)
 
-        self.V.fill(0.0)
-        self.RotV.fill(0.0)
+        _fill_array(self.V, 0.0)
+        _fill_array(self.RotV, 0.0)
 
         # AABB is now stored in ExplicitLoop using global domain indices
         # RigidManager will receive a reference to the global aabb field
@@ -266,35 +1654,35 @@ class RigidManager:
         self.MAX_COLLISION_PAIRS = 10000  # Maximum collision pairs per frame
 
         # Buffers for different collision pair types
-        self.primitive_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
-        self.ball_ball_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
-        self.box_box_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
-        self.box_ball_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
-        self.seg_point_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
-        self.seg_ball_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
-        self.seg_seg_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
+        self.primitive_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
+        self.ball_ball_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
+        self.box_box_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
+        self.box_ball_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
+        self.seg_point_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
+        self.seg_ball_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
+        self.seg_seg_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
 
-        self.mesh_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
-        self.mixed_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_COLLISION_PAIRS)
+        self.mesh_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
+        self.mixed_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
         # Ground collision pairs need larger buffer for batched environments
         # Each rigid can collide with ground, so need at least MAX_NODES capacity
         self.MAX_GROUND_PAIRS = max(self.MAX_NODES * 2, 4096)
-        self.groundprim_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_GROUND_PAIRS)
-        self.groundmesh_pairs_buffer = ti.Vector.field(2, ti.i32, self.MAX_GROUND_PAIRS)
+        self.groundprim_pairs_buffer = wp.zeros(self.MAX_GROUND_PAIRS, dtype=wp.vec2i)
+        self.groundmesh_pairs_buffer = wp.zeros(self.MAX_GROUND_PAIRS, dtype=wp.vec2i)
 
         # Counters for each pair type
-        self.num_primitive_pairs = ti.field(ti.i32, shape=())
-        self.num_ball_ball_pairs = ti.field(ti.i32, shape=())
-        self.num_box_box_pairs = ti.field(ti.i32, shape=())
-        self.num_box_ball_pairs = ti.field(ti.i32, shape=())
-        self.num_seg_point_pairs = ti.field(ti.i32, shape=())
-        self.num_seg_ball_pairs = ti.field(ti.i32, shape=())
-        self.num_seg_seg_pairs = ti.field(ti.i32, shape=())
+        self.num_primitive_pairs = wp.zeros(1, dtype=int)
+        self.num_ball_ball_pairs = wp.zeros(1, dtype=int)
+        self.num_box_box_pairs = wp.zeros(1, dtype=int)
+        self.num_box_ball_pairs = wp.zeros(1, dtype=int)
+        self.num_seg_point_pairs = wp.zeros(1, dtype=int)
+        self.num_seg_ball_pairs = wp.zeros(1, dtype=int)
+        self.num_seg_seg_pairs = wp.zeros(1, dtype=int)
 
-        self.num_mesh_pairs = ti.field(ti.i32, shape=())
-        self.num_mixed_pairs = ti.field(ti.i32, shape=())
-        self.num_groundprim_pairs = ti.field(ti.i32, shape=())
-        self.num_groundmesh_pairs = ti.field(ti.i32, shape=())
+        self.num_mesh_pairs = wp.zeros(1, dtype=int)
+        self.num_mixed_pairs = wp.zeros(1, dtype=int)
+        self.num_groundprim_pairs = wp.zeros(1, dtype=int)
+        self.num_groundmesh_pairs = wp.zeros(1, dtype=int)
 
         # ==== Contact Cache: Store detected contacts to avoid redundant detection in PGS iterations ====
         self.MAX_CONTACTS = max(self.MAX_NODES * 16, 10000)
@@ -306,50 +1694,42 @@ class RigidManager:
             self.MAX_GROUND_CONTACTS = max(self.MAX_NODES * 200, 50000)
 
         # Rigid-Rigid contacts (use applyImpulsePair)
-        self.num_contacts = ti.field(ti.i32, shape=())
-        self.num_contacts[None] = 0
-        self.contact_rigid_a = ti.field(ti.i32, self.MAX_CONTACTS)
-        self.contact_rigid_b = ti.field(ti.i32, self.MAX_CONTACTS)
-        self.contact_point = ti.Vector.field(self.d, ti.f32, self.MAX_CONTACTS)
-        self.contact_normal = ti.Vector.field(self.d, ti.f32, self.MAX_CONTACTS)
+        self.num_contacts = wp.zeros(1, dtype=int)
+        _assign_scalar(self.num_contacts, 0)
+        self.contact_rigid_a = wp.zeros(self.MAX_CONTACTS, dtype=int)
+        self.contact_rigid_b = wp.zeros(self.MAX_CONTACTS, dtype=int)
+        self.contact_point = wp.zeros(self.MAX_CONTACTS, dtype=wp.vec2)
+        self.contact_normal = wp.zeros(self.MAX_CONTACTS, dtype=wp.vec2)
         # PGS row indices for each contact (to map pgs_lambda back to contact forces)
         # Using single field to avoid LLVM memory layout issues on Windows
-        self.contact_pgs_indices = ti.Vector.field(3, ti.i32, self.MAX_CONTACTS)  # [normal, tangent1, tangent2]
-        self.contact_depth = ti.field(ti.f32, self.MAX_CONTACTS)
-        self.contact_bounce_vel = ti.field(
-            ti.f32, self.MAX_CONTACTS
-        )  # Restitution bounce target velocity (computed once at cache time)
-        self.contact_tangent1 = ti.Vector.field(self.d, ti.f32, self.MAX_CONTACTS)
-        self.contact_force = ti.Vector.field(self.d, ti.f32, self.MAX_CONTACTS)
-        self.contact_count_per_rigid = ti.field(ti.i32, self.MAX_NODES)
+        self.contact_pgs_indices = wp.zeros(self.MAX_CONTACTS, dtype=wp.vec3i)  # [normal, tangent1, tangent2]
+        self.contact_depth = wp.zeros(self.MAX_CONTACTS, dtype=float)
+        self.contact_bounce_vel = wp.zeros(self.MAX_CONTACTS, dtype=float)  # Restitution bounce target velocity (computed once at cache time)
+        self.contact_tangent1 = wp.zeros(self.MAX_CONTACTS, dtype=wp.vec2)
+        self.contact_force = wp.zeros(self.MAX_CONTACTS, dtype=wp.vec2)
+        self.contact_count_per_rigid = wp.zeros(self.MAX_NODES, dtype=int)
 
         # Ground-Rigid contacts (use applyImpulseAtPoint)
-        self.num_ground_contacts = ti.field(ti.i32, shape=())
-        self.num_ground_contacts[None] = 0
+        self.num_ground_contacts = wp.zeros(1, dtype=int)
+        _assign_scalar(self.num_ground_contacts, 0)
         # Track previous frame's contact counts to bound reset loops
-        self.prev_num_contacts = ti.field(ti.i32, shape=())
-        self.prev_num_contacts[None] = 0
-        self.prev_num_ground_contacts = ti.field(ti.i32, shape=())
-        self.prev_num_ground_contacts[None] = 0
-        self.ground_contact_rigid = ti.field(ti.i32, self.MAX_GROUND_CONTACTS)
-        self.ground_contact_point = ti.Vector.field(self.d, ti.f32, self.MAX_GROUND_CONTACTS)
-        self.ground_contact_normal = ti.Vector.field(self.d, ti.f32, self.MAX_GROUND_CONTACTS)
-        self.ground_contact_vel = ti.Vector.field(self.d, ti.f32, self.MAX_GROUND_CONTACTS)
+        self.prev_num_contacts = wp.zeros(1, dtype=int)
+        _assign_scalar(self.prev_num_contacts, 0)
+        self.prev_num_ground_contacts = wp.zeros(1, dtype=int)
+        _assign_scalar(self.prev_num_ground_contacts, 0)
+        self.ground_contact_rigid = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=int)
+        self.ground_contact_point = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=wp.vec2)
+        self.ground_contact_normal = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=wp.vec2)
+        self.ground_contact_vel = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=wp.vec2)
         # PGS row indices for each ground contact
         # Using single field to avoid LLVM memory layout issues on Windows
-        self.ground_contact_pgs_indices = ti.Vector.field(
-            3, ti.i32, self.MAX_GROUND_CONTACTS
-        )  # [normal, tangent1, tangent2]
-        self.ground_contact_force = ti.Vector.field(self.d, ti.f32, self.MAX_GROUND_CONTACTS)
-        self.ground_contact_depth = ti.field(
-            ti.f32, self.MAX_GROUND_CONTACTS
-        )  # Signed penetration depth (negative = penetrating)
-        self.ground_contact_bounce_vel = ti.field(
-            ti.f32, self.MAX_GROUND_CONTACTS
-        )  # Restitution bounce target velocity (computed once at cache time)
+        self.ground_contact_pgs_indices = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=wp.vec3i)  # [normal, tangent1, tangent2]
+        self.ground_contact_force = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=wp.vec2)
+        self.ground_contact_depth = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=float)  # Signed penetration depth (negative = penetrating)
+        self.ground_contact_bounce_vel = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=float)  # Restitution bounce target velocity (computed once at cache time)
         # Fixed tangent basis per contact (computed once at contact creation, stable across PGS iterations)
-        self.ground_contact_tangent1 = ti.Vector.field(self.d, ti.f32, self.MAX_GROUND_CONTACTS)
-        self.ground_contact_tangent2 = ti.Vector.field(self.d, ti.f32, self.MAX_GROUND_CONTACTS)  # only used in 3D
+        self.ground_contact_tangent1 = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=wp.vec2)
+        self.ground_contact_tangent2 = wp.zeros(self.MAX_GROUND_CONTACTS, dtype=wp.vec2)  # only used in 3D
 
         # Per-env ground contact indexing for efficient PGS parallel scanning.
         # Without this, each of N env-threads scans ALL contacts → O(N × total_contacts).
@@ -358,41 +1738,41 @@ class RigidManager:
             4096  # Max envs we allocate for (can be set based on expected batch size, but keep reasonable upper bound)
         )
         self.MAX_GC_PER_ENV = max(self.MAX_GROUND_CONTACTS // self.MAX_ENVS_ALLOC, 1024)
-        self.ground_contact_env_count = ti.field(ti.i32, self.MAX_ENVS_ALLOC)
+        self.ground_contact_env_count = wp.zeros(self.MAX_ENVS_ALLOC, dtype=int)
         # Per-env index lists: ground_contact_env_idx[env_id * MAX_GC_PER_ENV + local_i] = global contact idx
-        self.ground_contact_env_idx = ti.field(ti.i32, self.MAX_ENVS_ALLOC * self.MAX_GC_PER_ENV)
+        self.ground_contact_env_idx = wp.zeros(self.MAX_ENVS_ALLOC * self.MAX_GC_PER_ENV, dtype=int)
         # Same for rigid-rigid contacts
         self.MAX_CC_PER_ENV = max(self.MAX_CONTACTS // self.MAX_ENVS_ALLOC, 256)
-        self.contact_env_count = ti.field(ti.i32, self.MAX_ENVS_ALLOC)
-        self.contact_env_idx = ti.field(ti.i32, self.MAX_ENVS_ALLOC * self.MAX_CC_PER_ENV)
+        self.contact_env_count = wp.zeros(self.MAX_ENVS_ALLOC, dtype=int)
+        self.contact_env_idx = wp.zeros(self.MAX_ENVS_ALLOC * self.MAX_CC_PER_ENV, dtype=int)
 
         print("Finished allocating contact cached ======")
 
         # Per-rigid friction coefficient (Coulomb, 0.0 = frictionless), first friction, second restitution
-        self.contactParams = ti.Vector.field(2, ti.f32, self.MAX_NODES)
+        self.contactParams = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
 
         # Inertia storage: 2D uses scalar, 3D uses 3x3 matrix
-        self.inertia = ti.field(ti.f32, self.MAX_NODES)
+        self.inertia = wp.zeros(self.MAX_NODES, dtype=float)
         # OPTIMIZATION: Cached values for 2D joint solving
-        self.cached_rotation_matrix = ti.Matrix.field(2, 2, ti.f32, self.MAX_NODES)
-        self.cached_inertia_inv_2d = ti.field(ti.f32, self.MAX_NODES)
-        self.visual_angle = ti.field(ti.f32, self.MAX_NODES)
+        self.cached_rotation_matrix = wp.zeros(self.MAX_NODES, dtype=wp.mat22)
+        self.cached_inertia_inv_2d = wp.zeros(self.MAX_NODES, dtype=float)
+        self.visual_angle = wp.zeros(self.MAX_NODES, dtype=float)
 
-        self.mass = ti.field(ti.f32, self.MAX_NODES)
+        self.mass = wp.zeros(self.MAX_NODES, dtype=float)
 
         # per-rigid radius for capsule/ball where applicable
-        self.radius = ti.field(ti.f32, self.MAX_NODES)
+        self.radius = wp.zeros(self.MAX_NODES, dtype=float)
 
         # ── Compound collision shapes ────────────────────────────────────
         # Multiple collision primitives (e.g. 4 spheres on a foot) attached
         # to a single parent rigid body. Sub-colliders are stored in a flat
         # pool; per-rigid (count, offset) index into it.
         self.MAX_COMPOUND_SHAPES = max(count_compound_shapes + 64, 128)
-        self.compound_count = ti.field(ti.i32, self.MAX_NODES)  # num sub-colliders per rigid (0 = use main shape)
-        self.compound_offset = ti.field(ti.i32, self.MAX_NODES)  # start index in pool
-        self.compound_local_pos = ti.Vector.field(d, ti.f32, self.MAX_COMPOUND_SHAPES)  # body-local offset
-        self.compound_radius = ti.field(ti.f32, self.MAX_COMPOUND_SHAPES)  # sub-collider radius
-        self.compound_type = ti.field(ti.i32, self.MAX_COMPOUND_SHAPES)  # RigidType (BALL for now)
+        self.compound_count = wp.zeros(self.MAX_NODES, dtype=int)  # num sub-colliders per rigid (0 = use main shape)
+        self.compound_offset = wp.zeros(self.MAX_NODES, dtype=int)  # start index in pool
+        self.compound_local_pos = wp.zeros(self.MAX_COMPOUND_SHAPES, dtype=wp.vec2)  # body-local offset
+        self.compound_radius = wp.zeros(self.MAX_COMPOUND_SHAPES, dtype=float)  # sub-collider radius
+        self.compound_type = wp.zeros(self.MAX_COMPOUND_SHAPES, dtype=int)  # RigidType (BALL for now)
         self.num_compound_shapes = 0  # total allocated sub-colliders
 
         self.needUpdate = False
@@ -404,16 +1784,16 @@ class RigidManager:
         print("Processed", self.numRigids, "rigids and", self.numAnalytical, "analytical planes.")
 
         self.spatialHash = None
-        self._sh_contact_margin = ti.field(ti.f32, shape=())
-        self._sh_contact_margin[None] = 0.0
+        self._sh_contact_margin = wp.zeros(1, dtype=float)
+        _assign_scalar(self._sh_contact_margin, 0.0)
         self._sh_mesh_elapsed = 0.0
         self._sh_mesh_rebuild_interval = 1.0 / 500.0  # rebuild at most every ~2ms
         self._sh_mesh_needs_rebuild = True  # first call always rebuilds
         self._sh_mesh_max_v = 0.0  # max rigid velocity at last rebuild
-        self._sh_unbounded_lb = ti.Vector.field(self.d, ti.f32, shape=())
-        self._sh_unbounded_ub = ti.Vector.field(self.d, ti.f32, shape=())
-        self._sh_unbounded_lb[None] = ti.Vector([-1e9 for _ in range(self.d)])
-        self._sh_unbounded_ub[None] = ti.Vector([1e9 for _ in range(self.d)])
+        self._sh_unbounded_lb = wp.zeros(1, dtype=wp.vec2)
+        self._sh_unbounded_ub = wp.zeros(1, dtype=wp.vec2)
+        _assign_scalar(self._sh_unbounded_lb, wp.vec2(-1e9, -1e9))
+        _assign_scalar(self._sh_unbounded_ub, wp.vec2(1e9, 1e9))
         if (self.numMeshRigidInContact > 0) and not self.skip_spatial_hash:
             # Size spatial hash based on actual mesh boundary element count (not hardcoded)
             total_elems = self.totalBoundaryElements if self.totalBoundaryElements > 0 else count_mesh_elems
@@ -448,36 +1828,32 @@ class RigidManager:
         self.numAnchors = 0
 
         # ==== Joint storage fields for unified kernel processing ====
-        self.joint_type = ti.field(ti.i32, self.MAX_JOINTS)
-        self.joint_anchor = ti.Vector.field(
-            self.d, ti.f32, self.MAX_JOINTS
-        )  # world-space anchor point for joint constraint
-        self.joint_id_a = ti.field(ti.i32, self.MAX_JOINTS)
-        self.joint_id_b = ti.field(ti.i32, self.MAX_JOINTS)
+        self.joint_type = wp.zeros(self.MAX_JOINTS, dtype=int)
+        self.joint_anchor = wp.zeros(self.MAX_JOINTS, dtype=wp.vec2)  # world-space anchor point for joint constraint
+        self.joint_id_a = wp.zeros(self.MAX_JOINTS, dtype=int)
+        self.joint_id_b = wp.zeros(self.MAX_JOINTS, dtype=int)
 
         # Local offset vectors (body-local coordinates)
-        self.joint_l1 = ti.Vector.field(self.d, ti.f32, self.MAX_JOINTS)
-        self.joint_l2 = ti.Vector.field(self.d, ti.f32, self.MAX_JOINTS)
+        self.joint_l1 = wp.zeros(self.MAX_JOINTS, dtype=wp.vec2)
+        self.joint_l2 = wp.zeros(self.MAX_JOINTS, dtype=wp.vec2)
 
         # Initial orientations for computing relative rotation
-        self.joint_axis = ti.Vector.field(2, ti.f32, self.MAX_JOINTS)
-        self.joint_q0_rel_inv = ti.Vector.field(1, ti.f32, self.MAX_JOINTS)
+        self.joint_axis = wp.zeros(self.MAX_JOINTS, dtype=wp.vec2)
+        self.joint_q0_rel_inv = wp.zeros(self.MAX_JOINTS, dtype=float)
 
         # Joint parameters: [position_bias, angular_bias, lower_limit, upper_limit, velocity_limit, effort_limit]
-        self.joint_params = ti.Vector.field(6, ti.f32, self.MAX_JOINTS)
+        self.joint_params = wp.zeros(self.MAX_JOINTS, dtype=vec6f)
 
         # Motor flag
-        self.joint_has_motor = ti.field(ti.i32, self.MAX_JOINTS)
-        self.joint_control_target = ti.field(
-            ti.f32, self.MAX_JOINTS
-        )  # target position for motor (angle for revolute, length for prismatic)
+        self.joint_has_motor = wp.zeros(self.MAX_JOINTS, dtype=int)
+        self.joint_control_target = wp.zeros(self.MAX_JOINTS, dtype=float)  # target position for motor (angle for revolute, length for prismatic)
         # Motor command semantics:
         # 0 = velocity command (rad/s or m/s), 1 = acceleration command (rad/s^2 or m/s^2), 2 = torque motor
-        self.joint_motor_target_mode = ti.field(ti.i32, self.MAX_JOINTS)
+        self.joint_motor_target_mode = wp.zeros(self.MAX_JOINTS, dtype=int)
         # Runtime velocity target consumed by unified PGS motor rows.
         # This is updated per-substep from joint_control_target according to mode.
-        self.joint_motor_target_vel = ti.field(ti.f32, self.MAX_JOINTS)
-        self.kpd_field = ti.Vector.field(2, ti.f32, self.MAX_JOINTS)  # [kp_pos, kp_rot] for PD control
+        self.joint_motor_target_vel = wp.zeros(self.MAX_JOINTS, dtype=float)
+        self.kpd_field = wp.zeros(self.MAX_JOINTS, dtype=wp.vec2)  # [kp_pos, kp_rot] for PD control
 
         print("Processing joints for RigidManager...")
         self.processJoints(joints)
@@ -488,35 +1864,35 @@ class RigidManager:
         # joint axis, instead of the parent-child relative angle.  This lets
         # ankle/hip joints sense the full body tilt even when the whole chain
         # tips as a unit.
-        self.joint_pd_world_frame = ti.field(ti.i32, self.MAX_JOINTS)
+        self.joint_pd_world_frame = wp.zeros(self.MAX_JOINTS, dtype=int)
 
         self.pgs_iterations = 200  # Max PGS iterations (with early convergence exit)
         self.pgs_tol = 1e-5  # Convergence tolerance for PGS early exit
 
         self.MAX_CONSTRAINTS = 16 * self.MAX_CONTACTS * 3 + 7 * self.MAX_JOINTS  # 3 per contact and 7 per joints
-        self.numConstraints = ti.field(ti.i32, shape=())
-        self.numConstraints[None] = 0
+        self.numConstraints = wp.zeros(1, dtype=int)
+        _assign_scalar(self.numConstraints, 0)
         # Per-constraint Jacobians for body A and body B:
         #   - ground-vs-rigid uses only pgs_Jac_a (B is zero)
         #   - rigid-vs-rigid uses both pgs_Jac_a and pgs_Jac_b
-        self.pgs_Jac_a = ti.Vector.field(3, ti.f32, self.MAX_CONSTRAINTS)
-        self.pgs_Jac_b = ti.Vector.field(3, ti.f32, self.MAX_CONSTRAINTS)
-        self.pgs_rhs = ti.field(ti.f32, self.MAX_CONSTRAINTS)
-        self.pgs_limits = ti.Vector.field(2, ti.f32, self.MAX_CONSTRAINTS)  # [lower, upper]
-        self.pgs_bodypair = ti.Vector.field(2, ti.i32, self.MAX_CONSTRAINTS)
+        self.pgs_Jac_a = wp.zeros(self.MAX_CONSTRAINTS, dtype=wp.vec3)
+        self.pgs_Jac_b = wp.zeros(self.MAX_CONSTRAINTS, dtype=wp.vec3)
+        self.pgs_rhs = wp.zeros(self.MAX_CONSTRAINTS, dtype=float)
+        self.pgs_limits = wp.zeros(self.MAX_CONSTRAINTS, dtype=wp.vec2)  # [lower, upper]
+        self.pgs_bodypair = wp.zeros(self.MAX_CONSTRAINTS, dtype=wp.vec2i)
         # Per-row accumulated impulse for projected GS and friction clamping.
-        self.pgs_lambda = ti.field(ti.f32, self.MAX_CONSTRAINTS)
+        self.pgs_lambda = wp.zeros(self.MAX_CONSTRAINTS, dtype=float)
         # For friction rows, parent normal row index; -1 otherwise.
-        self.pgs_parent_row = ti.field(ti.i32, self.MAX_CONSTRAINTS)
+        self.pgs_parent_row = wp.zeros(self.MAX_CONSTRAINTS, dtype=int)
         self._pgs_check_interval = 5  # Check convergence every N iterations (after warm-up of 10)
         # Allocate PGS RotV snapshot with matching dimension
-        self.pgsErrorNone = ti.field(ti.f32, shape=())
-        self.pgsErrorNone[None] = 0.0
+        self.pgsErrorNone = wp.zeros(1, dtype=float)
+        _assign_scalar(self.pgsErrorNone, 0.0)
 
         # Snapshot fields for PGS convergence check
-        self.V_prev = ti.Vector.field(self.d, ti.f32, self.MAX_NODES)
+        self.V_prev = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
         self.RotV_prev = None  # allocated below after RotV
-        self.RotV_prev = ti.Vector.field(1, ti.f32, self.MAX_NODES)
+        self.RotV_prev = wp.zeros(self.MAX_NODES, dtype=float)
 
         # Optional Python-side PGS kernel timing breakdown.
         self.pgs_profile_enabled = False
@@ -539,6 +1915,11 @@ class RigidManager:
         self.movingAnalytical = False
         print("Processing boundary conditions for RigidManager...")
         self.processConditions()
+
+        # Materialize world-space mesh boundary coords for contact / drawing.
+        if self.numMesh > 0:
+            self.precompute_rigid_transforms()
+            self.updateMeshCoords()
 
         # Normal mode: use shared BVH from ExplicitLoop
         self.bvh = bvh
@@ -630,13 +2011,13 @@ class RigidManager:
             return -1
 
         # Record pool geometry metadata
-        self.pool_node_offset[pool_id] = node_offset
-        self.pool_node_count[pool_id] = num_nodes
-        self.pool_elem_offset[pool_id] = elem_offset
-        self.pool_elem_count[pool_id] = num_elems
+        _patch_array(self.pool_node_offset, pool_id, node_offset)
+        _patch_array(self.pool_node_count, pool_id, num_nodes)
+        _patch_array(self.pool_elem_offset, pool_id, elem_offset)
+        _patch_array(self.pool_elem_count, pool_id, num_elems)
 
         # Get reference point from rigid
-        ref = self.rigidParams[rigid_idx, 0].to_numpy()
+        ref = np.asarray(self.rigidParams.numpy()[rigid_idx, 0], dtype=np.float32)
 
         # Store boundary node coordinates in pool
         boundary_node_map = {}
@@ -647,14 +2028,14 @@ class RigidManager:
             coord = mesh.coords[global_nid]
             lr = coord - ref
 
-            self.pool_boundary_lrs[node_offset + local_bid] = lr
+            _patch_array(self.pool_boundary_lrs, node_offset + local_bid, lr)
 
         # Store boundary element connectivity (remapped to local indices)
         for eid in range(num_elems):
             elem_conn = mesh.boundaryElements[eid]
             local_n0 = boundary_node_map[int(elem_conn[0])]
             local_n1 = boundary_node_map[int(elem_conn[1])]
-            self.pool_boundary_elements[elem_offset + eid] = ti.Vector([local_n0, local_n1, -1])
+            _patch_array(self.pool_boundary_elements, elem_offset + eid, (local_n0, local_n1, -1))
           
 
         # Update pool counters
@@ -678,7 +2059,6 @@ class RigidManager:
         self.precompute_rigid_transforms()
         self.updateBBox()
 
-    @ti.kernel
     def calInertiaInv(self):
         for i in range(self.numRigids):
             # Compute inverse using Taichi's built-in matrix inverse
@@ -687,45 +2067,37 @@ class RigidManager:
                 I_inv = self.inertia[i].inverse()
                 self.inertiaInv[i] = I_inv
             else:
-                self.inertiaInv[i] = ti.Matrix.zero(ti.f32, 3, 3)  # zero inverse = infinite inertia (fixed body)
+                self.inertiaInv[i] = wp.mat33(0.0)  # zero inverse = infinite inertia (fixed body)
 
-    @ti.kernel
     def _copy_elements_from_pool_kernel(
-        self, dst_offset: ti.i32, src_offset: ti.i32, count: ti.i32, node_offset: ti.i32
+        self, dst_offset: int, src_offset: int, count: int, node_offset: int
     ):
-        """Fast kernel to copy element connectivity from pool to legacy array.
-
-        OPTIMIZATION: GPU-parallel copy is 10-100x faster than Python loop.
-        Used when multiple mesh rigids share the same geometry (instancing).
-        """
+        """Copy element connectivity from pool to legacy array (host numpy path)."""
+        pool_elems = self.pool_boundary_elements.numpy()
         for i in range(count):
-            conn = self.pool_boundary_elements[src_offset + i]
-            out_conn = ti.Vector([conn[0], conn[1], conn[2]])
-            if conn[0] >= 0:
-                out_conn[0] = conn[0] + node_offset
-            if conn[1] >= 0:
-                out_conn[1] = conn[1] + node_offset
-            if conn[2] >= 0:
-                out_conn[2] = conn[2] + node_offset
-            self.meshBoundaryElements[dst_offset + i] = out_conn
-
-    @ti.kernel
-    def _batch_copy_elements_kernel(self, dst_offset: ti.i32, node_offset: ti.i32, elem_data: ti.types.ndarray()):
-        """Fast kernel to copy element array from numpy to Taichi field.
-
-        OPTIMIZATION: Direct ndarray access in Taichi kernel avoids Python loop overhead.
-        """
-        for i in range(elem_data.shape[0]):
-            c0 = elem_data[i, 0]
-            c1 = elem_data[i, 1]
-            c2 = elem_data[i, 2]
+            conn = pool_elems[src_offset + i]
+            c0, c1, c2 = int(conn[0]), int(conn[1]), int(conn[2])
             if c0 >= 0:
                 c0 += node_offset
             if c1 >= 0:
                 c1 += node_offset
             if c2 >= 0:
                 c2 += node_offset
-            self.meshBoundaryElements[dst_offset + i] = ti.Vector([c0, c1, c2])
+            _patch_array(self.meshBoundaryElements, dst_offset + i, wp.vec3(c0, c1, c2))
+
+    def _batch_copy_elements_kernel(self, dst_offset: int, node_offset: int, elem_data):
+        """Copy element connectivity from numpy into meshBoundaryElements."""
+        for i in range(elem_data.shape[0]):
+            c0 = int(elem_data[i, 0])
+            c1 = int(elem_data[i, 1])
+            c2 = int(elem_data[i, 2])
+            if c0 >= 0:
+                c0 += node_offset
+            if c1 >= 0:
+                c1 += node_offset
+            if c2 >= 0:
+                c2 += node_offset
+            _patch_array(self.meshBoundaryElements, dst_offset + i, wp.vec3(c0, c1, c2))
 
     def substep(self, collision_pairs_field, num_pairs, dt, damping, fem_lb=None, fem_ub=None, fem_margin=0.0):
         """High-level rigid update: integrate velocities, solve constraints, update positions.
@@ -758,7 +2130,7 @@ class RigidManager:
         # Only update GPU field when rigid-rigid SH is actually used (avoids GPU sync).
         if self.considerRigidRigidContact:
             margin = self._sh_mesh_max_v * self._sh_mesh_elapsed
-            self._sh_contact_margin[None] = margin
+            _assign_scalar(self._sh_contact_margin, margin)
 
         self.update_joint_motor_velocity_targets_kernel(dt)
         if self.use_pd == 1:
@@ -772,22 +2144,22 @@ class RigidManager:
             # Generate them directly to avoid scanning all BVH pairs.
             self._generate_ground_pairs_direct_kernel()
 
-        # if (self.num_box_box_pairs[None] > 0):
-        #     print("Num pairs:", num_pairs, "Ball-Ball:", self.num_ball_ball_pairs[None],
-        #         "Box-Box:", self.num_box_box_pairs[None], "Box-Ball:", self.num_box_ball_pairs[None],
-        #         "Seg-Point:", self.num_seg_point_pairs[None], "Seg-Ball:", self.num_seg_ball_pairs[None], "Seg-Seg:", self.num_seg_seg_pairs[None],
-        # "Mesh-Mesh:", self.num_mesh_pairs[None], "Mixed:", self.num_mixed_pairs[None], "Ground-Prim:", self.num_groundprim_pairs[None], "Ground-Mesh:", self.num_groundmesh_pairs[None])
+        # if (int(self.num_box_box_pairs.numpy()[0]) > 0):
+        #     print("Num pairs:", num_pairs, "Ball-Ball:", int(self.num_ball_ball_pairs.numpy()[0]),
+        #         "Box-Box:", int(self.num_box_box_pairs.numpy()[0]), "Box-Ball:", int(self.num_box_ball_pairs.numpy()[0]),
+        #         "Seg-Point:", int(self.num_seg_point_pairs.numpy()[0]), "Seg-Ball:", int(self.num_seg_ball_pairs.numpy()[0]), "Seg-Seg:", int(self.num_seg_seg_pairs.numpy()[0]),
+        # "Mesh-Mesh:", int(self.num_mesh_pairs.numpy()[0]), "Mixed:", int(self.num_mixed_pairs.numpy()[0]), "Ground-Prim:", int(self.num_groundprim_pairs.numpy()[0]), "Ground-Mesh:", int(self.num_groundmesh_pairs.numpy()[0]))
         has_rigid_rigid_contact = (
-            self.num_ball_ball_pairs[None]
-            + self.num_box_box_pairs[None]
-            + self.num_box_ball_pairs[None]
-            + self.num_seg_point_pairs[None]
-            + self.num_seg_ball_pairs[None]
-            + self.num_seg_seg_pairs[None]
-            + self.num_mesh_pairs[None]
-            + self.num_mixed_pairs[None]
+            int(self.num_ball_ball_pairs.numpy()[0])
+            + int(self.num_box_box_pairs.numpy()[0])
+            + int(self.num_box_ball_pairs.numpy()[0])
+            + int(self.num_seg_point_pairs.numpy()[0])
+            + int(self.num_seg_ball_pairs.numpy()[0])
+            + int(self.num_seg_seg_pairs.numpy()[0])
+            + int(self.num_mesh_pairs.numpy()[0])
+            + int(self.num_mixed_pairs.numpy()[0])
         ) > 0
-        has_rigid_ground_contact = (self.num_groundprim_pairs[None] + self.num_groundmesh_pairs[None]) > 0
+        has_rigid_ground_contact = (int(self.num_groundprim_pairs.numpy()[0]) + int(self.num_groundmesh_pairs.numpy()[0])) > 0
         has_contact = has_rigid_rigid_contact or has_rigid_ground_contact
         has_solve = self.numAnchors > 0 or has_contact
 
@@ -815,7 +2187,7 @@ class RigidManager:
             # Compute contact forces from impulses (force = impulse / dt)
             if has_contact:
                 self._compute_contact_forces_kernel(dt)
-            self.numConstraints[None] = 0
+            _assign_scalar(self.numConstraints, 0)
         # K4: position integration + AABB update (2→1 kernel)
         update_bbox_coords = 1
         self._updateU_and_BBox_kernel(dt, update_bbox_coords)
@@ -839,14 +2211,15 @@ class RigidManager:
         Note: Does NOT reset boundary conditions - those should be managed by the caller.
         """
         # Reset all dynamic state variables to zero
-        self.V.fill(0.0)
-        self.RotV.fill(0.0)
-        self.U.fill(0.0)  # CRITICAL: Reset accumulated displacement
+        _fill_array(self.V, 0.0)
+        _fill_array(self.RotV, 0.0)
+        _fill_array(self.U, 0.0)  # CRITICAL: Reset accumulated displacement
 
         # Re-pack rigid parameters from initial origins stored in rigid objects
         # This restores initial positions (and will set initial rotations)
+        domain_ids = self.rigidDomainIds.numpy()
         for i in range(self.numRigids):
-            domain_idx = int(self.rigidDomainIds[i][0])
+            domain_idx = int(domain_ids[i][0])
             domain = self.domains[domain_idx]
             if domain.type == DomainType.RIGID:
                 # Re-pack parameters from the rigid object (which stores initial origin)
@@ -864,7 +2237,7 @@ class RigidManager:
             return np.asarray(rigid.initial_quat, dtype=np.float32)
 
         euler = rigid.angle
-        mag = euler.norm()
+        mag = wp.length(euler)
         if mag < 1e-8:
             return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -883,27 +2256,27 @@ class RigidManager:
         """
         # Reference point
         ref = rigid.getRefPoint()
-        self.rigidParams[idx, 0] = ref
-        self.mass[idx] = rigid.mass
+        _patch_array(self.rigidParams, (idx, 0), ref)
+        _patch_array(self.mass, idx, rigid.mass)
 
         # default zero for primary / aux
-        zero_vec = ti.Vector([0.0 for _ in range(self.d)])
-        self.rigidParams[idx, 1] = zero_vec
+        zero_vec = wp.vec2(0.0, 0.0)
+        _patch_array(self.rigidParams, (idx, 1), zero_vec)
 
         # fill according to rigid type if available
         if rigid.rtype == RigidType.BALL:
             # also keep scalar radius field
-            self.radius[idx] = rigid.getRadius()
+            _patch_array(self.radius, idx, rigid.getRadius())
 
         elif rigid.rtype == RigidType.BOX:
             # extents -> primary, angle -> aux
-            self.rigidParams[idx, 1] = rigid.getPrimary()
+            _patch_array(self.rigidParams, (idx, 1), rigid.getPrimary())
 
         elif rigid.rtype == RigidType.CAPSULE:
             # store segment endpoints relative to the reference point (local offsets)
             # so that they can be rotated/translated in-kernel correctly.
-            self.rigidParams[idx, 1] = rigid.getPrimary() - ref
-            self.radius[idx] = rigid.getRadius()
+            _patch_array(self.rigidParams, (idx, 1), rigid.getPrimary() - ref)
+            _patch_array(self.radius, idx, rigid.getRadius())
 
         elif rigid.rtype == RigidType.MESH:
             # ==== MESH INSTANCING: Use geometry pool with deduplication ====
@@ -923,12 +2296,12 @@ class RigidManager:
 
             # Link this rigid instance to its pool geometry
             if pool_id >= 0:
-                self.instance_pool_id[idx] = pool_id
+                _patch_array(self.instance_pool_id, idx, pool_id)
 
             # Store scale and offset (needed for transform operations)
             if rigid.transform is not None:
                 scale_vec = rigid.transform.scale
-                self.meshRigidScale[idx] = ti.Vector([float(scale_vec[i]) for i in range(self.d)])
+                _patch_array(self.meshRigidScale, idx, wp.vec2(float(scale_vec[0]), float(scale_vec[1])))
                 # Absorb offset into the body center so that the physics
                 # pivot (rigidParams[idx,0]) coincides with the geometry
                 # center.  This ensures correct lever arms in impulse
@@ -938,18 +2311,23 @@ class RigidManager:
                 # still produces the correct world coords because offset
                 # is now zero.
                 offset_vec = rigid.transform.offset
-                offset_ti = ti.Vector([float(offset_vec[i]) for i in range(self.d)])
-                self.rigidParams[idx, 0] += offset_ti
-                self.meshRigidOffset[idx] = ti.Vector([0.0 for _ in range(self.d)])
+                offset_ti = wp.vec2(float(offset_vec[0]), float(offset_vec[1]))
+                params = self.rigidParams.numpy()
+                params[idx, 0] = (
+                    float(params[idx, 0][0]) + float(offset_vec[0]),
+                    float(params[idx, 0][1]) + float(offset_vec[1]),
+                )
+                self.rigidParams.assign(params)
+                _patch_array(self.meshRigidOffset, idx, wp.vec2(0.0, 0.0))
             else:
                 # Default to uniform scale of 1.0
-                self.meshRigidScale[idx] = ti.Vector([1.0 for _ in range(self.d)])
-                self.meshRigidOffset[idx] = ti.Vector([0.0 for _ in range(self.d)])
+                _patch_array(self.meshRigidScale, idx, wp.vec2(1.0, 1.0))
+                _patch_array(self.meshRigidOffset, idx, wp.vec2(0.0, 0.0))
 
             # Maintain index mappings and metadata for backward compatibility
             mesh_local_idx = self.numMesh
-            self.rigid2MeshIndices[idx] = mesh_local_idx
-            self.mesh2RigidIndices[mesh_local_idx] = idx
+            _patch_array(self.rigid2MeshIndices, idx, mesh_local_idx)
+            _patch_array(self.mesh2RigidIndices, mesh_local_idx, idx)
 
             # ==== OPTIMIZATION: Fast element copy using mesh instancing ====
             # If this mesh reuses pool geometry, directly copy elements from pool
@@ -975,15 +2353,15 @@ class RigidManager:
                 raise RuntimeError("Exceeded MAX_BOUNDARY_ELEMENTS")
 
             # Record metadata
-            self.meshBoundaryNodeOffset[mesh_local_idx] = node_offset
-            self.meshBoundaryNodeCount[mesh_local_idx] = num_boundary_nodes
-            self.meshBoundaryElementOffset[mesh_local_idx] = elem_offset
-            self.meshBoundaryElementCount[mesh_local_idx] = num_boundary_elements
+            _patch_array(self.meshBoundaryNodeOffset, mesh_local_idx, node_offset)
+            _patch_array(self.meshBoundaryNodeCount, mesh_local_idx, num_boundary_nodes)
+            _patch_array(self.meshBoundaryElementOffset, mesh_local_idx, elem_offset)
+            _patch_array(self.meshBoundaryElementCount, mesh_local_idx, num_boundary_elements)
 
             # OPTIMIZATION: Reuse element connectivity from pool if available
             if pool_id >= 0:
                 # Fast path: copy from pool using Taichi kernel
-                pool_elem_offset = self.pool_elem_offset[pool_id]
+                pool_elem_offset = int(self.pool_elem_offset.numpy()[pool_id])
                 self._copy_elements_from_pool_kernel(elem_offset, pool_elem_offset, num_boundary_elements, node_offset)
             else:
                 # Slow path: build element array (only for first instance of unique geometry)
@@ -1012,35 +2390,37 @@ class RigidManager:
 
         # consider angle for mesh rigid, box, capsule
         # 2D: just store the scalar angle
-        self.quat[idx] = rigid.angle
-        self.quat_initial[idx] = rigid.angle
-        self.visual_angle[idx] = 0.0
+        _patch_array(self.quat, idx, rigid.angle)
+        _patch_array(self.quat_initial, idx, rigid.angle)
+        _patch_array(self.visual_angle, idx, 0.0)
 
         # Store inertia if available on python-side rigid object
         ib = rigid.inertia_body
-        self.inertia[idx] = float(ib)
+        _patch_array(self.inertia, idx, float(ib))
       
 
     def resetRigidParams(self, rigid, idx: int):
         # Reference point (absorb transform offset so physics center = geometry center)
-        ref = rigid.getRefPoint()
-        self.rigidParams[idx, 0] = ref
+        ref = np.asarray(rigid.getRefPoint(), dtype=np.float32).reshape(-1)
         if hasattr(rigid, "transform") and rigid.transform is not None:
             offset_vec = rigid.transform.offset
-            for i in range(self.d):
-                self.rigidParams[idx, 0][i] += float(offset_vec[i])
+            ref = np.array(
+                [float(ref[0]) + float(offset_vec[0]), float(ref[1]) + float(offset_vec[1])],
+                dtype=np.float32,
+            )
+        _patch_array(self.rigidParams, (idx, 0), ref)
 
         # consider angle for mesh rigid, box, capsule
         if hasattr(rigid, "angle"):
             # 2D: just store the scalar angle
-            self.quat[idx] = rigid.angle
-            self.quat_initial[idx] = rigid.angle
-            self.visual_angle[idx] = 0.0
-          
+            _patch_array(self.quat, idx, rigid.angle)
+            _patch_array(self.quat_initial, idx, rigid.angle)
+            _patch_array(self.visual_angle, idx, 0.0)
+
         else:
-            self.quat[idx] = ti.Vector([0.0])
-            self.quat_initial[idx] = ti.Vector([0.0])
-            self.visual_angle[idx] = 0.0
+            _patch_array(self.quat, idx, 0.0)
+            _patch_array(self.quat_initial, idx, 0.0)
+            _patch_array(self.visual_angle, idx, 0.0)
 
     def _register_compound_shapes(self, rigid_idx, collision_shapes):
         """Register compound sub-colliders for a rigid body.
@@ -1054,15 +2434,15 @@ class RigidManager:
         if offset + n > self.MAX_COMPOUND_SHAPES:
             print(f"\033[91mError: Compound shape pool exhausted ({offset + n} > {self.MAX_COMPOUND_SHAPES})\033[0m")
             raise RuntimeError("Exceeded MAX_COMPOUND_SHAPES")
-        self.compound_count[rigid_idx] = n
-        self.compound_offset[rigid_idx] = offset
+        _patch_array(self.compound_count, rigid_idx, n)
+        _patch_array(self.compound_offset, rigid_idx, offset)
         for k, shape in enumerate(collision_shapes):
             idx = offset + k
             pos = shape["local_pos"]
 
-            self.compound_local_pos[idx] = ti.Vector([float(pos[0]), float(pos[1])])
-            self.compound_radius[idx] = float(shape["radius"])
-            self.compound_type[idx] = int(shape["type"])
+            _patch_array(self.compound_local_pos, idx, wp.vec2(float(pos[0]), float(pos[1])))
+            _patch_array(self.compound_radius, idx, float(shape["radius"]))
+            _patch_array(self.compound_type, idx, int(shape)["type"])
         self.num_compound_shapes = offset + n
 
     def processDomains_(self, domains):
@@ -1086,7 +2466,7 @@ class RigidManager:
 
                 # Set environment ID for collision filtering (batched training)
                 if hasattr(domain, "env_id"):
-                    self.rigid_env_id[rigid_idx] = domain.env_id
+                    _patch_array(self.rigid_env_id, rigid_idx, domain.env_id)
 
                 self.numRigids += 1
                 self.needUpdate = True
@@ -1115,22 +2495,22 @@ class RigidManager:
                     )
                     raise RuntimeError(f"Exceeded maximum analytical domains ({self.MAX_ANAL})")
 
-                self.rigidDomainIds[self.numAnalytical + self.numRigids] = [
-                    i,
-                    0,
-                    1,
-                ]  # type 0 for ground, type 1 for considerContact as default
+                _patch_array(
+                    self.rigidDomainIds,
+                    self.numAnalytical + self.numRigids,
+                    wp.vec3i(i, 0, 1),
+                )  # type 0 for ground, type 1 for considerContact as default
                 anal_idx = self.numAnalytical + self.numRigids
                 category_bits = int(getattr(domain, "category_bits", COLLISION_CATEGORY_GROUND)) & 0b11111111
                 collide_bits = int(getattr(domain, "collide_bits", COLLISION_MASK_ALL)) & 0b11111111
-                self.category_bits[anal_idx] = category_bits
-                self.collide_bits[anal_idx] = collide_bits
-                self.mass[self.numAnalytical + self.numRigids] = 1e10  # very large mass to simulate immovable object
+                _patch_array(self.category_bits, anal_idx, category_bits)
+                _patch_array(self.collide_bits, anal_idx, collide_bits)
+                _patch_array(self.mass, self.numAnalytical + self.numRigids, 1e10)# very large mass to simulate immovable object
                 domain.attach(self, self.numAnalytical + self.numRigids)
-                self.domainToRigid[i] = self.numAnalytical + self.numRigids
+                _patch_array(self.domainToRigid, i, self.numAnalytical + self.numRigids)
                 if domain.type == DomainType.ANALYTICAL:
-                    self.rigidParams[self.numRigids + self.numAnalytical, 0] = domain.point
-                    self.rigidParams[self.numRigids + self.numAnalytical, 1] = domain.normal
+                    _patch_array(self.rigidParams, (self.numRigids + self.numAnalytical, 0), domain.point)
+                    _patch_array(self.rigidParams, (self.numRigids + self.numAnalytical, 1), domain.normal)
                     if len(domain.bcs) > 0:
                         self.needUpdate = True
                 elif domain.type in (DomainType.HEIGHTFIELD, DomainType.VOXELMAP):
@@ -1145,42 +2525,44 @@ class RigidManager:
             self.needUpdate = True
 
     def _addBcValue(self, idx, type, value):
-        self.bcNodes[idx] |= type
+        cur = int(self.bcNodes.numpy()[idx])
+        _patch_array(self.bcNodes, idx, cur | int(type))
 
         if type == UTYPE:
-            self.bcTValues[idx] = [0.0 for j in range(self.d)]
-            self.mass[idx] = 1e10  # large mass to fix in space
+            _patch_array(self.bcTValues, idx, wp.vec2(0.0, 0.0))
+            _patch_array(self.mass, idx, 1e10)  # large mass to fix in space
         elif type == RTYPE:
-            self.bcTValues[idx] = [0.0 for j in range(self.d)]
-            self.mass[idx] = 1e10  # large mass to fix in space
-            self.inertia[idx] = 1e10
-            self.bcRValues[idx] = [0.0]
+            _patch_array(self.bcTValues, idx, wp.vec2(0.0, 0.0))
+            _patch_array(self.mass, idx, 1e10)  # large mass to fix in space
+            _patch_array(self.inertia, idx, 1e10)
+            _patch_array(self.bcRValues, idx, 0.0)
         elif type == VTYPE:
-            self.bcTValues[idx] = value
-            self.mass[idx] = 1e10
+            _patch_array(self.bcTValues, idx, value)
+            _patch_array(self.mass, idx, 1e10)
 
         elif type == ROTVTYPE:
-            self.bcRValues[idx] = value
-            self.inertia[idx] = 1e10
+            _patch_array(self.bcRValues, idx, value)
+            _patch_array(self.inertia, idx, 1e10)
 
         elif type == ROTATYPE or type == TORQUETYPE:
-            self.bcRValues[idx] = value
+            _patch_array(self.bcRValues, idx, value)
 
         elif type == GRAVITY:
-            self.bcGValues[idx] = value
+            _patch_array(self.bcGValues, idx, value)
         else:
-            self.bcTValues[idx] = value
+            _patch_array(self.bcTValues, idx, value)
 
     def processConditions(self):
+        domain_ids = self.rigidDomainIds.numpy()
         for i in range(self.numRigids):
-            idx = int(self.rigidDomainIds[i][0])
+            idx = int(domain_ids[i][0])
             domain = self.domains[idx]
             for bc in domain.bcs:
                 type, nodes, value = bc.processData()
                 self._addBcValue(i, type, value)
 
         for i in range(self.numAnalytical):
-            idx = int(self.rigidDomainIds[i + self.numRigids][0])
+            idx = int(domain_ids[i + self.numRigids][0])
             domain = self.domains[idx]
             for bc in domain.bcs:
                 type, nodes, value = bc.processData()
@@ -1193,12 +2575,12 @@ class RigidManager:
                 type, nodes, value = bc.processData()
                 target_value = 0.0
                 if type == ROTVTYPE or type == VTYPE:
-                    self.joint_motor_target_mode[i] = 0
+                    _patch_array(self.joint_motor_target_mode, i, 0)
                 elif type == ROTATYPE or type == ATYPE:
-                    self.joint_motor_target_mode[i] = 1
+                    _patch_array(self.joint_motor_target_mode, i, 1)
 
                 if isinstance(value, (list, tuple, np.ndarray)):
-                    axis_np = self.joint_axis[i].to_numpy()
+                    axis_np = self.joint_axis.numpy()[i]
                     axis_norm = np.linalg.norm(axis_np)
                     if axis_norm > 1e-9:
                         axis_np = axis_np / axis_norm
@@ -1208,7 +2590,7 @@ class RigidManager:
                 else:
                     target_value = float(value)
 
-                self.joint_control_target[i] = target_value
+                _patch_array(self.joint_control_target, i, target_value)
 
     # -------  Rigid-Rigid contact related functions ----------------------------
     # ---------------------------------------------------------------------------
@@ -1226,26 +2608,26 @@ class RigidManager:
         """
         # Primitive contacts: use a single dispatch kernel so first-frame JIT
         # only needs one kernel entry for primitive rigid-rigid contacts.
-        if self.num_primitive_pairs[None] > 0:
+        if int(self.num_primitive_pairs.numpy()[0]) > 0:
             self._detect_primitive_contacts_kernel()
         # Mesh and mixed: only compile/launch when spatialHash exists.
         # When spatialHash is None (no mesh rigids), these kernels reference
-        has_mesh_related_pairs = (self.num_mesh_pairs[None] + self.num_mixed_pairs[None]) > 0
+        has_mesh_related_pairs = (int(self.num_mesh_pairs.numpy()[0]) + int(self.num_mixed_pairs.numpy()[0])) > 0
         if self.spatialHash is not None and has_mesh_related_pairs:
             self.maybe_rebuild_spatial_hash()
-            if self.num_mesh_pairs[None] > 0:
+            if int(self.num_mesh_pairs.numpy()[0]) > 0:
                 self.detect_mesh_mesh_contacts_kernel()
-            if self.num_mixed_pairs[None] > 0:
+            if int(self.num_mixed_pairs.numpy()[0]) > 0:
                 self.detect_mixed_contacts_kernel()
 
     # ── Primitive contact dispatch ──
     # A single kernel entry reduces first-frame JIT overhead for scenes that
     # only need a small subset of primitive contact types.
 
-    @ti.func
-    def _dispatch_primitive_contact(self, rigid_a: ti.i32, rigid_b: ti.i32):
-        type_a = self.rigidDomainIds[rigid_a][1]
-        type_b = self.rigidDomainIds[rigid_b][1]
+    def _dispatch_primitive_contact(self, rigid_a: int, rigid_b: int):
+        domain_ids = self.rigidDomainIds.numpy()
+        type_a = int(domain_ids[rigid_a][1])
+        type_b = int(domain_ids[rigid_b][1])
         contact_type = type_a | type_b
 
         if contact_type == RigidContactType.BALLBALL:
@@ -1281,36 +2663,107 @@ class RigidManager:
         elif contact_type == RigidContactType.CAPSULECAPSULE:
             self.detectSegmentSegmentContact_(rigid_a, rigid_b)
 
-    @ti.kernel
     def _detect_primitive_contacts_kernel(self):
-        for i in range(self.num_primitive_pairs[None]):
-            pair = self.primitive_pairs_buffer[i]
-            self._dispatch_primitive_contact(pair[0], pair[1])
+        n = int(self.num_primitive_pairs.numpy()[0])
+        if n <= 0:
+            return
+        wp.launch(
+            _detect_primitive_contacts_wp,
+            dim=1,
+            inputs=[
+                n,
+                int(self.MAX_CONTACTS),
+                float(self.restitution_velocity_threshold),
+                int(self.MAX_ENVS_ALLOC),
+                int(self.MAX_CC_PER_ENV),
+                self.primitive_pairs_buffer,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.radius,
+                self.cached_rotation_matrix,
+                self.V,
+                self.RotV,
+                self.contactParams,
+                self.rigid_env_id,
+                self.num_contacts,
+                self.contact_rigid_a,
+                self.contact_rigid_b,
+                self.contact_point,
+                self.contact_normal,
+                self.contact_depth,
+                self.contact_bounce_vel,
+                self.contact_tangent1,
+                self.contact_count_per_rigid,
+                self.contact_env_count,
+                self.contact_env_idx,
+            ],
+        )
 
-    @ti.kernel
     def detect_analyticalprim_contacts_kernel(self):
         """Detect and resolve collisions between analytical planes and rigids."""
-        for i in range(self.num_groundprim_pairs[None]):
-            analIdx, rigidIdx = self.groundprim_pairs_buffer[i]
-            self.detectAnalaytical2Rigid(analIdx, rigidIdx)
+        n = int(self.num_groundprim_pairs.numpy()[0])
+        if n <= 0:
+            return
+        wp.launch(
+            _detect_analytical_prim_contacts_wp,
+            dim=1,
+            inputs=[
+                n,
+                0.0005,
+                int(self.MAX_GROUND_CONTACTS),
+                float(self.restitution_velocity_threshold),
+                self._ground_use_aabb_early_out,
+                self.groundprim_pairs_buffer,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.radius,
+                self.V,
+                self.RotV,
+                self.contactParams,
+                self.rigid_env_id,
+                self.cached_rotation_matrix,
+                self.aabb,
+                self.compound_count,
+                self.compound_offset,
+                self.compound_local_pos,
+                self.compound_radius,
+                self.num_ground_contacts,
+                self.ground_contact_rigid,
+                self.ground_contact_point,
+                self.ground_contact_normal,
+                self.ground_contact_vel,
+                self.ground_contact_depth,
+                self.ground_contact_bounce_vel,
+                self.ground_contact_tangent1,
+                self.ground_contact_env_count,
+                self.ground_contact_env_idx,
+                int(self.MAX_ENVS_ALLOC),
+                int(self.MAX_GC_PER_ENV),
+            ],
+        )
 
-    @ti.kernel
     def detect_mesh_mesh_contacts_kernel(self):
         """Detect and resolve collisions between two mesh rigids."""
-        for i in range(self.num_mesh_pairs[None]):
-            pair = self.mesh_pairs_buffer[i]
-            ic = int(pair[0])
-            jc = int(pair[1])
+        n = int(self.num_mesh_pairs.numpy()[0])
+        if n <= 0:
+            return
+        pairs = self.mesh_pairs_buffer.numpy()
+        for i in range(n):
+            ic = int(pairs[i][0])
+            jc = int(pairs[i][1])
             self.detectMeshMeshContact_(ic, jc)
 
-    @ti.kernel
     def detect_mixed_contacts_kernel(self):
         """Detect and resolve collisions between a mesh rigid and a primitive rigid."""
-        for i in range(self.num_mixed_pairs[None]):
-            pair = self.mixed_pairs_buffer[i]
-            ic = int(pair[0])
-            jc = int(pair[1])
-            rigid1Type = int(self.rigidDomainIds[ic][1])
+        n = int(self.num_mixed_pairs.numpy()[0])
+        if n <= 0:
+            return
+        pairs = self.mixed_pairs_buffer.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        for i in range(n):
+            ic = int(pairs[i][0])
+            jc = int(pairs[i][1])
+            rigid1Type = int(domain_ids[ic][1])
 
             # Determine which index is the mesh and which is primitive
             mesh_idx = jc
@@ -1325,67 +2778,58 @@ class RigidManager:
     # ===== All the followings are rigid-rigid contact detection functions ======
     # ===========================================================================
 
-    @ti.func
-    def _capsule_segment_endpoints(self, seg_id: ti.i32):
-        center = self.rigidParams[seg_id, 0]
-        lcdir = self.rigidParams[seg_id, 1]
-        lc = self.cached_rotation_matrix[seg_id] @ lcdir + center
+    def _capsule_segment_endpoints(self, seg_id: int):
+        params = self.rigidParams.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        center = params[seg_id, 0]
+        lcdir = params[seg_id, 1]
+        lc = rot[seg_id] @ lcdir + center
         uc = center * 2.0 - lc
         return lc, uc
 
-    @ti.func
     def detectBallBallContact_(self, ic, jc):
         """Handle ball-ball instantaneous collision response by velocity impulse."""
-
-        # radii stored in row 1 component 0
-        radius = self.radius[ic] + self.radius[jc]
-        p = self.rigidParams[ic, 0] - self.rigidParams[jc, 0]
-        l = p.norm()
+        params = self.rigidParams.numpy()
+        radius_np = self.radius.numpy()
+        radius = radius_np[ic] + radius_np[jc]
+        p = params[ic, 0] - params[jc, 0]
+        l = wp.length(p)
         if l < radius:
-            # contact happens -> use symmetric impulse pair
             n = p / l
-            # contact point: midpoint between sphere centers
-            cpoint_mid = (self.rigidParams[ic, 0] + self.rigidParams[jc, 0]) * 0.5
+            cpoint_mid = (params[ic, 0] + params[jc, 0]) * 0.5
             self.cacheContact(ic, jc, cpoint_mid, n, l - radius)
 
-    @ti.func
     def detectSegmentSegmentContact_(self, id1, id2):
         """Handle collision between two segment-like rigids (capsule) using GJK+EPA.
 
         - Capsule-capsule : use closest segment method
         """
-        # Get rigid types to determine if using capsule
-        type1 = self.rigidDomainIds[id1][1]
-        type2 = self.rigidDomainIds[id2][1]
-
         self.detectCapsuleCapsuleContact_(id1, id2)
 
-
-    @ti.func
     def detectCapsuleCapsuleContact_(self, id1, id2):
-        """
-        Check capsule-capsule contact using closest points on segments.
-        """
-        center1 = self.rigidParams[id1, 0]
-        lcdir1 = self.rigidParams[id1, 1]
-        lc1 = ti.Vector.zero(ti.f32, self.d)
-        lc1 = self.cached_rotation_matrix[id1] @ lcdir1 + center1
-        uc1 = center1 * 2 - lc1
-        r1 = self.radius[id1]
+        """Check capsule-capsule contact using closest points on segments."""
+        params = self.rigidParams.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        radius_np = self.radius.numpy()
 
-        center2 = self.rigidParams[id2, 0]
-        lcdir2 = self.rigidParams[id2, 1]
-        lc2 = ti.Vector.zero(ti.f32, self.d)
-        lc2 = self.cached_rotation_matrix[id2] @ lcdir2 + center2
+        center1 = params[id1, 0]
+        lcdir1 = params[id1, 1]
+        lc1 = rot[id1] @ lcdir1 + center1
+        uc1 = center1 * 2 - lc1
+        r1 = radius_np[id1]
+
+        center2 = params[id2, 0]
+        lcdir2 = params[id2, 1]
+        lc2 = rot[id2] @ lcdir2 + center2
         uc2 = center2 * 2 - lc2
-        r2 = self.radius[id2]
+        r2 = radius_np[id2]
 
         p, q, t1, t2 = calMinDisSegment2Segment(lc1, uc1, lc2, uc2)
         pq = q - p
-        dis = pq.norm()
+        dis = wp.length(pq)
 
         # Compute normal direction from p to q (fallback unit-x)
-        normal = ti.Vector([1.0 if i == 0 else 0.0 for i in ti.static(range(self.d))])
+        normal = wp.vec2(1.0, 0.0)
         if dis > 1e-9:
             normal = pq / dis
         penetration = 1.0
@@ -1402,234 +2846,227 @@ class RigidManager:
             cpoint_mid = (cpoint1 + cpoint2) * 0.5
             self.cacheContact(id1, id2, cpoint_mid, -normal, penetration)
 
-    @ti.func
     def detectBoxBoxContact_(self, ic, jc):
         """Detect box-box contact via 2D OBB resolver in sat.py."""
-        center_i = self.rigidParams[ic, 0]
-        center_j = self.rigidParams[jc, 0]
-        half_i = self.rigidParams[ic, 1] * 0.5
-        half_j = self.rigidParams[jc, 1] * 0.5
+        params = self.rigidParams.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        center_i = params[ic, 0]
+        center_j = params[jc, 0]
+        half_i = params[ic, 1] * 0.5
+        half_j = params[jc, 1] * 0.5
         hit, penetration, normal_ij, cpoint = obb2d_contact_quad_vs_quad(
             center_i,
             half_i,
-            self.cached_rotation_matrix[ic],
+            rot[ic],
             center_j,
             half_j,
-            self.cached_rotation_matrix[jc],
+            rot[jc],
         )
         if hit == 1:
             self.cacheContact(ic, jc, cpoint, -normal_ij, penetration)
 
-    @ti.func
     def detectBoxBallContact_(self, ic, jc):
         """Test box representative vertices vs a sphere and apply forces/torques."""
-        pos = self.rigidParams[jc, 0]  # jc is ball, get center
+        params = self.rigidParams.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        radius_np = self.radius.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        pos = params[jc, 0]
         l, n, _ = detectPointToPrimitive(
             pos,
-            self.rigidDomainIds[ic][1],
-            self.rigidParams[ic, 0],
-            self.rigidParams[ic, 1],
-            self.cached_rotation_matrix[ic],
-            self.radius[ic],
+            int(domain_ids[ic][1]),
+            params[ic, 0],
+            params[ic, 1],
+            rot[ic],
+            radius_np[ic],
         )
-        l -= self.radius[jc]
+        l -= radius_np[jc]
         if l < 0:
-            # contact happens -> apply symmetric impulse between box (ic) and ball (jc)
-            n = n.normalized() if n.norm() > 1e-9 else (pos - self.rigidParams[ic, 0]).normalized(1e-9)
-            # contact point on sphere surface
-            cpoint = pos - n * self.radius[jc]
+            n = (n / (wp.length(n) + 1e-9)) if wp.length(n) > 1e-9 else (pos - params[ic, 0]) / (
+                wp.length(pos - params[ic, 0]) + 1e-9
+            )
+            cpoint = pos - n * radius_np[jc]
             self.cacheContact(jc, ic, cpoint, n, l)
 
-    @ti.func
     def detectSegmentBoxContact_(self, seg_id, other_id):
         """Detect capsule vs box using 2D SAT (OBB quad vs segment), with capsule radius."""
+        radius_np = self.radius.numpy()
         a0 = self.get_box_vertex(other_id, 0)
         a1 = self.get_box_vertex(other_id, 1)
         a2 = self.get_box_vertex(other_id, 2)
         a3 = self.get_box_vertex(other_id, 3)
         lc, uc = self._capsule_segment_endpoints(seg_id)
         signed, normal = obb2d_signed_distance_quad_vs_segment(a0, a1, a2, a3, lc, uc)
-        penetration = signed - self.radius[seg_id]
+        penetration = signed - radius_np[seg_id]
         if penetration < 0.0:
             cpoint = (lc + uc) * 0.5
             self.cacheContact(other_id, seg_id, cpoint, -normal, penetration)
 
-    @ti.func
     def detectSegmentBallContact_(self, seg_id, other_id):
         """segment-point contact using SDF queries (kept for ball interactions).
 
         - Capsule vs Ball (SDF method)
         """
-        pos = self.rigidParams[other_id, 0]
+        params = self.rigidParams.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        radius_np = self.radius.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        pos = params[other_id, 0]
         dis, normal, _ = detectPointToPrimitive(
             pos,
-            self.rigidDomainIds[seg_id][1],
-            self.rigidParams[seg_id, 0],
-            self.rigidParams[seg_id, 1],
-            self.cached_rotation_matrix[seg_id],
-            self.radius[seg_id],
+            int(domain_ids[seg_id][1]),
+            params[seg_id, 0],
+            params[seg_id, 1],
+            rot[seg_id],
+            radius_np[seg_id],
         )
 
         penetration = dis
-        penetration -= self.radius[other_id]
+        penetration -= radius_np[other_id]
 
         if penetration < 0.0:
-            # compute normalized contact normal (points from segment -> sample point)
-            nrm = normal.norm()
-            n = ti.Vector.zero(ti.f32, self.d)
+            nrm = wp.length(normal)
+            n = wp.vec2(0.0, 0.0)
             if nrm > 1e-9:
                 n = normal / nrm
             else:
-                n = ti.Vector([1.0 if k == 0 else 0.0 for k in ti.static(range(self.d))])
+                n = wp.vec2(1.0, 0.0)
 
-            # contact point on the segment primitive
             cpoint = pos - normal * dis
-            # apply symmetric impulse (normal points from segment -> other)
             self.cacheContact(other_id, seg_id, cpoint, n, penetration)
 
-    @ti.func
-    def detectMeshPrimitiveContact_(self, mesh_idx: ti.i32, other_idx: ti.i32):
+    def detectMeshPrimitiveContact_(self, mesh_idx: int, other_idx: int):
         """Handle mesh-primitive contacts (Optimized with Spatial Hash).
 
         Uses Spatial Hash for primitive-sample-vs-mesh checks.
         Uses direct node iteration for mesh-node-vs-primitive checks.
         """
-        mesh_local_idx = self.rigid2MeshIndices[mesh_idx]
-        node_offset = self.meshBoundaryNodeOffset[mesh_local_idx]
-        num_nodes = self.meshBoundaryNodeCount[mesh_local_idx]
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        params = self.rigidParams.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        radius_np = self.radius.numpy()
+        rigid2mesh = self.rigid2MeshIndices.numpy()
+        mesh_node_off = self.meshBoundaryNodeOffset.numpy()
+        mesh_node_cnt = self.meshBoundaryNodeCount.numpy()
+        mesh_coords = self.meshBoundaryCoords.numpy()
 
-        # Intersected bounding box (for node culling)
-        intersect_lb = ti.max(
-            self.aabb[self.rigidDomainIds[mesh_idx][0], 0], self.aabb[self.rigidDomainIds[other_idx][0], 0]
-        )
-        intersect_ub = ti.min(
-            self.aabb[self.rigidDomainIds[mesh_idx][0], 1], self.aabb[self.rigidDomainIds[other_idx][0], 1]
-        )
+        mesh_local_idx = int(rigid2mesh[mesh_idx])
+        node_offset = int(mesh_node_off[mesh_local_idx])
+        num_nodes = int(mesh_node_cnt[mesh_local_idx])
 
-        # Expand intersection box slightly
-        limit_penetration = (
-            self.aabb[self.rigidDomainIds[mesh_idx][0], 1] - self.aabb[self.rigidDomainIds[mesh_idx][0], 0]
-        ).min() * 0.1
-        intersect_lb -= limit_penetration
-        intersect_ub += limit_penetration
+        mesh_dom = int(domain_ids[mesh_idx][0])
+        other_dom = int(domain_ids[other_idx][0])
+        intersect_lb = np.maximum(aabb[mesh_dom, 0], aabb[other_dom, 0])
+        intersect_ub = np.minimum(aabb[mesh_dom, 1], aabb[other_dom, 1])
 
-        # --- Optimization: Pre-calculate primitive sample points ---
-        other_type = self.rigidDomainIds[other_idx][1]
+        limit_penetration = float(np.min(aabb[mesh_dom, 1] - aabb[mesh_dom, 0]) * 0.1)
+        intersect_lb = intersect_lb - limit_penetration
+        intersect_ub = intersect_ub + limit_penetration
 
-        # Buffer for sample points (max 8 for Box in 3D)
-        test_points = ti.Matrix.zero(ti.f32, self.d, 8)
+        other_type = int(domain_ids[other_idx][1])
+
+        test_points = mat28(0.0)
         num_samples = 0
         p_radius = 0.0
 
         if other_type == RigidType.BALL:
-            test_points[:, 0] = self.rigidParams[other_idx, 0]
-            p_radius = self.radius[other_idx]
+            center = params[other_idx, 0]
+            test_points[0, 0] = float(center[0])
+            test_points[1, 0] = float(center[1])
+            p_radius = float(radius_np[other_idx])
             num_samples = 1
 
         elif other_type == RigidType.BOX:
-            center = self.rigidParams[other_idx, 0]
-            extent = self.rigidParams[other_idx, 1]
+            center = params[other_idx, 0]
+            extent = params[other_idx, 1]
             half_ext = extent * 0.5
-            rot = self.cached_rotation_matrix[other_idx]
+            rot_m = rot[other_idx]
 
             num_cnt = 2**self.d
             num_samples = num_cnt
             for nid in range(num_cnt):
-                local_pos = ti.Vector.zero(ti.f32, self.d)
-                for k in ti.static(range(self.d)):
-                    if (nid >> k) & 1:
-                        local_pos[k] = half_ext[k]
-                    else:
-                        local_pos[k] = -half_ext[k]
-                test_points[:, nid] = center + rot @ local_pos
+                local_pos = np.zeros(self.d, dtype=np.float32)
+                for k in range(self.d):
+                    local_pos[k] = half_ext[k] if (nid >> k) & 1 else -half_ext[k]
+                world = center + rot_m @ local_pos
+                test_points[0, nid] = float(world[0])
+                test_points[1, nid] = float(world[1])
             p_radius = 0.0
 
         elif other_type == RigidType.CAPSULE:
-            center = self.rigidParams[other_idx, 0]
-            lcdir = self.rigidParams[other_idx, 1]
-            lc = self.cached_rotation_matrix[other_idx] @ lcdir + center
+            center = params[other_idx, 0]
+            lcdir = params[other_idx, 1]
+            lc = rot[other_idx] @ lcdir + center
             uc = center * 2 - lc
-            p_radius = self.radius[other_idx]
+            p_radius = float(radius_np[other_idx])
 
             num_s = 2
             num_samples = num_s
             for k in range(num_s):
                 t = k / (num_s - 1) if num_s > 1 else 0.5
-                test_points[:, k] = lc * (1 - t) + uc * t
+                sample = lc * (1 - t) + uc * t
+                test_points[0, k] = float(sample[0])
+                test_points[1, k] = float(sample[1])
 
-        # Part 1: Mesh nodes vs Primitive (Iterate nodes directly)
         for nid_local in range(num_nodes):
-            coord = self.meshBoundaryCoords[node_offset + nid_local]
-
-            # Simple AABB Cull
+            coord = mesh_coords[node_offset + nid_local]
             if (coord - intersect_ub).max() <= 0.0 and (intersect_lb - coord).max() <= 0.0:
                 self._mesh_node_vs_primitive(mesh_idx, other_idx, coord)
 
-        # Part 2: Primitive Samples vs Mesh (Using Spatial Hash)
         for k in range(num_samples):
-            # Extract point from matrix column
-            p = ti.Vector([test_points[d_i, k] for d_i in ti.static(range(self.d))])
-
-            # Use spatial hash to find nearby triangles
+            p = wp.vec2(test_points[0, k], test_points[1, k])
             self._prim_point_vs_mesh_with_sh(p, p_radius, mesh_idx, other_idx, limit_penetration)
 
-    @ti.func
+    def _mesh_node_vs_primitive(self, mesh_idx: int, other_idx: int, pos):
+        """Thin dispatch over shared point-vs-primitive SDF family helpers."""
+        params = self.rigidParams.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        radius_np = self.radius.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        pos = np.asarray(pos, dtype=np.float32).reshape(-1)
+        center = np.asarray(params[other_idx, 0], dtype=np.float32).reshape(-1)
+        prim = np.asarray(params[other_idx, 1], dtype=np.float32).reshape(-1)
+        R = np.asarray(rot[other_idx], dtype=np.float32).reshape(2, 2)
+        l, n, _ = detect_point_to_primitive_np(
+            pos,
+            int(domain_ids[other_idx][1]),
+            center,
+            prim,
+            R,
+            float(radius_np[other_idx]),
+        )
+        if l < 0.0:
+            cpoint = pos - np.asarray([float(n[0]), float(n[1])], dtype=np.float32) * float(l)
+            self.cacheContact(mesh_idx, other_idx, cpoint, n, l)
+
     def _prim_point_vs_mesh_with_sh(
-        self, point, radius: ti.f32, mesh_idx: ti.i32, other_idx: ti.i32, limit_penetration: ti.f32
+        self, point, radius: float, mesh_idx: int, other_idx: int, limit_penetration: float
     ):
-        """Test a point (with optional radius) against mesh using spatial hash.
-
-        Args:
-            point: Test point position
-            radius: Radius to offset (0 for vertices, >0 for balls/capsules)
-            mesh_idx: Mesh rigid index
-            other_idx: Primitive rigid index
-            limit_penetration: Penetration tolerance
-
-        """
-        # Skip the hash query for large primitives to avoid MAX_QUERY overflow.
-        # Part 1 (mesh-node vs primitive SDF) covers all contacts above this size.
-        cell_size = self.spatialHash.gridSize[None].min()
+        """Test a point (with optional radius) against mesh using spatial hash."""
+        point = np.asarray(point, dtype=np.float32).reshape(-1)
+        point_wp = wp.vec2(float(point[0]), float(point[1]))
+        cell_size = float(np.min(self.spatialHash.gridSize.numpy()[0]))
         if radius < cell_size * 4.0:
+            numPotentials = self.spatialHash.queryPointWithBuffer(point_wp, radius, mesh_idx)
+            mesh_elements = self.meshBoundaryElements.numpy()
+            query_elids = self.spatialHash.queryElids.numpy()
+            mesh_coords_arr = self.meshBoundaryCoords
 
-            # Query spatial hash with radius to get candidate triangles
-            numPotentials = self.spatialHash.queryPointWithBuffer(point, radius, mesh_idx)
-
-            mesh_local_idx = self.rigid2MeshIndices[mesh_idx]
-
-            # Test against each candidate triangle
             for pot_idx in range(numPotentials):
-                eidx = self.spatialHash.queryElids[pot_idx]
+                eidx = int(query_elids[pot_idx])
                 if eidx >= 0:
-                    conn = self.meshBoundaryElements[eidx]
-
-                    # Compute detailed point-to-triangle distance
-                    penetration, normal, cpoint, _ = detectPointToMeshBoundary(
-                        point, self.meshBoundaryCoords, conn, limit_penetration=limit_penetration + radius
+                    conn = mesh_elements[eidx]
+                    mesh_coords_np = mesh_coords_arr.numpy()
+                    penetration, normal, cpoint, _ = detect_point_to_mesh_boundary_np(
+                        point, mesh_coords_np, conn, limit_penetration=limit_penetration + radius
                     )
 
-                    # Account for radius offset
                     l = penetration - radius
                     if l < 0.0:
                         self.cacheContact(other_idx, mesh_idx, cpoint, normal, l)
 
-    @ti.func
-    def _mesh_node_vs_primitive(self, mesh_idx: ti.i32, other_idx: ti.i32, pos):
-        """Thin dispatch over shared point-vs-primitive SDF family helpers."""
-        l, n, _ = detectPointToPrimitive(
-            pos,
-            self.rigidDomainIds[other_idx][1],
-            self.rigidParams[other_idx, 0],
-            self.rigidParams[other_idx, 1],
-            self.cached_rotation_matrix[other_idx],
-            self.radius[other_idx],
-        )
-        if l < 0.0:
-            cpoint = pos - n * l
-            self.cacheContact(mesh_idx, other_idx, cpoint, n, l)
-
-    @ti.func
-    def detectMeshMeshContact_(self, ic: ti.i32, jc: ti.i32):
+    def detectMeshMeshContact_(self, ic: int, jc: int):
         """Test mesh ic boundary nodes against mesh jc boundary elements using spatial hash acceleration.
 
         OPTIMIZED: Split into two separate passes to reduce JIT compilation complexity.
@@ -1644,85 +3081,73 @@ class RigidManager:
         # Second pass: jc nodes vs ic triangles
         self._mesh_nodes_vs_mesh_elements(jc, ic)
 
-    @ti.func
-    def _mesh_nodes_vs_mesh_elements(self, node_mesh_rigid_idx: ti.i32, elem_mesh_rigid_idx: ti.i32):
-        """Test boundary nodes of node_mesh against boundary elements of elem_mesh.
+    def _mesh_nodes_vs_mesh_elements(self, node_mesh_rigid_idx: int, elem_mesh_rigid_idx: int):
+        """Test boundary nodes of node_mesh against boundary elements of elem_mesh."""
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        rigid2mesh = self.rigid2MeshIndices.numpy()
+        mesh_node_off = self.meshBoundaryNodeOffset.numpy()
+        mesh_node_cnt = self.meshBoundaryNodeCount.numpy()
+        mesh_coords = self.meshBoundaryCoords.numpy()
+        mesh_elements = self.meshBoundaryElements.numpy()
+        mesh_coords_arr = self.meshBoundaryCoords
 
-        This is a specialized helper that reduces compilation complexity by handling
-        only one direction of mesh-mesh collision detection.
-        """
-        # Get mesh indices
-        node_mesh_idx = self.rigid2MeshIndices[node_mesh_rigid_idx]
-        elem_mesh_idx = self.rigid2MeshIndices[elem_mesh_rigid_idx]
+        node_mesh_idx = int(rigid2mesh[node_mesh_rigid_idx])
+        elem_mesh_idx = int(rigid2mesh[elem_mesh_rigid_idx])
 
-        # Get node mesh info
-        node_offset = self.meshBoundaryNodeOffset[node_mesh_idx]
-        num_nodes = self.meshBoundaryNodeCount[node_mesh_idx]
+        node_offset = int(mesh_node_off[node_mesh_idx])
+        num_nodes = int(mesh_node_cnt[node_mesh_idx])
 
-        # Get intersection bounding box for broad phase filtering
-        intersect_lb = ti.max(
-            self.aabb[self.rigidDomainIds[node_mesh_rigid_idx][0], 0],
-            self.aabb[self.rigidDomainIds[elem_mesh_rigid_idx][0], 0],
-        )
-        intersect_ub = ti.min(
-            self.aabb[self.rigidDomainIds[node_mesh_rigid_idx][0], 1],
-            self.aabb[self.rigidDomainIds[elem_mesh_rigid_idx][0], 1],
-        )
-        limit_penetration = (
-            0.1
-            * (
-                self.aabb[self.rigidDomainIds[elem_mesh_rigid_idx][0], 1]
-                - self.aabb[self.rigidDomainIds[elem_mesh_rigid_idx][0], 0]
-            ).min()
+        node_dom = int(domain_ids[node_mesh_rigid_idx][0])
+        elem_dom = int(domain_ids[elem_mesh_rigid_idx][0])
+        intersect_lb = np.maximum(aabb[node_dom, 0], aabb[elem_dom, 0])
+        intersect_ub = np.minimum(aabb[node_dom, 1], aabb[elem_dom, 1])
+        limit_penetration = float(
+            0.1 * np.min(aabb[elem_dom, 1] - aabb[elem_dom, 0])
         )
 
-        # Expand intersection box slightly
-        intersect_lb -= limit_penetration
-        intersect_ub += limit_penetration
+        intersect_lb = intersect_lb - limit_penetration
+        intersect_ub = intersect_ub + limit_penetration
 
-        # Test each boundary node against elements
         for nidx in range(num_nodes):
-            coord = self.meshBoundaryCoords[node_offset + nidx]
+            coord = mesh_coords[node_offset + nidx]
+            coord_wp = wp.vec2(float(coord[0]), float(coord[1]))
 
-            # Broad phase: check if node is in intersection region
             if ((coord - intersect_lb).min() > 0.0) and ((coord - intersect_ub).max() < 0.0):
-                # Lazy hash: rebuilt adaptively based on displacement.
-                # Query buffer = cell_size + estimated displacement since rebuild.
-                query_buf = self._sh_contact_margin[None]
+                query_buf = float(self._sh_contact_margin.numpy()[0])
                 numPotentials = self.spatialHash.queryPointWithBuffer(
-                    coord, query_buf, elem_mesh_rigid_idx
+                    coord_wp, query_buf, elem_mesh_rigid_idx
                 )
+                query_elids = self.spatialHash.queryElids.numpy()
 
-                # Test against each potential triangle
                 for pot_idx in range(numPotentials):
-                    elem_idx = self.spatialHash.queryElids[pot_idx]
+                    elem_idx = int(query_elids[pot_idx])
                     if elem_idx >= 0:
-                        conn = self.meshBoundaryElements[elem_idx]
+                        conn = mesh_elements[elem_idx]
+                        conn_wp = wp.vec3i(int(conn[0]), int(conn[1]), int(conn[2]))
 
-                        # Triangle-level AABB check
-                        lb = ti.Vector([1e30 for k in range(self.d)])
-                        ub = ti.Vector([-1e30 for k in range(self.d)])
-                        for j in ti.static(range(self.d)):
-                            if conn[j] >= 0:
-                                tri_coord = self.meshBoundaryCoords[conn[j]]
-                                lb = ti.min(lb, tri_coord)
-                                ub = ti.max(ub, tri_coord)
+                        lb = np.array([1e30, 1e30], dtype=np.float32)
+                        ub = np.array([-1e30, -1e30], dtype=np.float32)
+                        for j in range(self.d):
+                            if int(conn[j]) >= 0:
+                                tri_coord = mesh_coords[int(conn[j])]
+                                lb = np.minimum(lb, tri_coord[:2])
+                                ub = np.maximum(ub, tri_coord[:2])
 
-                        # Expand triangle bbox slightly
-                        lb -= limit_penetration
-                        ub += limit_penetration
+                        lb = lb - limit_penetration
+                        ub = ub + limit_penetration
 
-                        # Skip if node is outside triangle's bbox
-                        if (lb - coord).max() > 0.0 or (coord - ub).max() > 0.0:
+                        if np.max(lb - coord[:2]) > 0.0 or np.max(coord[:2] - ub) > 0.0:
                             continue
 
-                        # Perform detailed point-to-triangle distance check
-                        penetration, normal, cpoint, _ = detectPointToMeshBoundary(
-                            coord, self.meshBoundaryCoords, conn, limit_penetration=limit_penetration
+                        penetration, normal, cpoint, _ = detect_point_to_mesh_boundary_np(
+                            coord,
+                            mesh_coords,
+                            conn,
+                            limit_penetration=limit_penetration,
                         )
 
                         if penetration < 0.0:
-                            # Cache contact (node_mesh collides with elem_mesh)
                             self.cacheContact(node_mesh_rigid_idx, elem_mesh_rigid_idx, cpoint, normal, penetration)
 
     # ================== The end of contact detection functions ==========================
@@ -1737,7 +3162,7 @@ class RigidManager:
         """Run analytical-vs-rigid and analytical-vs-mesh contact detectors.
 
         OPTIMIZATION: Analytical plane contacts use kernelized dispatch.
-        HeightField/Voxel contacts require Python loops (ti.template() args),
+        HeightField/Voxel contacts require Python loops (wp.template() args),
         but are skipped entirely when hasHeightFieldOrVoxel is False.
 
         When heightfield/voxel domains exist, we must NOT run the blanket
@@ -1757,40 +3182,45 @@ class RigidManager:
 
         # ── Slow path: mix of analytical planes, heightfields, and voxelmaps ──
         # Primitive rigids vs ground domains
-        for i in range(self.num_groundprim_pairs[None]):
-            rigid_i, rigid_j = self.groundprim_pairs_buffer[i]  # rigid_i : ground, rigid_j : rigid
-            anlDomain = self.domains[self.rigidDomainIds[rigid_i][0]]
-            if anlDomain.type == DomainType.HEIGHTFIELD and anlDomain.considerContact:
-                self.detectHeightField2Rigids_(rigid_j, anlDomain)
-            elif anlDomain.type == DomainType.VOXELMAP and anlDomain.considerContact:
-                self.detectVoxel2Rigids_(rigid_j, anlDomain)
-            elif anlDomain.considerContact:
-                # True analytical plane — single-pair kernel dispatch
-                self._detect_single_analyticalprim_kernel(int(rigid_i), int(rigid_j))
+        n_gp = int(self.num_groundprim_pairs.numpy()[0])
+        if n_gp > 0:
+            gp_pairs = self.groundprim_pairs_buffer.numpy()
+            domain_ids = self.rigidDomainIds.numpy()
+            for i in range(n_gp):
+                rigid_i, rigid_j = int(gp_pairs[i][0]), int(gp_pairs[i][1])  # rigid_i : ground, rigid_j : rigid
+                anlDomain = self.domains[int(domain_ids[rigid_i][0])]
+                if anlDomain.type == DomainType.HEIGHTFIELD and anlDomain.considerContact:
+                    self.detectHeightField2Rigids_(rigid_j, anlDomain)
+                elif anlDomain.type == DomainType.VOXELMAP and anlDomain.considerContact:
+                    self.detectVoxel2Rigids_(rigid_j, anlDomain)
+                elif anlDomain.considerContact:
+                    # True analytical plane — single-pair kernel dispatch
+                    self._detect_single_analyticalprim_kernel(int(rigid_i), int(rigid_j))
 
         # Mesh rigids vs ground domains
-        for i in range(self.num_groundmesh_pairs[None]):
-            rigid_i, rigid_j = self.groundmesh_pairs_buffer[i]  # rigid_i : ground, rigid_j : rigid
-            anlDomain = self.domains[self.rigidDomainIds[rigid_i][0]]
-            if anlDomain.type == DomainType.HEIGHTFIELD and anlDomain.considerContact:
-                self.detectHeightField2MeshContacts_(rigid_j, anlDomain)
-            elif anlDomain.type == DomainType.VOXELMAP and anlDomain.considerContact:
-                self.detectVoxel2MeshContacts_(rigid_j, anlDomain)
-            elif anlDomain.considerContact:
-                # True analytical plane — single-pair kernel dispatch
-                self._detect_single_analyticalmesh_kernel(int(rigid_i), int(rigid_j))
+        n_gm = int(self.num_groundmesh_pairs.numpy()[0])
+        if n_gm > 0:
+            gm_pairs = self.groundmesh_pairs_buffer.numpy()
+            domain_ids = self.rigidDomainIds.numpy()
+            for i in range(n_gm):
+                rigid_i, rigid_j = int(gm_pairs[i][0]), int(gm_pairs[i][1])  # rigid_i : ground, rigid_j : rigid
+                anlDomain = self.domains[int(domain_ids[rigid_i][0])]
+                if anlDomain.type == DomainType.HEIGHTFIELD and anlDomain.considerContact:
+                    self.detectHeightField2MeshContacts_(rigid_j, anlDomain)
+                elif anlDomain.type == DomainType.VOXELMAP and anlDomain.considerContact:
+                    self.detectVoxel2MeshContacts_(rigid_j, anlDomain)
+                elif anlDomain.considerContact:
+                    # True analytical plane — single-pair kernel dispatch
+                    self._detect_single_analyticalmesh_kernel(int(rigid_i), int(rigid_j))
 
-    @ti.kernel
-    def _detect_single_analyticalprim_kernel(self, analIdx: ti.i32, rigidIdx: ti.i32):
+    def _detect_single_analyticalprim_kernel(self, analIdx: int, rigidIdx: int):
         """Dispatch a single analytical-plane vs primitive-rigid contact check."""
         self.detectAnalaytical2Rigid(analIdx, rigidIdx)
 
-    @ti.kernel
-    def _detect_single_analyticalmesh_kernel(self, analIdx: ti.i32, rigidIdx: ti.i32):
+    def _detect_single_analyticalmesh_kernel(self, analIdx: int, rigidIdx: int):
         """Dispatch a single analytical-plane vs mesh-rigid contact check."""
         self.detectAnalytical2MeshPair(analIdx, rigidIdx)
 
-    @ti.kernel
     def detect_analyticalmesh_contacts_kernel(self):
         """Detect analytical-plane vs mesh-rigid contacts, parallelized over ground-mesh pairs.
 
@@ -1798,58 +3228,57 @@ class RigidManager:
         boundary nodes internally. This pair-level dispatch avoids the global atomic
         contention that node-level expansion would cause (2.6M atomics for 1024 envs).
         """
-        for i in range(self.num_groundmesh_pairs[None]):
-            analIdx = self.groundmesh_pairs_buffer[i][0]
-            rigidIdx = self.groundmesh_pairs_buffer[i][1]
+        n = int(self.num_groundmesh_pairs.numpy()[0])
+        if n <= 0:
+            return
+        pairs = self.groundmesh_pairs_buffer.numpy()
+        for i in range(n):
+            analIdx = int(pairs[i][0])
+            rigidIdx = int(pairs[i][1])
             self.detectAnalytical2MeshPair(analIdx, rigidIdx)
 
-    @ti.func
     def detectAnalaytical2Rigid(self, analIdx, rigidIdx):
-        """
-          Detect and resolve collisions between analytical plane and rigids.
-        """
-        # Cache plane parameters (read once instead of per-rigid)
-        planepoint = self.rigidParams[analIdx, 0]
-        normal = self.rigidParams[analIdx, 1]
-        anal_vel = self.V[analIdx]
+        """Detect and resolve collisions between analytical plane and rigids."""
+        params = self.rigidParams.numpy()
+        V = self.V.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        radius_np = self.radius.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        compound_count = self.compound_count.numpy()
+        compound_offset = self.compound_offset.numpy()
+        compound_local_pos = self.compound_local_pos.numpy()
+        compound_radius = self.compound_radius.numpy()
 
-        # Contact margin: detect contacts slightly before penetration for stable resting.
+        planepoint = params[analIdx, 0]
+        normal = params[analIdx, 1]
+        anal_vel = V[analIdx]
+
         contact_margin = 0.0005
         run_narrow_phase = True
 
-        if self._ground_use_aabb_early_out[None] == 1:
-            # Get global domain index from rigid domain ID
-            domain_idx = self.rigidDomainIds[rigidIdx][0]
+        if int(self._ground_use_aabb_early_out.numpy()[0]) == 1:
+            domain_idx = int(domain_ids[rigidIdx][0])
+            bbox_min = aabb[domain_idx, 0]
+            bbox_max = aabb[domain_idx, 1]
 
-            # OPTIMIZED AABB-plane test: project AABB extent onto normal
-            bbox_min = self.aabb[domain_idx, 0]  # Lower bound
-            bbox_max = self.aabb[domain_idx, 1]  # Upper bound
-
-            support_point = ti.Vector.zero(ti.f32, self.d)
-            for dim in ti.static(range(self.d)):
+            support_point = np.zeros(self.d, dtype=np.float32)
+            for dim in range(self.d):
                 support_point[dim] = bbox_max[dim] if normal[dim] < 0 else bbox_min[dim]
 
-            min_dist = (support_point - planepoint).dot(normal)
+            min_dist = float(np.dot(support_point - planepoint, normal))
             run_narrow_phase = min_dist <= contact_margin
 
         if run_narrow_phase:
-            # ── Compound sub-colliders ───────────────────────────────
-            # If this rigid has compound shapes, test each sub-collider
-            # against the analytical plane instead of the main shape.
-            n_sub = self.compound_count[rigidIdx]
+            n_sub = int(compound_count[rigidIdx])
             if n_sub > 0:
-                # print(
-                #     "\033[93m[Debug] Rigid {} has {} compound sub-colliders, testing each against plane\033[0m".format(
-                #         rigidIdx, n_sub
-                #     )
-                # )
-                base = self.compound_offset[rigidIdx]
-                parent_center = self.rigidParams[rigidIdx, 0]
-                R = self.cached_rotation_matrix[rigidIdx]
+                base = int(compound_offset[rigidIdx])
+                parent_center = params[rigidIdx, 0]
+                R = rot[rigidIdx]
                 for k in range(n_sub):
                     idx = base + k
-                    local_p = self.compound_local_pos[idx]
-                    r_sub = self.compound_radius[idx]
+                    local_p = compound_local_pos[idx]
+                    r_sub = float(compound_radius[idx])
                     world_p = R @ local_p + parent_center
                     d_sub, _, _ = detectPointToAnalyticalPlane(world_p, planepoint, normal)
                     if d_sub < r_sub + contact_margin:
@@ -1857,11 +3286,8 @@ class RigidManager:
                         depth = d_sub - r_sub
                         self.cacheGroundContact(rigidIdx, cpoint, normal, anal_vel, depth)
             else:
-                # ── Single-shape path (original logic) ───────────────────
-                # Cache rigid type to avoid double indexing
-                type = self.rigidDomainIds[rigidIdx][1]
+                type = int(domain_ids[rigidIdx][1])
 
-                # BOX: Check vertices
                 if type == RigidType.BOX:
                     num_verts = 4
                     for i in range(num_verts):
@@ -1870,28 +3296,23 @@ class RigidManager:
                         if d < contact_margin:
                             self.cacheGroundContact(rigidIdx, pos, normal, anal_vel, d)
 
-                # BALL: Check sphere center with radius
                 elif type == RigidType.BALL:
-                    center = self.rigidParams[rigidIdx, 0]
-                    radius = self.radius[rigidIdx]
+                    center = params[rigidIdx, 0]
+                    radius = float(radius_np[rigidIdx])
                     d, _, _ = detectPointToAnalyticalPlane(center, planepoint, normal)
                     if d < radius + contact_margin:
                         cpoint = center - normal * radius
-                        depth = d - radius  # negative when penetrating
+                        depth = d - radius
                         self.cacheGroundContact(rigidIdx, cpoint, normal, anal_vel, depth)
 
-
-                # CAPSULE: Check endpoints (branchless)
                 elif type == RigidType.CAPSULE:
-                    center = self.rigidParams[rigidIdx, 0]
-                    lcdir = self.rigidParams[rigidIdx, 1]
-                    lc = ti.Vector.zero(ti.f32, self.d)
-                    lc = self.cached_rotation_matrix[rigidIdx] @ lcdir + center
+                    center = params[rigidIdx, 0]
+                    lcdir = params[rigidIdx, 1]
+                    lc = rot[rigidIdx] @ lcdir + center
                     uc = center * 2.0 - lc
-                    radius = self.radius[rigidIdx]
+                    radius = float(radius_np[rigidIdx])
 
-                    # Check both endpoints in unrolled loop (better for GPU)
-                    for ep in ti.static(range(2)):
+                    for ep in range(2):
                         test_p = lc if ep == 0 else uc
                         d_ep, _, _ = detectPointToAnalyticalPlane(test_p, planepoint, normal)
                         if d_ep < radius + contact_margin:
@@ -1899,7 +3320,6 @@ class RigidManager:
                             depth = d_ep - radius
                             self.cacheGroundContact(rigidIdx, cpoint, normal, anal_vel, depth)
 
-    @ti.func
     def detectAnalytical2MeshPair(self, analIdx, rigidIdx):
         """Detect representative boundary-node contacts between an analytical plane
         and a mesh rigid.
@@ -1912,67 +3332,57 @@ class RigidManager:
           - 2 extreme nodes along second tangent direction (max / min t2, 3D only)
         This matches the ~4-8 contacts that primitive box bodies generate.
         """
-        planepoint = self.rigidParams[analIdx, 0]
-        normal = self.rigidParams[analIdx, 1]
-        domain_idx = self.rigidDomainIds[rigidIdx][0]
-        bbox_min = self.aabb[domain_idx, 0]
-        bbox_max = self.aabb[domain_idx, 1]
+        params = self.rigidParams.numpy()
+        V = self.V.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        rigid2mesh = self.rigid2MeshIndices.numpy()
+        mesh_node_off = self.meshBoundaryNodeOffset.numpy()
+        mesh_node_cnt = self.meshBoundaryNodeCount.numpy()
+        mesh_coords = self.meshBoundaryCoords.numpy()
 
-        # AABB-plane early exit: compute support point closest to plane
-        support_point = ti.Vector.zero(ti.f32, self.d)
-        for dim in ti.static(range(self.d)):
+        planepoint = params[analIdx, 0]
+        normal = params[analIdx, 1]
+        domain_idx = int(domain_ids[rigidIdx][0])
+        bbox_min = aabb[domain_idx, 0]
+        bbox_max = aabb[domain_idx, 1]
+
+        support_point = np.zeros(self.d, dtype=np.float32)
+        for dim in range(self.d):
             support_point[dim] = bbox_max[dim] if normal[dim] < 0 else bbox_min[dim]
-        min_dist = (support_point - planepoint).dot(normal)
+        min_dist = float(np.dot(support_point - planepoint, normal))
 
         if min_dist < 0.0:
-            mesh_local_idx = self.rigid2MeshIndices[rigidIdx]
+            mesh_local_idx = int(rigid2mesh[rigidIdx])
             if mesh_local_idx >= 0:
-                node_offset = self.meshBoundaryNodeOffset[mesh_local_idx]
-                num_nodes = self.meshBoundaryNodeCount[mesh_local_idx]
-                anal_vel = self.V[analIdx]
+                node_offset = int(mesh_node_off[mesh_local_idx])
+                num_nodes = int(mesh_node_cnt[mesh_local_idx])
+                anal_vel = V[analIdx]
 
-                # --- Build tangent frame for manifold extremes ---
-                t1 = ti.Vector.zero(ti.f32, self.d)
-                t2 = ti.Vector.zero(ti.f32, self.d)
+                t1 = np.array([-normal[1], normal[0]], dtype=np.float32)
 
-                t1 = ti.Vector([-normal[1], normal[0]])
-
-                # --- Representative contact tracking (single pass) ---
                 has_contact = False
-
-                # Slot 0: deepest penetrating node
                 deep_d = 0.0
-                deep_pos = ti.Vector.zero(ti.f32, self.d)
+                deep_pos = np.zeros(2, dtype=np.float32)
 
-                # Slot 1/2: t1-direction extremes
-                max_t1_proj = ti.cast(-1e30, ti.f32)
+                max_t1_proj = -1e30
                 max_t1_d = 0.0
-                max_t1_pos = ti.Vector.zero(ti.f32, self.d)
-                min_t1_proj = ti.cast(1e30, ti.f32)
+                max_t1_pos = np.zeros(2, dtype=np.float32)
+                min_t1_proj = 1e30
                 min_t1_d = 0.0
-                min_t1_pos = ti.Vector.zero(ti.f32, self.d)
-
-                # Slot 3/4: t2-direction extremes (3D only)
-                max_t2_proj = ti.cast(-1e30, ti.f32)
-                max_t2_d = 0.0
-                max_t2_pos = ti.Vector.zero(ti.f32, self.d)
-                min_t2_proj = ti.cast(1e30, ti.f32)
-                min_t2_d = 0.0
-                min_t2_pos = ti.Vector.zero(ti.f32, self.d)
+                min_t1_pos = np.zeros(2, dtype=np.float32)
 
                 for nidx in range(num_nodes):
-                    pos = self.meshBoundaryCoords[node_offset + nidx]
-                    d = (pos - planepoint).dot(normal)
+                    pos = mesh_coords[node_offset + nidx]
+                    d = float(np.dot(pos - planepoint, normal))
                     if d < 0.0:
                         has_contact = True
 
-                        # Track deepest
                         if d < deep_d:
                             deep_d = d
                             deep_pos = pos
 
-                        # Track t1 extremes
-                        p1 = pos.dot(t1)
+                        p1 = float(np.dot(pos, t1))
                         if p1 > max_t1_proj:
                             max_t1_proj = p1
                             max_t1_d = d
@@ -1983,326 +3393,284 @@ class RigidManager:
                             min_t1_pos = pos
 
                 if has_contact:
-                    # Use actual node positions as contact points (consistent
-                    # with detectAnalaytical2Rigid / BOX which passes the vertex
-                    # position directly, not the projected-onto-plane point).
                     self.cacheGroundContact(rigidIdx, deep_pos, normal, anal_vel, deep_d)
 
-                    # Minimum separation to consider a contact as distinct
                     sep = 0.005
-
-                    # t1 extremes
-                    if (max_t1_pos - deep_pos).norm() > sep:
+                    if float(np.linalg.norm(max_t1_pos - deep_pos)) > sep:
                         self.cacheGroundContact(rigidIdx, max_t1_pos, normal, anal_vel, max_t1_d)
-                    if (min_t1_pos - deep_pos).norm() > sep and (min_t1_pos - max_t1_pos).norm() > sep:
+                    if float(np.linalg.norm(min_t1_pos - deep_pos)) > sep and float(
+                        np.linalg.norm(min_t1_pos - max_t1_pos)
+                    ) > sep:
                         self.cacheGroundContact(rigidIdx, min_t1_pos, normal, anal_vel, min_t1_d)
 
 
-    @ti.kernel
-    def detectHeightField2Rigids_(self, rigidIdx: ti.i32, hf: ti.template()):
-        """Detect and resolve collisions between a heightfield ground (z = h(x[,y])) and rigids.
+    def detectHeightField2Rigids_(self, rigidIdx: int, hf):
+        """Detect and resolve collisions between a heightfield ground and rigids."""
+        if rigidIdx == -1:
+            return
+        j = int(rigidIdx)
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        params = self.rigidParams.numpy()
+        radius_arr = self.radius.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        compound_count = self.compound_count.numpy()
+        compound_offset = self.compound_offset.numpy()
+        compound_local_pos = self.compound_local_pos.numpy()
+        compound_radius = self.compound_radius.numpy()
 
-        Optimized to iterate the collision pairs buffer instead of all rigids.
-        """
-        if rigidIdx != -1:
-            j = rigidIdx
-            # Rigid logic follows...
-            # Early exit optimization: check rigid AABB against heightfield
-            domain_idx = self.rigidDomainIds[j][0]
-            rigid_min_x = self.aabb[domain_idx, 0][0]
-            rigid_max_x = self.aabb[domain_idx, 1][0]
-            rigid_min_z = self.aabb[domain_idx, 0][self.d - 1]
-            rigid_max_z = self.aabb[domain_idx, 1][self.d - 1]
+        domain_idx = int(domain_ids[j][0])
+        rigid_min_x = float(aabb[domain_idx, 0][0])
+        rigid_max_x = float(aabb[domain_idx, 1][0])
+        rigid_min_z = float(aabb[domain_idx, 0][self.d - 1])
+        rigid_max_z = float(aabb[domain_idx, 1][self.d - 1])
 
-            # Get max/min height in the rigid's x (and y for 3D) range
-            max_height_in_range = 0.0
-            min_height_in_range = 0.0
-            skip_rigid = False
+        max_height_in_range, min_height_in_range = hf.get_maxmin_height_in_range_2d(rigid_min_x, rigid_max_x)
+        if max_height_in_range < rigid_min_z or (hf.reverse and (min_height_in_range > rigid_max_z)):
+            return
 
-            max_height_in_range, min_height_in_range = hf.get_maxmin_height_in_range_2d(rigid_min_x, rigid_max_x)
+        n_sub = int(compound_count[j])
+        if n_sub > 0:
+            base = int(compound_offset[j])
+            parent_center = params[j, 0]
+            R = rot[j]
+            for k in range(n_sub):
+                sidx = base + k
+                local_p = compound_local_pos[sidx]
+                r_sub = float(compound_radius[sidx])
+                world_p = R @ local_p + parent_center
+                foot, n, signed = hf.nearest_on_curve_2d(float(world_p[0]), float(world_p[1]))
+                penetration = r_sub - signed
+                if penetration > 0.0:
+                    cpoint = world_p - np.asarray(n, dtype=np.float32) * r_sub
+                    self.cacheGroundContact(j, cpoint, n, (0.0, 0.0), signed - r_sub)
+            return
 
-            # Early exit: if max heightfield height < min rigid z, no contact possible
-            if max_height_in_range < rigid_min_z or (hf.reverse and (min_height_in_range > rigid_max_z)):
-                skip_rigid = True
-
-            if not skip_rigid:
-                # ── Compound sub-colliders for heightfield ──────────────
-                n_sub = self.compound_count[j]
-                if n_sub > 0:
-                    base = self.compound_offset[j]
-                    parent_center = self.rigidParams[j, 0]
-                    R = self.cached_rotation_matrix[j]
-                    for k in range(n_sub):
-                        sidx = base + k
-                        local_p = self.compound_local_pos[sidx]
-                        r_sub = self.compound_radius[sidx]
-                        world_p = R @ local_p + parent_center
-                        x = world_p[0]
-                        z = world_p[1]
-                        foot, n, signed = hf.nearest_on_curve_2d(x, z)
-                        penetration = r_sub - signed
-                        if penetration > 0.0:
-                            cpoint = world_p - n * r_sub
-                            self.cacheGroundContact(j, cpoint, n, ti.Vector.zero(ti.f32, self.d), signed - r_sub)
-                else:
-                    # ── Single-shape heightfield path ──────────────────────
-                    type = self.rigidDomainIds[j][1]
-                    # BOX: calculate vertices on-the-fly from center, extents, and rotation
-                    if type == RigidType.BOX:
-                        center = self.rigidParams[j, 0]
-                        ext = self.rigidParams[j, 1]
-                        num_verts = 4
-                        for vi in range(num_verts):
-                            # Generate local vertex position (corners of box in local space)
-                            local_pos = ti.Vector.zero(ti.f32, self.d)
-                            # 2D: 4 corners (±ext_x, ±ext_y)
-                            local_pos[0] = ext[0] if (vi & 1) else -ext[0]
-                            local_pos[1] = ext[1] if (vi & 2) else -ext[1]
-                            # Rotate and translate
-                            pos = self.cached_rotation_matrix[j] @ local_pos + center
-                            x = pos[0]
-                            z = pos[1]
-                            foot, n, signed = hf.nearest_on_curve_2d(x, z)
-                            if signed < 0.0:  # vertex penetrating surface
-                                cpoint = pos  # contact point is the vertex itself
-                                self.cacheGroundContact(j, cpoint, n, ti.Vector.zero(ti.f32, self.d), signed)
-
-                    # BALL: test center against surface + radius
-                    elif type == RigidType.BALL:
-                        center = self.rigidParams[j, 0]
-                        radius = self.radius[j]
-                        x = center[0]
-                        z = center[1]
-                        foot, n, signed = hf.nearest_on_curve_2d(x, z)
-                        # Ball is penetrating if signed distance < radius
-                        penetration = radius - signed
-                        if penetration > 0.0:
-                            # Contact point is on ball surface along normal direction
-                            cpoint = center - n * radius
-                            self.cacheGroundContact(j, cpoint, n, ti.Vector.zero(ti.f32, self.d), signed - radius)
-
-                    # CAPSULE: test endpoints + radius
-                    elif type == RigidType.CAPSULE:
-                        center = self.rigidParams[j, 0]
-                        lcdir = self.rigidParams[j, 1]
-                        lc = self.cached_rotation_matrix[j] @ lcdir + center
-                        uc = center * 2.0 - lc
-                        radius = self.radius[j]
-                        for ep in ti.static(range(2)):
-                            test_p = lc if ep == 0 else uc
-                            x = test_p[0]
-                            z = test_p[1]
-                            foot, n, signed = hf.nearest_on_curve_2d(x, z)
-                            penetration = radius - signed
-                            if penetration > 0.0:
-                                # Contact point is on capsule surface along normal
-                                cpoint = test_p - n * radius
-                                self.cacheGroundContact(
-                                    j, cpoint, n, ti.Vector.zero(ti.f32, self.d), signed - radius
-                                )
-
-    @ti.kernel
-    def detectHeightField2MeshContacts_(self, rigidIdx: ti.i32, hf: ti.template()):
-        """Detect and resolve contacts between heightfield ground and mesh rigids.
-
-        Iterates over ground-mesh pairs buffer to support multiple HFs and avoid O(N) scan.
-
-        TODO: Similar to analytical-plane vs mesh, we can apply contact manifold reduction here to avoid over-correction from too many boundary nodes.
-          We can select representative contacts based on penetration depth and spatial distribution along the heightfield surface.
-        """
-
-        if rigidIdx != -1:
-            meshid = rigidIdx
-
-            # Early exit optimization: check mesh rigid AABB against heightfield
-            domain_idx = self.rigidDomainIds[meshid][0]
-            mesh_min_x = self.aabb[domain_idx, 0][0]
-            mesh_max_x = self.aabb[domain_idx, 1][0]
-            mesh_min_z = self.aabb[domain_idx, 0][self.d - 1]
-            mesh_max_z = self.aabb[domain_idx, 1][self.d - 1]
-
-            # Get max/min height in the mesh's x (and y for 3D) range
-            max_height_in_range = 0.0
-            min_height_in_range = 0.0
-            skip_mesh = False
-
-            max_height_in_range, min_height_in_range = hf.get_maxmin_height_in_range_2d(mesh_min_x, mesh_max_x)
-
-            # Early exit: if max heightfield height < min mesh z, no contact possible
-            if max_height_in_range < mesh_min_z or (hf.reverse and (min_height_in_range > mesh_max_z)):
-                skip_mesh = True
-
-            if not skip_mesh:
-                # Map rigid index -> per-mesh boundary arrays
-                mesh_local_idx = self.rigid2MeshIndices[meshid]
-                if mesh_local_idx >= 0:
-                    node_offset = self.meshBoundaryNodeOffset[mesh_local_idx]
-                    num_nodes = self.meshBoundaryNodeCount[mesh_local_idx]
-
-                    for nidx in range(num_nodes):
-                        pos = self.meshBoundaryCoords[node_offset + nidx]
-                        x = pos[0]
-                        z = pos[1]
-                        foot, n, signed = hf.nearest_on_curve_2d(x, z)
-                        if signed < 0.0:
-                            cpoint = foot
-                            self.cacheGroundContact(meshid, cpoint, n, ti.Vector.zero(ti.f32, self.d), signed)
-
-    @ti.kernel
-    def detectVoxel2Rigids_(self, rigidIdx: ti.i32, vox: ti.template()):
-        """Detect collisions between a voxel grid (2D surface edges) and primitive rigids.
-
-        Uses voxel boundary edges with outward normals for contact response.
-
-        """
-        j = rigidIdx
-        rtype = self.rigidDomainIds[j][1]
-        prim = self.rigidParams[j, 1]
-
-        # 2D: edges distance
+        rtype = int(domain_ids[j][1])
         if rtype == RigidType.BOX:
-            num_verts = 4
-            minExtent = prim.norm()
-            for vi in range(num_verts):
+            for vi in range(4):
+                pos = self.get_box_vertex(j, vi)
+                foot, n, signed = hf.nearest_on_curve_2d(float(pos[0]), float(pos[1]))
+                if signed < 0.0:
+                    self.cacheGroundContact(j, pos, n, (0.0, 0.0), signed)
+        elif rtype == RigidType.BALL:
+            center = params[j, 0]
+            radius = float(radius_arr[j])
+            foot, n, signed = hf.nearest_on_curve_2d(float(center[0]), float(center[1]))
+            penetration = radius - signed
+            if penetration > 0.0:
+                n = np.asarray(n, dtype=np.float32)
+                cpoint = center - n * radius
+                self.cacheGroundContact(j, cpoint, n, (0.0, 0.0), signed - radius)
+        elif rtype == RigidType.CAPSULE:
+            center = params[j, 0]
+            lcdir = params[j, 1]
+            lc = rot[j] @ lcdir + center
+            uc = center * 2.0 - lc
+            radius = float(radius_arr[j])
+            for test_p in (lc, uc):
+                foot, n, signed = hf.nearest_on_curve_2d(float(test_p[0]), float(test_p[1]))
+                penetration = radius - signed
+                if penetration > 0.0:
+                    n = np.asarray(n, dtype=np.float32)
+                    cpoint = test_p - n * radius
+                    self.cacheGroundContact(j, cpoint, n, (0.0, 0.0), signed - radius)
+
+    def detectHeightField2MeshContacts_(self, rigidIdx: int, hf):
+        """Heightfield vs mesh rigid boundary nodes."""
+        if rigidIdx == -1:
+            return
+        j = int(rigidIdx)
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        mesh_ids = self.rigid2MeshIndices.numpy()
+        node_off = self.meshBoundaryNodeOffset.numpy()
+        node_cnt = self.meshBoundaryNodeCount.numpy()
+        coords = self.meshBoundaryCoords.numpy()
+
+        domain_idx = int(domain_ids[j][0])
+        rigid_min_x = float(aabb[domain_idx, 0][0])
+        rigid_max_x = float(aabb[domain_idx, 1][0])
+        rigid_min_z = float(aabb[domain_idx, 0][self.d - 1])
+        rigid_max_z = float(aabb[domain_idx, 1][self.d - 1])
+        max_height_in_range, min_height_in_range = hf.get_maxmin_height_in_range_2d(rigid_min_x, rigid_max_x)
+        if max_height_in_range < rigid_min_z or (hf.reverse and (min_height_in_range > rigid_max_z)):
+            return
+
+        mesh_local = int(mesh_ids[j])
+        if mesh_local < 0:
+            return
+        off = int(node_off[mesh_local])
+        nnodes = int(node_cnt[mesh_local])
+        for nidx in range(nnodes):
+            pos = coords[off + nidx]
+            foot, n, signed = hf.nearest_on_curve_2d(float(pos[0]), float(pos[1]))
+            if signed < 0.0:
+                self.cacheGroundContact(j, pos, n, (0.0, 0.0), signed)
+
+    def detectVoxel2Rigids_(self, rigidIdx: int, vox):
+        """Voxel map vs primitive rigid."""
+        if rigidIdx == -1:
+            return
+        j = int(rigidIdx)
+        domain_ids = self.rigidDomainIds.numpy()
+        params = self.rigidParams.numpy()
+        radius_arr = self.radius.numpy()
+        rot = self.cached_rotation_matrix.numpy()
+        rtype = int(domain_ids[j][1])
+        if rtype == RigidType.BOX:
+            for vi in range(4):
                 pos = self.get_box_vertex(j, vi)
                 d, n, c = vox.signed_distance_to_edges_2d(pos, 0.0)
                 if d < 0.0:
-                    self.cacheGroundContact(j, c, n, ti.Vector.zero(ti.f32, self.d), d)
+                    self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
         elif rtype == RigidType.BALL:
-            center = self.rigidParams[j, 0]
-            radius = self.radius[j]
+            center = params[j, 0]
+            radius = float(radius_arr[j])
             d, n, c = vox.signed_distance_to_edges_2d(center, radius)
-            if d < radius:
-                self.cacheGroundContact(j, c, n, ti.Vector.zero(ti.f32, self.d), d - radius)
+            if d < 0.0:
+                self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
         elif rtype == RigidType.CAPSULE:
-            center = self.rigidParams[j, 0]
-            lcdir = self.rigidParams[j, 1]
-            lc = self.cached_rotation_matrix[j] @ lcdir + center
+            center = params[j, 0]
+            lcdir = params[j, 1]
+            lc = rot[j] @ lcdir + center
             uc = center * 2.0 - lc
-            radius = self.radius[j]
-            for ep in ti.static(range(2)):
-                test_p = lc if ep == 0 else uc
+            radius = float(radius_arr[j])
+            for test_p in (lc, uc):
                 d, n, c = vox.signed_distance_to_edges_2d(test_p, radius)
-                if d < radius:
-                    self.cacheGroundContact(j, c, n, ti.Vector.zero(ti.f32, self.d), d - radius)
+                if d < 0.0:
+                    self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
 
-    @ti.kernel
-    def detectVoxel2MeshContacts_(self, rigidIdx: ti.i32, vox: ti.template()):
-        """Detect collisions between voxel grid (2D) and mesh rigids via boundary nodes.
-        Iterates over ground-mesh pairs buffer.
+    def detectVoxel2MeshContacts_(self, rigidIdx: int, vox):
+        """Voxel map vs mesh rigid boundary nodes."""
+        if rigidIdx == -1:
+            return
+        j = int(rigidIdx)
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        mesh_ids = self.rigid2MeshIndices.numpy()
+        node_off = self.meshBoundaryNodeOffset.numpy()
+        node_cnt = self.meshBoundaryNodeCount.numpy()
+        coords = self.meshBoundaryCoords.numpy()
 
-        TODO: Similar to analytical-plane vs mesh,
-        we can apply contact manifold reduction here to avoid over-correction from too many boundary nodes.
-        """
-
-        if rigidIdx != -1:
-            meshid = rigidIdx
-            mesh_local = self.rigid2MeshIndices[meshid]
-
-            if mesh_local >= 0:
-                # Get global domain index from mesh rigid
-                domain_idx = self.rigidDomainIds[meshid][0]
-                # print("mesh id:", meshid, " local idx:", mesh_local)
-                node_offset = self.meshBoundaryNodeOffset[mesh_local]
-                num_nodes = self.meshBoundaryNodeCount[mesh_local]
-                minExtent = (self.aabb[domain_idx, 1] - self.aabb[domain_idx, 0]).norm()
-                for nidx in range(num_nodes):
-                        pos = self.meshBoundaryCoords[node_offset + nidx]
-                        d, n, c = vox.signed_distance_to_edges_2d(pos, 0.2 * minExtent)
-                        if d < 0.0:
-                            self.cacheGroundContact(meshid, c, n, ti.Vector.zero(ti.f32, self.d), d)
+        domain_idx = int(domain_ids[j][0])
+        mesh_local = int(mesh_ids[j])
+        if mesh_local < 0:
+            return
+        off = int(node_off[mesh_local])
+        nnodes = int(node_cnt[mesh_local])
+        minExtent = aabb[domain_idx, 1] - aabb[domain_idx, 0]
+        extent_scale = 0.2 * float(np.linalg.norm(minExtent))
+        for nidx in range(nnodes):
+            pos = coords[off + nidx]
+            d, n, c = vox.signed_distance_to_edges_2d(pos, extent_scale)
+            if d < 0.0:
+                self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
 
     # -------  End of Rigid-Ground contact related functions -----------------------------
     # ----------------------------------------------------------------------------------
 
-    @ti.func
-    def cacheContact(self, aid, bid, cpoint, normal, depth: ti.f32):
-        """Cache a rigid-rigid contact (will use applyImpulsePair during iteration).
+    def cacheContact(self, aid, bid, cpoint, normal, depth: float):
+        """Cache a rigid-rigid contact (host path; Warp kernels use _cache_*_func)."""
+        nc = self.num_contacts.numpy()
+        idx = int(nc[0])
+        if idx >= self.MAX_CONTACTS:
+            return
+        nc[0] = idx + 1
+        self.num_contacts.assign(nc)
 
-        Also registers the contact in per-env index lists for O(1) PGS env-lookup.
+        cpoint = np.asarray(cpoint, dtype=np.float32).reshape(-1)
+        normal = np.asarray(normal, dtype=np.float32).reshape(-1)
+        aid = int(aid)
+        bid = int(bid)
+        _patch_array(self.contact_rigid_a, idx, aid)
+        _patch_array(self.contact_rigid_b, idx, bid)
+        _patch_array(self.contact_point, idx, (float(cpoint[0]), float(cpoint[1])))
+        _patch_array(self.contact_normal, idx, (float(normal[0]), float(normal[1])))
+        _patch_array(self.contact_depth, idx, float(depth))
 
-        Args:
-            aid: First rigid index
-            bid: Second rigid index
-            cpoint: Contact point in world space
-            normal: Contact normal (from aid to bid)
-            depth: Signed penetration depth (negative = penetrating)
-        """
-        idx = ti.atomic_add(self.num_contacts[None], 1)
-        if idx < self.MAX_CONTACTS:
-            self.contact_rigid_a[idx] = aid
-            self.contact_rigid_b[idx] = bid
-            self.contact_point[idx] = cpoint
-            self.contact_normal[idx] = normal
-            self.contact_depth[idx] = depth
-            ti.atomic_add(self.contact_count_per_rigid[aid], 1)
-            ti.atomic_add(self.contact_count_per_rigid[bid], 1)
-            # Compute restitution bounce target velocity (once, using pre-PGS velocity)
-            ra = cpoint - self.rigidParams[aid, 0]
-            rb = cpoint - self.rigidParams[bid, 0]
-            e = 0.5 * (self.contactParams[aid][1] + self.contactParams[bid][1])
-            v_threshold = self.restitution_velocity_threshold
-            vn_pre = 0.0
-            va = self.V[aid] + ti.Vector([-ra[1], ra[0]]) * self.RotV[aid][0]
-            vb = self.V[bid] + ti.Vector([-rb[1], rb[0]]) * self.RotV[bid][0]
-            vn_pre = (va - vb).dot(normal)
-            if vn_pre < -v_threshold:
-                self.contact_bounce_vel[idx] = -e * vn_pre
-            else:
-                self.contact_bounce_vel[idx] = 0.0
-            # Build fixed tangent basis (stable across PGS iterations)
-            self.contact_tangent1[idx] = ti.Vector([-normal[1], normal[0]])
-            # Per-env index tracking (env_id < 0 maps to env 0 for single-env mode)
-            env_id = ti.max(self.rigid_env_id[aid], 0)
-            if env_id < self.MAX_ENVS_ALLOC:
-                local_i = ti.atomic_add(self.contact_env_count[env_id], 1)
-                if local_i < self.MAX_CC_PER_ENV:
-                    self.contact_env_idx[env_id * self.MAX_CC_PER_ENV + local_i] = idx
+        cpr = self.contact_count_per_rigid.numpy()
+        cpr[aid] = int(cpr[aid]) + 1
+        cpr[bid] = int(cpr[bid]) + 1
+        self.contact_count_per_rigid.assign(cpr)
 
-    @ti.func
-    def cacheGroundContact(self, rid, cpoint, normal, ground_vel, depth: ti.f32):
-        """Cache a ground-rigid contact (will use applyImpulseAtPoint during iteration).
+        params = self.rigidParams.numpy()
+        V = self.V.numpy()
+        RotV = self.RotV.numpy()
+        contactParams = self.contactParams.numpy()
+        ra = cpoint[:2] - params[aid, 0]
+        rb = cpoint[:2] - params[bid, 0]
+        e = 0.5 * (float(contactParams[aid][1]) + float(contactParams[bid][1]))
+        v_threshold = float(self.restitution_velocity_threshold)
+        va = V[aid] + np.array([-ra[1], ra[0]], dtype=np.float32) * float(RotV[aid])
+        vb = V[bid] + np.array([-rb[1], rb[0]], dtype=np.float32) * float(RotV[bid])
+        vn_pre = float(np.dot(va - vb, normal[:2]))
+        bounce = -e * vn_pre if vn_pre < -v_threshold else 0.0
+        _patch_array(self.contact_bounce_vel, idx, bounce)
+        _patch_array(self.contact_tangent1, idx, (float(-normal[1]), float(normal[0])))
 
-        Also registers the contact in per-env index lists for O(1) PGS env-lookup.
+        env_ids = self.rigid_env_id.numpy()
+        env_id = max(int(env_ids[aid]), 0)
+        if env_id < self.MAX_ENVS_ALLOC:
+            env_count = self.contact_env_count.numpy()
+            local_i = int(env_count[env_id])
+            env_count[env_id] = local_i + 1
+            self.contact_env_count.assign(env_count)
+            if local_i < self.MAX_CC_PER_ENV:
+                _patch_array(self.contact_env_idx, env_id * self.MAX_CC_PER_ENV + local_i, idx)
 
-        Args:
-            rid: Rigid index
-            cpoint: Contact point in world space
-            normal: Contact normal (pointing away from ground)
-            ground_vel: Velocity of ground at contact point
-            depth: Signed penetration depth (negative = penetrating, positive = margin)
-        """
-        idx = ti.atomic_add(self.num_ground_contacts[None], 1)
-        if idx < self.MAX_GROUND_CONTACTS:
-            self.ground_contact_rigid[idx] = rid
-            self.ground_contact_point[idx] = cpoint
-            self.ground_contact_normal[idx] = normal
-            self.ground_contact_vel[idx] = ground_vel
-            self.ground_contact_depth[idx] = depth
-            # Compute restitution bounce target velocity (once, using pre-PGS velocity)
-            lr = cpoint - self.rigidParams[rid, 0]
-            e = self.contactParams[rid][1]
-            v_threshold = self.restitution_velocity_threshold
-            vn_pre = 0.0
-            tlr = ti.Vector([-lr[1], lr[0]])
-            v_point = self.V[rid] + tlr * self.RotV[rid][0]
-            vn_pre = (v_point - ground_vel).dot(normal)
-            if vn_pre < -v_threshold:
-                self.ground_contact_bounce_vel[idx] = -e * vn_pre
-            else:
-                self.ground_contact_bounce_vel[idx] = 0.0
-            # Build fixed tangent basis (stable across PGS iterations)
-            # 2D: single tangent = 90-degree rotation of normal
-            self.ground_contact_tangent1[idx] = ti.Vector([-normal[1], normal[0]])
+    def cacheGroundContact(self, rid, cpoint, normal, ground_vel, depth: float):
+        """Cache a ground-rigid contact (host path; Warp kernels use _cache_ground_contact_func)."""
+        ng = self.num_ground_contacts.numpy()
+        idx = int(ng[0])
+        if idx >= self.MAX_GROUND_CONTACTS:
+            return
+        ng[0] = idx + 1
+        self.num_ground_contacts.assign(ng)
 
-            # Per-env index tracking (env_id < 0 maps to env 0 for single-env mode)
-            env_id = ti.max(self.rigid_env_id[rid], 0)
-            if env_id < self.MAX_ENVS_ALLOC:
-                local_i = ti.atomic_add(self.ground_contact_env_count[env_id], 1)
-                if local_i < self.MAX_GC_PER_ENV:
-                    self.ground_contact_env_idx[env_id * self.MAX_GC_PER_ENV + local_i] = idx
+        cpoint = np.asarray(cpoint, dtype=np.float32).reshape(-1)
+        normal = np.asarray(normal, dtype=np.float32).reshape(-1)
+        ground_vel = np.asarray(ground_vel, dtype=np.float32).reshape(-1)
+        rid = int(rid)
+        _patch_array(self.ground_contact_rigid, idx, rid)
+        _patch_array(self.ground_contact_point, idx, (float(cpoint[0]), float(cpoint[1])))
+        _patch_array(self.ground_contact_normal, idx, (float(normal[0]), float(normal[1])))
+        _patch_array(
+            self.ground_contact_vel,
+            idx,
+            (float(ground_vel[0]), float(ground_vel[1]) if ground_vel.size > 1 else 0.0),
+        )
+        _patch_array(self.ground_contact_depth, idx, float(depth))
 
-    @ti.func
+        params = self.rigidParams.numpy()
+        V = self.V.numpy()
+        RotV = self.RotV.numpy()
+        contactParams = self.contactParams.numpy()
+        lr = cpoint[:2] - params[rid, 0]
+        e = float(contactParams[rid][1])
+        v_threshold = float(self.restitution_velocity_threshold)
+        tlr = np.array([-lr[1], lr[0]], dtype=np.float32)
+        gv = (
+            ground_vel[:2]
+            if ground_vel.size >= 2
+            else np.array([float(ground_vel[0]), 0.0], dtype=np.float32)
+        )
+        v_point = V[rid] + tlr * float(RotV[rid])
+        vn_pre = float(np.dot(v_point - gv, normal[:2]))
+        bounce = -e * vn_pre if vn_pre < -v_threshold else 0.0
+        _patch_array(self.ground_contact_bounce_vel, idx, bounce)
+        _patch_array(self.ground_contact_tangent1, idx, (float(-normal[1]), float(normal[0])))
+
+        env_ids = self.rigid_env_id.numpy()
+        env_id = max(int(env_ids[rid]), 0)
+        if env_id < self.MAX_ENVS_ALLOC:
+            env_count = self.ground_contact_env_count.numpy()
+            local_i = int(env_count[env_id])
+            env_count[env_id] = local_i + 1
+            self.ground_contact_env_count.assign(env_count)
+            if local_i < self.MAX_GC_PER_ENV:
+                _patch_array(self.ground_contact_env_idx, env_id * self.MAX_GC_PER_ENV + local_i, idx)
+
     def _add_pgs_row(
         self,
         aid,
@@ -2315,20 +3683,19 @@ class RigidManager:
         parent_row,
     ):
         flag = -1
-        ci = ti.atomic_add(self.numConstraints[None], 1)
+        ci = wp.atomic_add(self.numConstraints, 0, 1)
         if ci < self.MAX_CONSTRAINTS:
-            self.pgs_bodypair[ci] = ti.Vector([aid, bid])
+            self.pgs_bodypair[ci] = wp.vec2(aid, bid)
             self.pgs_Jac_a[ci] = jac_a
             self.pgs_Jac_b[ci] = jac_b
             self.pgs_rhs[ci] = rhs
-            self.pgs_limits[ci] = ti.Vector([lower, upper])
+            self.pgs_limits[ci] = wp.vec2(lower, upper)
             self.pgs_lambda[ci] = 0.0
             self.pgs_parent_row[ci] = parent_row
             flag = ci
         return flag
 
-    @ti.func
-    def _assemble_ground_contact_rows(self, idx: ti.i32, dt: ti.f32):
+    def _assemble_ground_contact_rows(self, idx: int, dt: float):
         rid = self.ground_contact_rigid[idx]
         cpoint = self.ground_contact_point[idx]
         normal = self.ground_contact_normal[idx]
@@ -2341,29 +3708,28 @@ class RigidManager:
 
         bias_vel = 0.0
         if depth < 0.0 and self.contact_erp > 0.0:
-            bias_vel = ti.max(self.contact_erp * depth / dt, -5.0)
+            bias_vel = wp.max(self.contact_erp * depth / dt, -5.0)
 
         # Properly decouple restitution and baumgarte separation velocities
         target_vel = bounce_vel
         if -bias_vel > bounce_vel:
             target_vel = -bias_vel
 
-        jac_n = ti.Vector([normal[0], normal[1], vectorCrossProduct(lr, normal)[0]])
+        jac_n = wp.vec3(normal[0], normal[1], vectorCrossProduct(lr, normal)[0])
 
         normal_row = self._add_pgs_row(
-            rid, -1, jac_n, ti.Vector.zero(ti.f32, 3), target_vel + normal.dot(ground_vel), 0.0, 1e10, -1
+            rid, -1, jac_n, wp.vec3(0.0, 0.0, 0.0), target_vel + normal.dot(ground_vel), 0.0, 1e10, -1
         )
-        self.ground_contact_pgs_indices[idx] = ti.Vector([normal_row, -1, -1])
+        self.ground_contact_pgs_indices[idx] = wp.vec3(normal_row, -1, -1)
         if mu > 1e-12 and normal_row >= 0:
             t1 = self.ground_contact_tangent1[idx]
-            jac_t1 = ti.Vector([t1[0], t1[1], vectorCrossProduct(lr, t1)[0]])
+            jac_t1 = wp.vec3(t1[0], t1[1], vectorCrossProduct(lr, t1)[0])
             rhs_t1 = t1.dot(ground_vel)
-            tangent1_row = self._add_pgs_row(rid, -1, jac_t1, ti.Vector.zero(ti.f32, 3), rhs_t1, -mu, mu, normal_row)
+            tangent1_row = self._add_pgs_row(rid, -1, jac_t1, wp.vec3(0.0, 0.0, 0.0), rhs_t1, -mu, mu, normal_row)
             self.ground_contact_pgs_indices[idx][1] = tangent1_row
 
 
-    @ti.func
-    def _assemble_pair_contact_rows(self, idx: ti.i32, dt: ti.f32):
+    def _assemble_pair_contact_rows(self, idx: int, dt: float):
         aid = self.contact_rigid_a[idx]
         bid = self.contact_rigid_b[idx]
         cpoint = self.contact_point[idx]
@@ -2377,7 +3743,7 @@ class RigidManager:
 
         bias_vel = 0.0
         if depth < 0.0 and self.contact_erp > 0.0:
-            bias_vel = ti.max(self.contact_erp * depth / dt, -5.0)
+            bias_vel = wp.max(self.contact_erp * depth / dt, -5.0)
 
         # Properly decouple restitution and baumgarte separation velocities
         # Both are positive requested separation velocities
@@ -2385,164 +3751,185 @@ class RigidManager:
         if -bias_vel > bounce_vel:
             target_vel = -bias_vel
 
-        jac_na = ti.Vector([normal[0], normal[1], vectorCrossProduct(ra, normal)[0]])
-        jac_nb = ti.Vector([normal[0], normal[1], vectorCrossProduct(rb, normal)[0]])
+        jac_na = wp.vec3(normal[0], normal[1], vectorCrossProduct(ra, normal)[0])
+        jac_nb = wp.vec3(normal[0], normal[1], vectorCrossProduct(rb, normal)[0])
 
         normal_row = self._add_pgs_row(aid, bid, jac_na, jac_nb, target_vel, 0.0, 1e10, -1)
-        self.contact_pgs_indices[idx] = ti.Vector([normal_row, -1, -1])
+        self.contact_pgs_indices[idx] = wp.vec3(normal_row, -1, -1)
 
         if mu > 1e-12 and normal_row >= 0:
             t1 = self.contact_tangent1[idx]
-            jac_t1a = ti.Vector([t1[0], t1[1], vectorCrossProduct(ra, t1)[0]])
-            jac_t1b = ti.Vector([t1[0], t1[1], vectorCrossProduct(rb, t1)[0]])
+            jac_t1a = wp.vec3(t1[0], t1[1], vectorCrossProduct(ra, t1)[0])
+            jac_t1b = wp.vec3(t1[0], t1[1], vectorCrossProduct(rb, t1)[0])
             tangent1_row = self._add_pgs_row(aid, bid, jac_t1a, jac_t1b, 0.0, -mu, mu, normal_row)
             self.contact_pgs_indices[idx][1] = tangent1_row
 
 
-    @ti.kernel
-    def _assemble_contact_constraints_kernel(self, dt: ti.f32):
-        for idx in range(self.num_ground_contacts[None]):
-            self._assemble_ground_contact_rows(idx, dt)
-        for idx in range(self.num_contacts[None]):
-            self._assemble_pair_contact_rows(idx, dt)
+    def _assemble_contact_constraints_kernel(self, dt: float):
+        wp.launch(
+            _assemble_ground_contact_constraints_wp,
+            dim=1,
+            inputs=[
+                float(dt),
+                float(self.contact_erp),
+                int(self.MAX_CONSTRAINTS),
+                self.num_ground_contacts,
+                self.ground_contact_rigid,
+                self.ground_contact_point,
+                self.ground_contact_normal,
+                self.ground_contact_vel,
+                self.ground_contact_depth,
+                self.ground_contact_bounce_vel,
+                self.ground_contact_tangent1,
+                self.ground_contact_pgs_indices,
+                self.rigidParams,
+                self.contactParams,
+                self.numConstraints,
+                self.pgs_bodypair,
+                self.pgs_Jac_a,
+                self.pgs_Jac_b,
+                self.pgs_rhs,
+                self.pgs_limits,
+                self.pgs_lambda,
+                self.pgs_parent_row,
+            ],
+        )
+        if int(self.num_contacts.numpy()[0]) > 0:
+            wp.launch(
+                _assemble_pair_contact_constraints_wp,
+                dim=1,
+                inputs=[
+                    float(dt),
+                    float(self.contact_erp),
+                    int(self.MAX_CONSTRAINTS),
+                    self.num_contacts,
+                    self.contact_rigid_a,
+                    self.contact_rigid_b,
+                    self.contact_point,
+                    self.contact_normal,
+                    self.contact_depth,
+                    self.contact_bounce_vel,
+                    self.contact_tangent1,
+                    self.contact_pgs_indices,
+                    self.rigidParams,
+                    self.contactParams,
+                    self.numConstraints,
+                    self.pgs_bodypair,
+                    self.pgs_Jac_a,
+                    self.pgs_Jac_b,
+                    self.pgs_rhs,
+                    self.pgs_limits,
+                    self.pgs_lambda,
+                    self.pgs_parent_row,
+                ],
+            )
 
-    @ti.kernel
-    def _compute_contact_forces_kernel(self, dt: ti.f32):
-        """
-        Compute contact forces from accumulated impulses after PGS solve.
+    def _compute_contact_forces_kernel(self, dt: float):
+        """Compute contact forces from accumulated impulses after PGS solve."""
+        wp.launch(
+            _compute_contact_forces_wp,
+            dim=1,
+            inputs=[
+                float(dt),
+                self.num_ground_contacts,
+                self.num_contacts,
+                self.ground_contact_pgs_indices,
+                self.ground_contact_normal,
+                self.ground_contact_tangent1,
+                self.ground_contact_force,
+                self.contact_pgs_indices,
+                self.contact_normal,
+                self.contact_tangent1,
+                self.contact_force,
+                self.pgs_lambda,
+            ],
+        )
 
-        Contact force = impulse / dt
+    def _assemble_joint_constraints_kernel(self, dt: float):
+        """Assemble joint PGS rows via joint_kernels.assemble_single_joint_rows."""
+        wp.launch(
+            _assemble_joint_constraints_wp,
+            dim=1,
+            inputs=[
+                float(dt),
+                int(self.numAnchors),
+                int(self.MAX_CONSTRAINTS),
+                self.joint_type,
+                self.joint_id_a,
+                self.joint_id_b,
+                self.joint_params,
+                self.joint_has_motor,
+                self.joint_motor_target_mode,
+                self.joint_motor_target_vel,
+                self.joint_q0_rel_inv,
+                self.joint_axis,
+                self.joint_l1,
+                self.joint_l2,
+                self.rigidParams,
+                self.quat,
+                self.quat_initial,
+                self.RotV,
+                self.numConstraints,
+                self.pgs_bodypair,
+                self.pgs_Jac_a,
+                self.pgs_Jac_b,
+                self.pgs_rhs,
+                self.pgs_limits,
+                self.pgs_lambda,
+                self.pgs_parent_row,
+            ],
+        )
 
-        For ground contacts:
-            force = (lambda_n * normal + lambda_t1 * tangent1 + lambda_t2 * tangent2) / dt
-
-        For rigid-rigid contacts:
-            force = (lambda_n * normal + lambda_t1 * tangent1 + lambda_t2 * tangent2) / dt
-        """
-        eps = 1e-12
-        dt_inv = 1.0 / (dt + eps)
-
-        # Compute ground contact forces
-        for idx in range(self.num_ground_contacts[None]):
-            pgs_indices = self.ground_contact_pgs_indices[idx]
-            normal_row = pgs_indices[0]
-            tangent1_row = pgs_indices[1]
-            tangent2_row = pgs_indices[2]
-
-            lambda_n = 0.0
-            if normal_row >= 0:
-                lambda_n = self.pgs_lambda[normal_row]
-
-            lambda_t1 = 0.0
-            if tangent1_row >= 0:
-                lambda_t1 = self.pgs_lambda[tangent1_row]
-
-            lambda_t2 = 0.0
-            if tangent2_row >= 0:
-                lambda_t2 = self.pgs_lambda[tangent2_row]
-
-            normal = self.ground_contact_normal[idx]
-            tangent1 = self.ground_contact_tangent1[idx]
-
-            force = lambda_n * normal + lambda_t1 * tangent1
-
-            self.ground_contact_force[idx] = force * dt_inv
-
-        # Compute rigid-rigid contact forces
-        for idx in range(self.num_contacts[None]):
-            pgs_indices = self.contact_pgs_indices[idx]
-            normal_row = pgs_indices[0]
-            tangent1_row = pgs_indices[1]
-            tangent2_row = pgs_indices[2]
-
-            lambda_n = 0.0
-            if normal_row >= 0:
-                lambda_n = self.pgs_lambda[normal_row]
-
-            lambda_t1 = 0.0
-            if tangent1_row >= 0:
-                lambda_t1 = self.pgs_lambda[tangent1_row]
-
-            lambda_t2 = 0.0
-            if tangent2_row >= 0:
-                lambda_t2 = self.pgs_lambda[tangent2_row]
-
-            normal = self.contact_normal[idx]
-            tangent1 = self.contact_tangent1[idx]
-
-            force = lambda_n * normal + lambda_t1 * tangent1
-
-            self.contact_force[idx] = force * dt_inv
-
-    @ti.kernel
-    def _assemble_joint_constraints_kernel(self, dt: ti.f32):
-        for j_idx in range(self.numAnchors):
-            assemble_single_joint_rows(self, dt, j_idx)
-
-    @ti.kernel
     def reset_contact_caches_kernel(self):
-        """Reset contact counters and force arrays in a single kernel launch.
-        Replaces 2x fill() + 2x [None]=0 = 4 Python-Taichi round trips with 1.
-        Uses bounded reset: only clears entries that were actually written.
+        """Reset contact counters and force arrays in a single kernel launch."""
+        wp.launch(
+            _reset_contact_caches_wp,
+            dim=1,
+            inputs=[
+                int(self.numRigids),
+                int(self.numAnalytical),
+                int(max(self.num_envs, 1)),
+                self.num_contacts,
+                self.num_ground_contacts,
+                self.prev_num_contacts,
+                self.prev_num_ground_contacts,
+                self.numConstraints,
+                self.contact_count_per_rigid,
+                self.contact_env_count,
+                self.ground_contact_env_count,
+                self.contact_force,
+                self.contact_pgs_indices,
+                self.contact_bounce_vel,
+                self.ground_contact_force,
+                self.ground_contact_pgs_indices,
+                self.ground_contact_bounce_vel,
+            ],
+        )
 
-        Also saves per-rigid total lambda from previous frame for warm-starting.
-        """
-        prev_nc = self.prev_num_contacts[None]
-        prev_ngc = self.prev_num_ground_contacts[None]
-        self.prev_num_contacts[None] = self.num_contacts[None]
-        self.prev_num_ground_contacts[None] = self.num_ground_contacts[None]
+    def solve_pgs(self, pgs_iters: int):
+        """Serial PGS via dim=1 Warp kernel (forward + backward sweeps)."""
+        wp.launch(
+            _solve_pgs_kernel,
+            dim=1,
+            inputs=[
+                int(pgs_iters),
+                self.numConstraints,
+                int(self.MAX_CONSTRAINTS),
+                self.V,
+                self.RotV,
+                self.mass,
+                self.inertia,
+                self.pgs_bodypair,
+                self.pgs_Jac_a,
+                self.pgs_Jac_b,
+                self.pgs_rhs,
+                self.pgs_limits,
+                self.pgs_lambda,
+                self.pgs_parent_row,
+            ],
+        )
 
-        # Save per-rigid total lambda for warm-starting before clearing
-        total_nodes = self.numRigids + self.numAnalytical
-
-        self.num_contacts[None] = 0
-        self.num_ground_contacts[None] = 0
-        self.numConstraints[None] = 0
-        # Reset per-env contact counters
-        n_envs = ti.max(self.num_envs, 1)
-        i = 0
-        while i < n_envs:
-            self.ground_contact_env_count[i] = 0
-            self.contact_env_count[i] = 0
-            i += 1
-        for rid in range(total_nodes):
-            self.contact_count_per_rigid[rid] = 0
-        for j in range(prev_nc):
-            self.contact_force[j] = ti.Vector.zero(ti.f32, self.d)
-            self.contact_pgs_indices[j] = ti.Vector([-1, -1, -1])
-            self.contact_bounce_vel[j] = 0.0
-        for k in range(prev_ngc):
-            self.ground_contact_force[k] = ti.Vector.zero(ti.f32, self.d)
-            self.ground_contact_pgs_indices[k] = ti.Vector([-1, -1, -1])
-            self.ground_contact_bounce_vel[k] = 0.0
-
-    @ti.kernel
-    def solve_pgs(self, pgs_iters: ti.i32):
-        """
-        Given that the PGS has been set up, solve the PGS.
-        This function is called after the PGS has been set up, and before the next step.
-        Now we have all:
-            - V: current velocity
-            - RotV: current angular velocity
-            - pgs_Jac_a: Jacobian matrix
-            - pgs_rhs: right-hand side vector
-            - pgs_bodypair: body pairs, body a and body b
-            - mass: mass matrix
-            - inertia: inertia matrix
-        """
-        ti.loop_config(serialize=True)
-        n_constraints = ti.min(self.numConstraints[None], ti.static(self.MAX_CONSTRAINTS))
-        for _iter in range(pgs_iters):
-            # print("Number of constraints: ", self.numConstraints[None])
-            for i in range(n_constraints):
-                self.solve_pgs_single_func(i)
-
-            for i in range(n_constraints):
-                k = n_constraints - 1 - i
-                self.solve_pgs_single_func(k)
-
-    @ti.func
-    def solve_pgs_single_func(self, i: ti.i32):
+    def solve_pgs_single_func(self, i: int):
         bodypair = self.pgs_bodypair[i]
         aid = bodypair[0]
         bid = bodypair[1]
@@ -2550,11 +3937,11 @@ class RigidManager:
             jac_a = self.pgs_Jac_a[i]
             jac_b = self.pgs_Jac_b[i]
 
-            va3 = ti.Vector([self.V[aid][0], self.V[aid][1], self.RotV[aid][0]])
-            vb3 = ti.Vector.zero(ti.f32, 3)
+            va3 = wp.vec3(self.V[aid][0], self.V[aid][1], self.RotV[aid])
+            vb3 = wp.vec3(0.0, 0.0, 0.0)
 
-            massInvA = ti.Matrix.zero(ti.f32, 3, 3)
-            massInvB = ti.Matrix.zero(ti.f32, 3, 3)
+            massInvA = wp.mat33(0.0)
+            massInvB = wp.mat33(0.0)
 
             inv_mass_a = 1.0 / (self.mass[aid] + 1e-12)
             massInvA[0, 0] = inv_mass_a
@@ -2567,7 +3954,7 @@ class RigidManager:
             W = jac_a.dot(massInvJacA)
 
             has_b = bid >= 0
-            massInvJacB = ti.Vector.zero(ti.f32, 3)
+            massInvJacB = wp.vec3(0.0, 0.0, 0.0)
             if has_b:
                 inv_mass_b = 1.0 / (self.mass[bid] + 1e-12)
                 massInvB[0, 0] = inv_mass_b
@@ -2575,7 +3962,7 @@ class RigidManager:
                 inv_Ib = 1.0 / (self.inertia[bid] + 1e-12)
                 massInvB[2, 2] = inv_Ib
 
-                vb3 = ti.Vector([self.V[bid][0], self.V[bid][1], self.RotV[bid][0]])
+                vb3 = wp.vec3(self.V[bid][0], self.V[bid][1], self.RotV[bid])
                 vel -= jac_b.dot(vb3)
                 massInvJacB = massInvB @ jac_b
                 W += jac_b.dot(massInvJacB)
@@ -2590,11 +3977,11 @@ class RigidManager:
             if parent >= 0:
                 fric_lim_low = self.pgs_limits[i][0] * self.pgs_lambda[parent]
                 fric_lim_upper = self.pgs_limits[i][1] * self.pgs_lambda[parent]
-                new_lamb = ti.max(fric_lim_low, ti.min(fric_lim_upper, new_lamb))
+                new_lamb = wp.max(fric_lim_low, wp.min(fric_lim_upper, new_lamb))
             else:
                 lower = self.pgs_limits[i][0]
                 upper = self.pgs_limits[i][1]
-                new_lamb = ti.max(lower, ti.min(upper, new_lamb))
+                new_lamb = wp.max(lower, wp.min(upper, new_lamb))
 
             apply_lamb = new_lamb - old_lamb
             self.pgs_lambda[i] = new_lamb
@@ -2602,181 +3989,78 @@ class RigidManager:
             if apply_lamb != 0.0:
                 deltaA = massInvJacA * apply_lamb
 
-                self.V[aid] += ti.Vector([deltaA[0], deltaA[1]])
-                self.RotV[aid][0] += deltaA[2]
+                self.V[aid] += wp.vec2(deltaA[0], deltaA[1])
+                self.RotV[aid] += deltaA[2]
 
                 if has_b:
                     deltaB = massInvJacB * apply_lamb
 
-                    self.V[bid] -= ti.Vector([deltaB[0], deltaB[1]])
-                    self.RotV[bid][0] -= deltaB[2]
+                    self.V[bid] -= wp.vec2(deltaB[0], deltaB[1])
+                    self.RotV[bid] -= deltaB[2]
 
-    @ti.kernel
     def precompute_rigid_transforms(self):
-        """Precompute rotation matrices and world-space inertia tensors for all rigids.
+        n = int(self.numRigids + self.numAnalytical)
+        if n <= 0:
+            return
+        wp.launch(
+            _precompute_rigid_transforms_wp,
+            dim=n,
+            inputs=[
+                n,
+                self.quat,
+                self.visual_angle,
+                self.inertia,
+                self.cached_rotation_matrix,
+                self.cached_inertia_inv_2d,
+            ],
+        )
 
-        OPTIMIZATION: Called once before joint solving to cache expensive computations.
-        Avoids recomputing the same rotation matrix and inertia transformation for
-        each joint involving the same rigid body. For robots with 16-20 joints,
-        this reduces computation by 50-70%.
-        """
-        for i in range(self.numRigids + self.numAnalytical):
+    def _mask_allows_pair(self, idx_a: int, idx_b: int) -> int:
+        allow_ab = (self.collide_bits[idx_a] & self.category_bits[idx_b]) != wp.uint32(0)
+        allow_ba = (self.collide_bits[idx_b] & self.category_bits[idx_a]) != wp.uint32(0)
+        return int(allow_ab and allow_ba, int)
 
-            # Cache 2D rotation angle and inverse inertia
-            self.cached_rotation_matrix[i] = cal2DRotationMat(self.quat[i][0] + self.visual_angle[i])
-            I = self.inertia[i]
-            if I > 0.0:
-                self.cached_inertia_inv_2d[i] = 1.0 / I
-            else:
-                self.cached_inertia_inv_2d[i] = 1.0 / 1e-6
-
-    @ti.func
-    def _mask_allows_pair(self, idx_a: ti.i32, idx_b: ti.i32) -> ti.i32:
-        allow_ab = (self.collide_bits[idx_a] & self.category_bits[idx_b]) != ti.u32(0)
-        allow_ba = (self.collide_bits[idx_b] & self.category_bits[idx_a]) != ti.u32(0)
-        return ti.cast(allow_ab and allow_ba, ti.i32)
-
-    @ti.kernel
-    def classify_collision_pairs_kernel(self, pairs: ti.template(), num_pairs: ti.i32):
-        """Kernel to classify collision pairs into specific buffers."""
-        # Clear pair buffers
-        self.num_primitive_pairs[None] = 0
-        self.num_ball_ball_pairs[None] = 0
-        self.num_box_box_pairs[None] = 0
-        self.num_box_ball_pairs[None] = 0
-        self.num_seg_point_pairs[None] = 0
-        self.num_seg_seg_pairs[None] = 0
-
-        self.num_mesh_pairs[None] = 0
-        self.num_mixed_pairs[None] = 0
-        self.num_groundprim_pairs[None] = 0
-        self.num_groundmesh_pairs[None] = 0
-
-        for i in range(num_pairs):
-            domain_a = pairs[i][0]
-            domain_b = pairs[i][1]
-
-            # Look up rigid indices from domain indices
-            rigid_a = self.domainToRigid[domain_a]
-            rigid_b = self.domainToRigid[domain_b]
-
-            # Skip if either is not a rigid (-1 means not found)
-            if rigid_a >= 0 and rigid_b >= 0:
-                if self._mask_allows_pair(rigid_a, rigid_b) == 0:
-                    continue
-
-                is_anal_a = rigid_a >= self.numRigids
-                is_anal_b = rigid_b >= self.numRigids
-
-                # Classify pair type
-                type_a = self.rigidDomainIds[rigid_a][1]
-                type_b = self.rigidDomainIds[rigid_b][1]
-                is_mesh_a = (type_a == RigidType.MESH) and (self.compound_count[rigid_a] == 0)
-                is_mesh_b = (type_b == RigidType.MESH) and (self.compound_count[rigid_b] == 0)
-
-                if is_anal_a or is_anal_b:
-                    # Ground collision
-                    # One must be analytical, one must be rigid/mesh
-                    # Analytical domains effectively have infinite mass/fixed
-                    # If both are analytical, we skip (logic below handles it)
-
-                    if is_anal_a and not is_anal_b:
-                        if is_mesh_b:
-                            idx = ti.atomic_add(self.num_groundmesh_pairs[None], 1)
-                            if idx < self.MAX_GROUND_PAIRS:
-                                self.groundmesh_pairs_buffer[idx] = ti.Vector([rigid_a, rigid_b])
-                        else:
-                            idx = ti.atomic_add(self.num_groundprim_pairs[None], 1)
-                            if idx < self.MAX_GROUND_PAIRS:
-                                self.groundprim_pairs_buffer[idx] = ti.Vector([rigid_a, rigid_b])
-
-                    elif is_anal_b and not is_anal_a:
-                        if is_mesh_a:
-                            idx = ti.atomic_add(self.num_groundmesh_pairs[None], 1)
-                            if idx < self.MAX_GROUND_PAIRS:
-                                self.groundmesh_pairs_buffer[idx] = ti.Vector([rigid_b, rigid_a])
-                        else:
-                            idx = ti.atomic_add(self.num_groundprim_pairs[None], 1)
-                            if idx < self.MAX_GROUND_PAIRS:
-                                self.groundprim_pairs_buffer[idx] = ti.Vector([rigid_b, rigid_a])
-                else:
-                    # Rigid-rigid collision
-                    considerRigidPair = True
-
-                    # **COLLISION FILTERING: Skip cross-environment collisions**
-                    # For batched training, no rigid-rigid contact is considered, as for the same env, they are connected with joints.
-                    # For different envs, they should not collide. This is a simple filter based on environment IDs.
-                    # Ground (-1) is env-independent and should collide with anything.
-                    env_a = self.rigid_env_id[rigid_a]
-                    env_b = self.rigid_env_id[rigid_b]
-                    if env_a >= 0 and env_b >= 0 and env_a != env_b:
-                        considerRigidPair = False  # Different environments, skip
-
-                    if considerRigidPair:
-                        if is_mesh_a and is_mesh_b:
-                            # Mesh-mesh
-                            idx = ti.atomic_add(self.num_mesh_pairs[None], 1)
-                            if idx < self.MAX_COLLISION_PAIRS:
-                                self.mesh_pairs_buffer[idx] = ti.Vector([rigid_a, rigid_b])
-
-                        elif is_mesh_a or is_mesh_b:
-                            # Mixed (mesh-primitive)
-                            idx = ti.atomic_add(self.num_mixed_pairs[None], 1)
-                            if idx < self.MAX_COLLISION_PAIRS:
-                                self.mixed_pairs_buffer[idx] = ti.Vector([rigid_a, rigid_b])
-
-                        else:
-                            # Primitive-primitive
-                            contact_type = type_a | type_b
-
-                            if contact_type == RigidContactType.BALLBALL:
-                                idx = ti.atomic_add(self.num_ball_ball_pairs[None], 1)
-                                if idx < self.MAX_COLLISION_PAIRS:
-                                    self.ball_ball_pairs_buffer[idx] = ti.Vector([rigid_a, rigid_b])
-
-                            elif contact_type == RigidContactType.BOXBOX:
-                                idx = ti.atomic_add(self.num_box_box_pairs[None], 1)
-                                if idx < self.MAX_COLLISION_PAIRS:
-                                    self.box_box_pairs_buffer[idx] = ti.Vector([rigid_a, rigid_b])
-
-                            elif contact_type == RigidContactType.BOXBALL:
-                                idx = ti.atomic_add(self.num_box_ball_pairs[None], 1)
-                                if idx < self.MAX_COLLISION_PAIRS:
-                                    # Ensure rigid_a is box, rigid_b is ball
-                                    r_a, r_b = rigid_a, rigid_b
-                                    if type_a == RigidType.BALL:
-                                        r_a, r_b = rigid_b, rigid_a
-                                    self.box_ball_pairs_buffer[idx] = ti.Vector([r_a, r_b])
-
-                            elif contact_type == RigidContactType.CAPSULEBOX:
-                                idx = ti.atomic_add(self.num_seg_point_pairs[None], 1)
-                                if idx < self.MAX_COLLISION_PAIRS:
-                                    # Ensure rigid_a is segment, rigid_b is box
-                                    r_a, r_b = rigid_a, rigid_b
-                                    if type_a == RigidType.BOX:
-                                        r_a, r_b = rigid_b, rigid_a
-                                    self.seg_point_pairs_buffer[idx] = ti.Vector([r_a, r_b])
-
-                            elif contact_type == RigidContactType.CAPSULEBALL:
-                                idx = ti.atomic_add(self.num_seg_ball_pairs[None], 1)
-                                if idx < self.MAX_COLLISION_PAIRS:
-                                    # Ensure rigid_a is segment, rigid_b is box/ball
-                                    r_a, r_b = rigid_a, rigid_b
-                                    if type_a == RigidType.BALL:
-                                        r_a, r_b = rigid_b, rigid_a
-                                    self.seg_ball_pairs_buffer[idx] = ti.Vector([r_a, r_b])
-
-                            elif contact_type == RigidContactType.CAPSULECAPSULE:
-                                idx = ti.atomic_add(self.num_seg_seg_pairs[None], 1)
-                                if idx < self.MAX_COLLISION_PAIRS:
-                                    # Ensure rigid_a is capsule if mixed (optional)
-                                    r_a, r_b = rigid_a, rigid_b
-                                    self.seg_seg_pairs_buffer[idx] = ti.Vector([r_a, r_b])
-
-                            # Also keep in general primitive buffer
-                            idx = ti.atomic_add(self.num_primitive_pairs[None], 1)
-                            if idx < self.MAX_COLLISION_PAIRS:
-                                self.primitive_pairs_buffer[idx] = ti.Vector([rigid_a, rigid_b])
+    def classify_collision_pairs_kernel(self, pairs, num_pairs: int):
+        """Classify collision pairs into typed buffers (Warp kernel)."""
+        wp.launch(
+            _classify_collision_pairs_wp,
+            dim=1,
+            inputs=[
+                pairs,
+                int(num_pairs),
+                int(self.numRigids),
+                int(self.MAX_COLLISION_PAIRS),
+                int(self.MAX_GROUND_PAIRS),
+                self.domainToRigid,
+                self.rigidDomainIds,
+                self.compound_count,
+                self.rigid_env_id,
+                self.category_bits,
+                self.collide_bits,
+                self.num_primitive_pairs,
+                self.num_ball_ball_pairs,
+                self.num_box_box_pairs,
+                self.num_box_ball_pairs,
+                self.num_seg_point_pairs,
+                self.num_seg_ball_pairs,
+                self.num_seg_seg_pairs,
+                self.num_mesh_pairs,
+                self.num_mixed_pairs,
+                self.num_groundprim_pairs,
+                self.num_groundmesh_pairs,
+                self.primitive_pairs_buffer,
+                self.ball_ball_pairs_buffer,
+                self.box_box_pairs_buffer,
+                self.box_ball_pairs_buffer,
+                self.seg_point_pairs_buffer,
+                self.seg_ball_pairs_buffer,
+                self.seg_seg_pairs_buffer,
+                self.mesh_pairs_buffer,
+                self.mixed_pairs_buffer,
+                self.groundprim_pairs_buffer,
+                self.groundmesh_pairs_buffer,
+            ],
+        )
 
     def maybe_rebuild_spatial_hash(self, fem_lb=None, fem_ub=None, fem_margin=0.0):
         """Rebuild the mesh spatial hash if enough time has elapsed or
@@ -2791,9 +4075,9 @@ class RigidManager:
         else:
             self.populate_spatial_hash_filtered(fem_lb=fem_lb, fem_ub=fem_ub)
 
-        cell_size = float(self.spatialHash.gridSize[None].max())
+        cell_size = float(float(np.max(self.spatialHash.gridSize.numpy()[0])))
         self._sh_mesh_max_v = self.get_max_linear_velocity()
-        self._sh_contact_margin[None] = cell_size
+        _assign_scalar(self._sh_contact_margin, cell_size)
         self._sh_mesh_cell_size = cell_size
 
         # print(
@@ -2826,7 +4110,7 @@ class RigidManager:
             fem_ub_field = fem_ub
 
         self.spatialHash.reset()
-        contact_margin = self._sh_contact_margin[None]
+        contact_margin = float(self._sh_contact_margin.numpy()[0])
         velocity_buffer = 2.0 * self._sh_mesh_max_v * self._sh_mesh_rebuild_interval
         self._populate_spatial_hash_filtered_kernel(
             float(velocity_buffer),
@@ -2835,310 +4119,223 @@ class RigidManager:
             fem_ub_field,
         )
         self.spatialHash.build()
-        self._sh_contact_margin[None] = float(contact_margin) + float(velocity_buffer)
+        _assign_scalar(self._sh_contact_margin, float(contact_margin) + float(velocity_buffer))
 
-    @ti.kernel
     def _populate_spatial_hash_filtered_kernel(
-        self, velocity_buffer: ti.f32, contact_margin: ti.f32, fem_lb_field: ti.template(), fem_ub_field: ti.template()
+        self, velocity_buffer: float, contact_margin: float, fem_lb_field, fem_ub_field
     ):
         """Insert only mesh elements that overlap the FEM-rigid AABB intersection."""
-        fem_lb = fem_lb_field[None]
-        fem_ub = fem_ub_field[None]
+        fem_lb_np = np.asarray(fem_lb_field.numpy()[0], dtype=np.float32).reshape(-1)
+        fem_ub_np = np.asarray(fem_ub_field.numpy()[0], dtype=np.float32).reshape(-1)
 
-        # Global bounding box for the grid — still covers all mesh rigids
-        # so that SH cells are valid for any FEM query point.
-        global_lb = ti.Vector([ti.f32(1e9) for _ in range(self.d)])
-        global_ub = ti.Vector([ti.f32(-1e9) for _ in range(self.d)])
+        mesh2rigid = self.mesh2RigidIndices.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        aabb = self.aabb.numpy()
+        elem_offsets = self.meshBoundaryElementOffset.numpy()
+        elem_counts = self.meshBoundaryElementCount.numpy()
+        elements = self.meshBoundaryElements.numpy()
+        coords = self.meshBoundaryCoords.numpy()
+
+        global_lb = np.array([1e9, 1e9], dtype=np.float32)
+        global_ub = np.array([-1e9, -1e9], dtype=np.float32)
 
         for k in range(self.numMesh):
-            rigid_id = self.mesh2RigidIndices[k]
-            domain_id = self.rigidDomainIds[rigid_id][0]
-            rigid_lb_k = self.aabb[domain_id, 0]
-            rigid_ub_k = self.aabb[domain_id, 1]
-            # Use FEM-rigid intersection for tighter grid bounds
-            isect_lb_k = ti.max(rigid_lb_k, fem_lb) - contact_margin
-            isect_ub_k = ti.min(rigid_ub_k, fem_ub) + contact_margin
-            has_isect_k = True
-            for d_idx in ti.static(range(self.d)):
-                if isect_lb_k[d_idx] > isect_ub_k[d_idx]:
-                    has_isect_k = False
-            if has_isect_k:
-                global_lb = ti.min(global_lb, isect_lb_k)
-                global_ub = ti.max(global_ub, isect_ub_k)
+            rigid_id = int(mesh2rigid[k])
+            domain_id = int(domain_ids[rigid_id][0])
+            rigid_lb_k = aabb[domain_id, 0]
+            rigid_ub_k = aabb[domain_id, 1]
+            isect_lb_k = np.maximum(rigid_lb_k, fem_lb_np) - contact_margin
+            isect_ub_k = np.minimum(rigid_ub_k, fem_ub_np) + contact_margin
+            if np.all(isect_lb_k <= isect_ub_k):
+                global_lb = np.minimum(global_lb, isect_lb_k)
+                global_ub = np.maximum(global_ub, isect_ub_k)
 
         if global_lb[0] <= global_ub[0]:
-            expand = (global_ub - global_lb).max() * 0.05 + contact_margin
-            global_lb -= expand
-            global_ub += expand
+            expand = float(np.max(global_ub - global_lb)) * 0.05 + contact_margin
+            global_lb = global_lb - expand
+            global_ub = global_ub + expand
 
             for k in range(self.numMesh):
-                rigid_id = self.mesh2RigidIndices[k]
-                domain_id = self.rigidDomainIds[rigid_id][0]
-                rigid_lb = self.aabb[domain_id, 0]
-                rigid_ub = self.aabb[domain_id, 1]
+                rigid_id = int(mesh2rigid[k])
+                domain_id = int(domain_ids[rigid_id][0])
+                rigid_lb = aabb[domain_id, 0]
+                rigid_ub = aabb[domain_id, 1]
+                isect_lb = np.maximum(rigid_lb, fem_lb_np) - contact_margin
+                isect_ub = np.minimum(rigid_ub, fem_ub_np) + contact_margin
+                has_isect = bool(np.all(isect_lb <= isect_ub))
 
-                # Intersection of rigid AABB and FEM contact AABB (+ margin)
-                isect_lb = ti.max(rigid_lb, fem_lb) - contact_margin
-                isect_ub = ti.min(rigid_ub, fem_ub) + contact_margin
-
-                # If no intersection, skip all elements of this rigid
-                has_isect = True
-                for d_idx in ti.static(range(self.d)):
-                    if isect_lb[d_idx] > isect_ub[d_idx]:
-                        has_isect = False
-
-                elem_offset = self.meshBoundaryElementOffset[k]
-                num_elems = self.meshBoundaryElementCount[k]
+                elem_offset = int(elem_offsets[k])
+                num_elems = int(elem_counts[k])
                 for eidx in range(num_elems):
                     global_eidx = elem_offset + eidx
-                    conn = self.meshBoundaryElements[global_eidx]
+                    conn = elements[global_eidx]
+                    lb = np.array([1e30, 1e30], dtype=np.float32)
+                    ub = np.array([-1e30, -1e30], dtype=np.float32)
+                    for j in range(3):
+                        if int(conn[j]) >= 0:
+                            coord = coords[int(conn[j])]
+                            lb = np.minimum(lb, coord[:2])
+                            ub = np.maximum(ub, coord[:2])
 
-                    lb = ti.Vector([ti.f32(1e30) for _ in range(self.d)])
-                    ub = ti.Vector([ti.f32(-1e30) for _ in range(self.d)])
-                    for j in ti.static(range(3)):
-                        if conn[j] >= 0:
-                            coord = self.meshBoundaryCoords[conn[j]]
-                            lb = ti.min(lb, coord)
-                            ub = ti.max(ub, coord)
+                    _patch_array(self.meshElemLB, global_eidx, (float(lb[0]), float(lb[1])))
+                    _patch_array(self.meshElemUB, global_eidx, (float(ub[0]), float(ub[1])))
+                    margin_base = self.meshRigidContactMarginRatio * float(np.linalg.norm(ub - lb)) + velocity_buffer
+                    _patch_array(self.meshElemMarginBase, global_eidx, margin_base)
 
-                    self.meshElemLB[global_eidx] = lb
-                    self.meshElemUB[global_eidx] = ub
-                    # consider element margin and velocity buffer
-                    self.meshElemMarginBase[global_eidx] = (
-                        self.meshRigidContactMarginRatio * (ub - lb).norm() + velocity_buffer
-                    )
-
-                    # Only insert if element AABB overlaps the FEM-rigid intersection
                     if has_isect:
-                        overlaps = True
-                        for d_idx in ti.static(range(self.d)):
-                            if ub[d_idx] < isect_lb[d_idx] or lb[d_idx] > isect_ub[d_idx]:
-                                overlaps = False
+                        overlaps = bool(np.all(ub >= isect_lb) and np.all(lb <= isect_ub))
                         if overlaps:
                             self.spatialHash.addElement(lb, ub, rigid_id, global_eidx, velocity_buffer)
         else:
-            global_lb = ti.Vector([ti.f32(0.0) for _ in range(self.d)])
-            global_ub = ti.Vector([ti.f32(1.0) for _ in range(self.d)])
+            global_lb = np.array([0.0, 0.0], dtype=np.float32)
+            global_ub = np.array([1.0, 1.0], dtype=np.float32)
 
         self.spatialHash.setBounds(global_lb, global_ub)
 
-    @ti.kernel
     def update_mesh_element_aabbs(self):
         """Refresh cached mesh element AABBs from current transformed coords."""
+        elem_offsets = self.meshBoundaryElementOffset.numpy()
+        elem_counts = self.meshBoundaryElementCount.numpy()
+        elements = self.meshBoundaryElements.numpy()
+        coords = self.meshBoundaryCoords.numpy()
+        ratio = self.meshRigidContactMarginRatio
+
         for k in range(self.numMesh):
-            elem_offset = self.meshBoundaryElementOffset[k]
-            num_elems = self.meshBoundaryElementCount[k]
+            elem_offset = int(elem_offsets[k])
+            num_elems = int(elem_counts[k])
             for eidx in range(num_elems):
                 global_eidx = elem_offset + eidx
-                conn = self.meshBoundaryElements[global_eidx]
-                lb = ti.Vector([1e30 for _ in range(self.d)])
-                ub = ti.Vector([-1e30 for _ in range(self.d)])
-                for j in ti.static(range(3)):
+                conn = elements[global_eidx]
+                lb = wp.vec2(1e30, 1e30)
+                ub = wp.vec2(-1e30, -1e30)
+                for j in range(3):
                     if conn[j] >= 0:
-                        coord = self.meshBoundaryCoords[conn[j]]
-                        lb = ti.min(lb, coord)
-                        ub = ti.max(ub, coord)
-                self.meshElemLB[global_eidx] = lb
-                self.meshElemUB[global_eidx] = ub
-                self.meshElemMarginBase[global_eidx] = self.meshRigidContactMarginRatio * (ub - lb).norm()
+                        coord = coords[conn[j]]
+                        c = wp.vec2(float(coord[0]), float(coord[1]))
+                        lb = wp.min(lb, c)
+                        ub = wp.max(ub, c)
+                _patch_array(self.meshElemLB, global_eidx, lb)
+                _patch_array(self.meshElemUB, global_eidx, ub)
+                _patch_array(
+                    self.meshElemMarginBase,
+                    global_eidx,
+                    ratio * (ub - wp.length(lb)),
+                )
 
     # ════════════════════════════════════════════════════════════════════
     # FUSED KERNELS — minimize kernel launch overhead (~0.12ms per launch)
     # ════════════════════════════════════════════════════════════════════
 
-    @ti.kernel
     def _rigidStep_and_precompute_kernel(self, dt: float, damping: float):
-        """Fused: precompute_rigid_transforms + rigidStep in 1 kernel launch.
-        Phase 1 precomputes world-frame inertia from current quaternion.
-        Phase 2 uses it for velocity integration (world-frame).
-        """
-        # ── Phase 1: Precompute rotation matrices + world inertia ──
-        for i in range(self.numRigids + self.numAnalytical):
+        """Fused: precompute_rigid_transforms + rigidStep in 1 kernel launch."""
+        wp.launch(
+            _rigid_step_wp,
+            dim=1,
+            inputs=[
+                float(dt),
+                float(damping),
+                int(self.numRigids),
+                int(self.numAnalytical),
+                self.bcNodes,
+                self.bcGValues,
+                self.bcTValues,
+                self.bcRValues,
+                self.mass,
+                self.inertia,
+                self.V,
+                self.RotV,
+                self.accumulated_impulse,
+                self.accumulated_rotational_impulse,
+                self.quat,
+                self.visual_angle,
+                self.cached_rotation_matrix,
+                self.cached_inertia_inv_2d,
+            ],
+        )
 
-            self.cached_rotation_matrix[i] = cal2DRotationMat(self.quat[i][0] + self.visual_angle[i])
-            I = self.inertia[i]
-            if I > 0.0:
-                self.cached_inertia_inv_2d[i] = 1.0 / I
-            else:
-                self.cached_inertia_inv_2d[i] = 1.0 / 1e-6
+    def _updateU_and_BBox_kernel(self, dt: float, update_bbox: int):
+        """Fused: position integration (updateU) + AABB update (updateBBox)."""
+        wp.launch(
+            _update_u_and_bbox_wp,
+            dim=1,
+            inputs=[
+                float(dt),
+                int(update_bbox),
+                int(self.numRigids),
+                int(self.numAnalytical),
+                1 if self.movingAnalytical else 0,
+                self.bcNodes,
+                self.bcTValues,
+                self.bcRValues,
+                self.V,
+                self.RotV,
+                self.U,
+                self.quat,
+                self.rigidParams,
+                self.accumulated_impulse,
+                self.accumulated_rotational_impulse,
+                self.rigidDomainIds,
+                self.radius,
+                self.cached_rotation_matrix,
+                self.aabb,
+            ],
+        )
+        # Mesh world coords / AABBs are not covered by the primitive AABB kernel.
+        if self.numMesh > 0:
+            self.precompute_rigid_transforms()
+            self.updateMeshCoords()
+            self._sh_mesh_needs_rebuild = True
 
-        # ── Phase 2: Velocity integration (using world-frame inertia) ──
-        for i in range(self.numRigids):
-            self._calculate_bc_for_index(i, dt)
-            V_i = self.V[i]
-            mass_i = self.mass[i]
-            I_i = self.accumulated_impulse[i]
-            RI_i = self.accumulated_rotational_impulse[i]
-
-            self.V[i] = V_i + I_i / mass_i
-            inertia_i = self.inertia[i]
-            self.RotV[i] += RI_i / (inertia_i + 1e-6)
-
-            # Rigid body velocity damping
-            damp_factor = ti.max(0.0, 1.0 - damping * dt)
-            self.V[i] *= damp_factor
-            self.RotV[i] *= damp_factor
-
-        # ── Phase 3: Apply enforced velocity/acceleration BCs ──
-        for i in range(self.numRigids + self.numAnalytical):
-            bc_type = self.bcNodes[i]
-            if (bc_type & ATYPE) != 0:
-                self.V[i] += self.bcTValues[i] * dt
-            if (bc_type & ROTATYPE) != 0:
-                self.RotV[i] += self.bcRValues[i] * dt
-
-    @ti.kernel
-    def _updateU_and_BBox_kernel(self, dt: float, update_bbox: ti.i32):
-        """Fused: position integration (updateU) + AABB update (updateBBox) in 1 kernel.
-        Saves ~0.12ms by eliminating one Python↔Taichi round trip.
-        """
-        # ── Phase 1: Integrate positions and quaternions ──
-        for i in range(self.numRigids + self.numAnalytical):
-            self._update_bc_for_index(i)
-            V_i = self.V[i]
-            du = V_i * dt
-            self.U[i] += du
-            self.rigidParams[i, 0] += du
-            omega = self.RotV[i]
-            drot = omega * dt
-            self.quat[i] += drot
-
-            if self.quat[i][0] > ti.math.pi:
-                self.quat[i][0] -= 2 * ti.math.pi
-            elif self.quat[i][0] < -ti.math.pi:
-                self.quat[i][0] += 2 * ti.math.pi
-
-        # ── Phase 2: Clear accumulated impulses for next substep ──
-        n_active = self.numRigids + self.numAnalytical
-        for i in range(n_active):
-            self.accumulated_impulse[i] = ti.Vector.zero(ti.f32, self.d)
-            self.accumulated_rotational_impulse[i] = ti.Vector.zero(ti.f32, 1)
-
-        # ── Phase 3: Update bounding boxes (conditional) ──
-        if update_bbox == 1:
-            # Primitive rigid AABBs
-            for i in range(self.numRigids):
-                self.getPrimitiveRigidBBox(i)
-
-            # Mesh rigid AABBs + coordinate transform
-            # Always update mesh coords and AABB — needed by FEM-rigid contact
-            # even when rigid-rigid contact is disabled.
-            for i in range(self.numMesh):
-                rigidIndice = self.mesh2RigidIndices[i]
-                pool_id = self.instance_pool_id[rigidIndice]
-                pool_node_offset = 0
-                num_nodes = 0
-                if pool_id >= 0:
-                    pool_node_offset = self.pool_node_offset[pool_id]
-                    num_nodes = self.pool_node_count[pool_id]
-                else:
-                    pool_node_offset = self.meshBoundaryNodeOffset[i]
-                    num_nodes = self.meshBoundaryNodeCount[i]
-                legacy_node_offset = self.meshBoundaryNodeOffset[i]
-                center = self.rigidParams[rigidIndice, 0]
-                scale = self.meshRigidScale[rigidIndice]
-                offset = self.meshRigidOffset[rigidIndice]
-                lb = ti.Vector([1e30 for _ in range(self.d)])
-                ub = ti.Vector([-1e30 for _ in range(self.d)])
-                for nid in range(num_nodes):
-                    lr = self.pool_boundary_lrs[pool_node_offset + nid]
-                    scaled = ti.Vector([lr[k] * scale[k] for k in ti.static(range(self.d))])
-                    coord = center + offset + self.cached_rotation_matrix[rigidIndice] @ scaled
-                    self.meshBoundaryCoords[legacy_node_offset + nid] = coord
-                    lb = ti.min(coord, lb)
-                    ub = ti.max(coord, ub)
-                domain_idx = self.rigidDomainIds[rigidIndice][0]
-                self.aabb[domain_idx, 0] = lb
-                self.aabb[domain_idx, 1] = ub
-
-            # Analytical plane AABBs
-            num_analytical = self.numAnalytical if self.movingAnalytical else 0
-            buffer = 0.1
-            large_span = 100.0
-            for i in range(num_analytical):
-                idx = i + self.numRigids
-                normal_local = self.rigidParams[idx, 1]
-                normal_world = self.cached_rotation_matrix[idx] @ normal_local
-                p = self.rigidParams[idx, 0]
-                lb = ti.Vector.zero(ti.f32, self.d)
-                ub = ti.Vector.zero(ti.f32, self.d)
-                tangent = ti.Vector([-normal_world[1], normal_world[0]])
-                lo_raw = p - tangent * large_span - normal_world * buffer
-                hi_raw = p + tangent * large_span + normal_world * buffer
-                lb = ti.Vector([min(float(lo_raw[k]), float(hi_raw[k])) for k in range(self.d)])
-                ub = ti.Vector([max(float(lo_raw[k]), float(hi_raw[k])) for k in range(self.d)])
-                self.aabb[idx, 0] = lb
-                self.aabb[idx, 1] = ub
-
-    # ════════════════════════════════════════════════════════════════════
-
-    @ti.kernel
     def _generate_ground_pairs_direct_kernel(self):
-        """Generate ground-rigid contact pairs directly without BVH broadphase.
+        """Generate ground-rigid contact pairs directly without BVH broadphase."""
+        wp.launch(
+            _generate_ground_pairs_wp,
+            dim=1,
+            inputs=[
+                int(self.numRigids),
+                int(self.numAnalytical),
+                int(self.MAX_GROUND_PAIRS),
+                self.rigidDomainIds,
+                self.compound_count,
+                self.category_bits,
+                self.collide_bits,
+                self.num_primitive_pairs,
+                self.num_ball_ball_pairs,
+                self.num_box_box_pairs,
+                self.num_box_ball_pairs,
+                self.num_seg_point_pairs,
+                self.num_seg_ball_pairs,
+                self.num_seg_seg_pairs,
+                self.num_mesh_pairs,
+                self.num_mixed_pairs,
+                self.num_groundprim_pairs,
+                self.num_groundmesh_pairs,
+                self.groundprim_pairs_buffer,
+                self.groundmesh_pairs_buffer,
+            ],
+        )
 
-        For parallel RL mode: analytical planes are infinite, so every rigid
-        is potentially in contact. Replaces BVH + classify for ground contacts.
-        Rigid-rigid pairs are NOT generated (envs are spatially isolated).
-        """
-        # Reset all pair counters
-        self.num_primitive_pairs[None] = 0
-        self.num_ball_ball_pairs[None] = 0
-        self.num_box_box_pairs[None] = 0
-        self.num_box_ball_pairs[None] = 0
-        self.num_seg_point_pairs[None] = 0
-        self.num_seg_ball_pairs[None] = 0
-        self.num_seg_seg_pairs[None] = 0
-        self.num_mesh_pairs[None] = 0
-        self.num_mixed_pairs[None] = 0
-        self.num_groundprim_pairs[None] = 0
-        self.num_groundmesh_pairs[None] = 0
-
-        # Pair every rigid with every analytical plane
-        for i in range(self.numRigids):
-            type_i = self.rigidDomainIds[i][1]
-            is_mesh_i = (type_i == RigidType.MESH) and (self.compound_count[i] == 0)
-            for j in range(self.numAnalytical):
-                anal_idx = self.numRigids + j
-                if self._mask_allows_pair(anal_idx, i) == 0:
-                    continue
-                if is_mesh_i:
-                    idx = ti.atomic_add(self.num_groundmesh_pairs[None], 1)
-                    if idx < self.MAX_GROUND_PAIRS:
-                        self.groundmesh_pairs_buffer[idx] = ti.Vector([anal_idx, i])
-                else:
-                    idx = ti.atomic_add(self.num_groundprim_pairs[None], 1)
-                    if idx < self.MAX_GROUND_PAIRS:
-                        self.groundprim_pairs_buffer[idx] = ti.Vector([anal_idx, i])
-
-    @ti.kernel
-    def update_joint_motor_velocity_targets_kernel(self, dt: ti.f32):
-        """Convert command targets to per-substep velocity targets for motor rows.
-
-        joint_control_target is treated as a command input and is never overwritten here.
-        For acceleration command mode, this performs: v_target = v_rel + a_cmd * dt.
-        """
+    def update_joint_motor_velocity_targets_kernel(self, dt: float):
+        """Convert command targets to per-substep velocity targets for motor rows."""
+        if self.numAnchors <= 0:
+            return
         for j in range(self.numAnchors):
-            if self.joint_has_motor[j] == 0:
+            if int(self.joint_has_motor.numpy()[j]) == 0:
                 continue
-            if self.joint_motor_target_mode[j] == 2:
+            mode = int(self.joint_motor_target_mode.numpy()[j])
+            cmd = float(self.joint_control_target.numpy()[j])
+            vel_limit = float(self.joint_params.numpy()[j][4])
+            if mode == 2:
                 continue
-
-            cmd = self.joint_control_target[j]
-            vel_limit = self.joint_params[j][4]
-            mode = self.joint_motor_target_mode[j]
-
-            vel_target = self.joint_motor_target_vel[j]
             if mode == 1:
-                vel_target += cmd * dt
-
+                vel_target = float(self.joint_motor_target_vel.numpy()[j]) + cmd * float(dt)
                 if vel_limit > 0.0:
-                    vel_target = ti.min(ti.max(vel_target, -vel_limit), vel_limit)
-                self.joint_motor_target_vel[j] = vel_target
+                    vel_target = max(min(vel_target, vel_limit), -vel_limit)
+                _patch_array(self.joint_motor_target_vel, j, vel_target)
             else:
-                self.joint_motor_target_vel[j] = cmd  # direct velocity target mode
+                _patch_array(self.joint_motor_target_vel, j, cmd)
 
-    @ti.kernel
-    def apply_joint_pd_velocity_kernel(self, dt: ti.f32):
+    def apply_joint_pd_velocity_kernel(self, dt: float):
         """PD control with per-joint stiffness/damping — VELOCITY-MOTOR output.
 
         Computes a velocity target from the PD position error and writes it
@@ -3150,83 +4347,87 @@ class RigidManager:
         The kd gain is used as optional pre-damping: the effective velocity
         written is  ω_target − (kd/kp) · ω_rel  when kp > 0.
         """
+        if self.numAnchors <= 0:
+            return
+        joint_id_a = self.joint_id_a.numpy()
+        joint_id_b = self.joint_id_b.numpy()
+        joint_axis = self.joint_axis.numpy()
+        joint_type = self.joint_type.numpy()
+        kpd = self.kpd_field.numpy()
+        joint_params = self.joint_params.numpy()
+        quat = self.quat.numpy()
+        quat_initial = self.quat_initial.numpy()
+        rot_v = self.RotV.numpy()
+        control_target = self.joint_control_target.numpy()
+        rigid_params = self.rigidParams.numpy()
+        lin_v = self.V.numpy()
+        motor_modes = self.joint_motor_target_mode.numpy().copy()
+        motor_vels = self.joint_motor_target_vel.numpy().copy()
+
         for j in range(self.numAnchors):
-            rigid_a = self.joint_id_a[j]
-            rigid_b = self.joint_id_b[j]
-            axis_local = self.joint_axis[j]
-            jointType = self.joint_type[j]
+            rigid_a = int(joint_id_a[j])
+            rigid_b = int(joint_id_b[j])
+            axis_local = joint_axis[j]
+            jointType = int(joint_type[j])
 
-            kp = self.kpd_field[j][0]
-            kd = self.kpd_field[j][1]
-            lower_limit = self.joint_params[j][2]  # joint lower limit
-            upper_limit = self.joint_params[j][3]  # joint upper limit
-            vel_limit = self.joint_params[j][4]  # velocity limit
+            kp = float(kpd[j][0])
+            kd = float(kpd[j][1])
+            lower_limit = float(joint_params[j][2])
+            upper_limit = float(joint_params[j][3])
+            vel_limit = float(joint_params[j][4])
 
-            if jointType == JointType.Revolute:  # JointType.Revolute
-                # Keep motor_mode = 0 so the velocity motor stays active
-                # and enforces the target we compute here.
-                self.joint_motor_target_mode[j] = 0  # set to velocity motor mode
-                # Ensure anchor BC is ROTVTYPE so _calculate_bc_for_index
-                # applies the PD output as a velocity (not acceleration).
-                qa = self.quat[rigid_a]
-                q0a = self.quat_initial[rigid_a]
-                qb = self.quat[rigid_b]
-                q0b = self.quat_initial[rigid_b]
-                wa = self.RotV[rigid_a]
-                wb = self.RotV[rigid_b]
+            if jointType == JointType.Revolute:
+                motor_modes[j] = 0
+                qa = float(quat[rigid_a])
+                q0a = float(quat_initial[rigid_a])
+                qb = float(quat[rigid_b])
+                q0b = float(quat_initial[rigid_b])
+                wa = float(rot_v[rigid_a])
+                wb = float(rot_v[rigid_b])
 
-                angle = ((qb - q0b) - (qa - q0a))[0]
-                target_pos = self.joint_control_target[j]  # j = local anchor index
+                angle = (qb - q0b) - (qa - q0a)
+                target_pos = float(control_target[j])
 
-                # Clamp target to joint limits to prevent motor from fighting with limit constraint
                 if lower_limit < upper_limit:
-                    target_pos = ti.min(ti.max(target_pos, lower_limit), upper_limit)
+                    target_pos = min(max(target_pos, lower_limit), upper_limit)
 
-                # Wrap error to [-pi, pi] to avoid discontinuity at ±pi
-                pos_err = ti.atan2(ti.sin(target_pos - angle), ti.cos(target_pos - angle))
-                # Optional damping pre-correction
-                w_rel = (wb - wa)[0]
-                ctrl_dt = self.control_dt
+                pos_err = float(np.arctan2(np.sin(target_pos - angle), np.cos(target_pos - angle)))
+                w_rel = wb - wa
+                ctrl_dt = float(self.control_dt)
                 vel_target = kp / ctrl_dt * pos_err - kd * w_rel
-                # Control-period safety cap: avoid overshooting the target in one control step.
-                # Uses control_dt (frame_dt or policy_dt), NOT substep_dt.
-                # max_step_gain < 1 keeps some margin for solver/contact coupling.
                 max_step_gain = 0.5
-                ctrl_dt = self.control_dt
                 if ctrl_dt > 0.0:
-                    max_vel_from_error = max_step_gain * ti.abs(pos_err) / ctrl_dt
-                    vel_target = ti.min(ti.max(vel_target, -max_vel_from_error), max_vel_from_error)
-                # Clamp by velocity limit
+                    max_vel_from_error = max_step_gain * abs(pos_err) / ctrl_dt
+                    vel_target = min(max(vel_target, -max_vel_from_error), max_vel_from_error)
                 if vel_limit > 0.0:
-                    vel_target = ti.min(ti.max(vel_target, -vel_limit), vel_limit)
-                # Feed velocity motor target without mutating command input
-                self.joint_motor_target_vel[j] = vel_target
+                    vel_target = min(max(vel_target, -vel_limit), vel_limit)
+                motor_vels[j] = vel_target
             elif jointType == JointType.Prismatic:
-                target_pos = self.joint_control_target[j]
-                posA = self.rigidParams[rigid_a, 0]
-                posB = self.rigidParams[rigid_b, 0]
-                axis_world = ti.Vector.zero(ti.f32, self.d)
-                axis_world = axis_local
-                
-                rel_pos = (posB - posA).dot(axis_world)
+                target_pos = float(control_target[j])
+                posA = rigid_params[rigid_a, 0]
+                posB = rigid_params[rigid_b, 0]
+                axis_world = np.asarray(axis_local, dtype=np.float32).reshape(-1)
+                rel_pos = float(np.dot(posB - posA, axis_world[:2]))
                 pos_err = target_pos - rel_pos
 
-                vel_err = (self.V[rigid_b] - self.V[rigid_a]).dot(axis_world)
+                vel_err = float(np.dot(lin_v[rigid_b] - lin_v[rigid_a], axis_world[:2]))
                 vel_target = kp * pos_err - kd * vel_err
 
                 max_step_gain = 0.5
-                ctrl_dt = self.control_dt
+                ctrl_dt = float(self.control_dt)
                 if ctrl_dt > 0.0:
-                    max_vel_from_error = max_step_gain * ti.abs(pos_err) / ctrl_dt
-                    vel_target = ti.min(ti.max(vel_target, -max_vel_from_error), max_vel_from_error)
+                    max_vel_from_error = max_step_gain * abs(pos_err) / ctrl_dt
+                    vel_target = min(max(vel_target, -max_vel_from_error), max_vel_from_error)
 
                 if vel_limit > 0.0:
-                    vel_target = ti.min(ti.max(vel_target, -vel_limit), vel_limit)
+                    vel_target = min(max(vel_target, -vel_limit), vel_limit)
 
-                self.joint_motor_target_vel[j] = vel_target
+                motor_vels[j] = vel_target
 
-    @ti.kernel
-    def apply_joint_pd_torque_kernel(self, dt: ti.f32):
+        self.joint_motor_target_mode.assign(motor_modes)
+        self.joint_motor_target_vel.assign(motor_vels)
+
+    def apply_joint_pd_torque_kernel(self, dt: float):
         """PD control with per-joint stiffness/damping — TORQUE output.
 
         Computes τ = kp * (target − angle) − kd * ω_rel
@@ -3235,75 +4436,74 @@ class RigidManager:
         to world frame and apply ±τ on the connected bodies as accumulated_rotational_impulse
         (external torque), identical to how MuJoCo / Isaac Lab operate.
         """
+        if self.numAnchors <= 0:
+            return
+        joint_id_a = self.joint_id_a.numpy()
+        joint_id_b = self.joint_id_b.numpy()
+        joint_type = self.joint_type.numpy()
+        kpd = self.kpd_field.numpy()
+        joint_params = self.joint_params.numpy()
+        quat = self.quat.numpy()
+        quat_initial = self.quat_initial.numpy()
+        rot_v = self.RotV.numpy()
+        control_target = self.joint_control_target.numpy()
+        inertia = self.inertia.numpy()
+        motor_modes = self.joint_motor_target_mode.numpy().copy()
+        accum_rot = self.accumulated_rotational_impulse.numpy().copy()
 
         for j in range(self.numAnchors):
-            rigid_a = self.joint_id_a[j]
-            rigid_b = self.joint_id_b[j]
-            axis_local = self.joint_axis[j]
-            jointType = self.joint_type[j]
+            rigid_a = int(joint_id_a[j])
+            rigid_b = int(joint_id_b[j])
+            jointType = int(joint_type[j])
 
-            kp = self.kpd_field[j][0]
-            kd = self.kpd_field[j][1]
-            vel_limit = self.joint_params[j][4]  # velocity limit
-            effort_lim = self.joint_params[j][5]  # effort limit stored in joint params row 5
-            target_pos = self.joint_control_target[j]
+            kp = float(kpd[j][0])
+            kd = float(kpd[j][1])
+            vel_limit = float(joint_params[j][4])
+            effort_lim = float(joint_params[j][5])
+            target_pos = float(control_target[j])
 
             if jointType == 1:  # JointType.Revolute
-                self.joint_motor_target_mode[j] = 2  # set to torque mode
-                qa = self.quat[rigid_a]
-                q0a = self.quat_initial[rigid_a]
-                qb = self.quat[rigid_b]
-                q0b = self.quat_initial[rigid_b]
-                wa = self.RotV[rigid_a]
-                wb = self.RotV[rigid_b]
+                motor_modes[j] = 2
+                qa = float(quat[rigid_a])
+                q0a = float(quat_initial[rigid_a])
+                qb = float(quat[rigid_b])
+                q0b = float(quat_initial[rigid_b])
+                wa = float(rot_v[rigid_a])
+                wb = float(rot_v[rigid_b])
 
-                angle = ((qb - q0b) - (qa - q0a))[0]
-                w_rel = (wb - wa)[0]
-                # Wrap error to [-pi, pi] to avoid discontinuity at ±pi
-                pos_err = ti.atan2(ti.sin(target_pos - angle), ti.cos(target_pos - angle))
-                print(
-                    "Check angle and w_rel for joint", j, " angle:", angle, " w_rel:", w_rel, " pos_err:", pos_err
-                )
+                angle = (qb - q0b) - (qa - q0a)
+                w_rel = wb - wa
+                pos_err = float(np.arctan2(np.sin(target_pos - angle), np.cos(target_pos - angle)))
                 torque_mag = kp * pos_err - kd * w_rel
 
-                # Small deadband near target to suppress chatter.
-                if ti.abs(pos_err) < 1e-3 and ti.abs(w_rel) < 1e-3:
+                if abs(pos_err) < 1e-3 and abs(w_rel) < 1e-3:
                     torque_mag = 0.0
 
-                # Soft effort saturation reduces bang-bang behavior at the limit.
                 if effort_lim > 0.0:
-                    torque_mag = effort_lim * ti.tanh(torque_mag / (effort_lim + 1e-6))
+                    torque_mag = effort_lim * float(np.tanh(torque_mag / (effort_lim + 1e-6)))
+                    torque_mag = min(max(torque_mag, -effort_lim), effort_lim)
 
-                # First apply effort saturation.
-                if effort_lim > 0.0:
-                    torque_mag = ti.min(ti.max(torque_mag, -effort_lim), effort_lim)
-
-                # Predictive velocity limit: clamp torque so next-step relative
-                # angular velocity cannot exceed +/- vel_limit.
-                inertia_a = self.inertia[rigid_a]
-                inertia_b = self.inertia[rigid_b]
+                inertia_a = float(inertia[rigid_a])
+                inertia_b = float(inertia[rigid_b])
                 alpha_per_tau = 1.0 / (inertia_a + 1e-6) + 1.0 / (inertia_b + 1e-6)
                 if vel_limit > 0.0 and dt > 0.0 and alpha_per_tau > 0.0:
                     tau_min = (-vel_limit - w_rel) / (dt * alpha_per_tau)
                     tau_max = (vel_limit - w_rel) / (dt * alpha_per_tau)
-                    torque_mag = ti.min(ti.max(torque_mag, tau_min), tau_max)
+                    torque_mag = min(max(torque_mag, tau_min), tau_max)
 
-                # Near target, if current speed cannot stop in time under effort
-                # limit, force braking torque to avoid limit-cycle oscillation.
                 if effort_lim > 0.0 and dt > 0.0 and alpha_per_tau > 0.0:
                     max_acc = effort_lim * alpha_per_tau
                     stopping_err = 0.5 * w_rel * w_rel / (max_acc + 1e-6)
-                    if ti.abs(pos_err) < stopping_err and pos_err * w_rel > 0.0:
+                    if abs(pos_err) < stopping_err and pos_err * w_rel > 0.0:
                         brake_tau = -w_rel / (dt * (alpha_per_tau + 1e-9))
-                        torque_mag = ti.min(ti.max(brake_tau, -effort_lim), effort_lim)
+                        torque_mag = min(max(brake_tau, -effort_lim), effort_lim)
 
-                # 2D: torque is scalar, stored in [0]
-                self.accumulated_rotational_impulse[rigid_a][0] -= torque_mag * dt
-                self.accumulated_rotational_impulse[rigid_b][0] += torque_mag * dt
-           
+                accum_rot[rigid_a] -= torque_mag * dt
+                accum_rot[rigid_b] += torque_mag * dt
 
+        self.joint_motor_target_mode.assign(motor_modes)
+        self.accumulated_rotational_impulse.assign(accum_rot)
 
-    @ti.func
     def _calculate_bc_for_index(self, idx, dt):
         """Accumulate boundary-condition forces/torques into accumulated_impulse
         and accumulated_rotational_impulse.
@@ -3311,219 +4511,153 @@ class RigidManager:
         NOTE: Also handles ROTVTYPE here so the motor target is available
         during PGS solve (before _updateU_and_BBox_kernel).
         """
-        bc_type = self.bcNodes[idx]
+        bc_nodes = self.bcNodes.numpy()
+        bc_type = int(bc_nodes[idx])
+        mass = self.mass.numpy()
+        bc_g = self.bcGValues.numpy()
+        bc_t = self.bcTValues.numpy()
+        bc_r = self.bcRValues.numpy()
+        accum = self.accumulated_impulse.numpy().copy()
+        accum_rot = self.accumulated_rotational_impulse.numpy().copy()
 
         # Linear: accumulate into accumulated_impulse
         if (bc_type & ATYPE) != 0:
-            self.accumulated_impulse[idx] = 0.0
+            accum[idx] = (0.0, 0.0)
         else:
             if (bc_type & GRAVITY) != 0:
-                # Prescribed acceleration -> equivalent force (overwrite, ignoring prior accumulations)
-                self.accumulated_impulse[idx] += self.mass[idx] * self.bcGValues[idx] * dt
-
+                accum[idx] = (
+                    float(accum[idx][0]) + float(mass[idx]) * float(bc_g[idx][0]) * float(dt),
+                    float(accum[idx][1]) + float(mass[idx]) * float(bc_g[idx][1]) * float(dt),
+                )
             if (bc_type & FORCETYPE) != 0:
-                self.accumulated_impulse[idx] += self.bcTValues[idx] * dt
+                accum[idx] = (
+                    float(accum[idx][0]) + float(bc_t[idx][0]) * float(dt),
+                    float(accum[idx][1]) + float(bc_t[idx][1]) * float(dt),
+                )
 
         # Angular: accumulate into accumulated_rotational_impulse
         if (bc_type & ROTATYPE) != 0:
-            self.accumulated_rotational_impulse[idx] = 0.0
+            accum_rot[idx] = 0.0
         elif (bc_type & TORQUETYPE) != 0:
-            self.accumulated_rotational_impulse[idx] += self.bcRValues[idx] * dt
+            accum_rot[idx] = float(accum_rot[idx]) + float(bc_r[idx]) * float(dt)
 
-    @ti.func
+        self.accumulated_impulse.assign(accum)
+        self.accumulated_rotational_impulse.assign(accum_rot)
+
     def _update_bc_for_index(self, i):
-        """Apply boundary conditions for rigid index i. Separated into ti.func for kernel reuse."""
-        bc_type = self.bcNodes[i]
-
+        """Apply boundary conditions for rigid index i."""
+        bc_nodes = self.bcNodes.numpy()
+        bc_type = int(bc_nodes[i])
+        bc_t = self.bcTValues.numpy()
+        bc_r = self.bcRValues.numpy()
         if (bc_type & VTYPE) != 0:
-            self.V[i] = self.bcTValues[i]
+            _patch_array(self.V, i, bc_t[i])
         elif (bc_type & UTYPE) != 0:
-            self.V[i] = ti.Vector.zero(ti.f32, self.d)
+            _patch_array(self.V, i, (0.0, 0.0))
         elif (bc_type & RTYPE) != 0:
-            self.V[i] = ti.Vector.zero(ti.f32, self.d)
-            self.RotV[i] = 0.0
+            _patch_array(self.V, i, (0.0, 0.0))
+            _patch_array(self.RotV, i, 0.0)
         if (bc_type & ROTVTYPE) != 0:
-            self.RotV[i] = self.bcRValues[i]
+            _patch_array(self.RotV, i, float(bc_r[i]))
 
-    @ti.func
-    def get_box_vertex(self, rigidIdx: ti.i32, v_idx: ti.i32):
-        center = self.rigidParams[rigidIdx, 0]
-        extent = self.rigidParams[rigidIdx, 1]
-
-        offset = ti.Vector.zero(ti.f32, self.d)
+    def get_box_vertex(self, rigidIdx: int, v_idx: int):
+        params = self.rigidParams.numpy()
+        center = params[rigidIdx, 0]
+        extent = params[rigidIdx, 1]
 
         # 0: - -, 1: + -, 2: + +, 3: - +
         sx = -1.0 if (v_idx == 0 or v_idx == 3) else 1.0
         sy = -1.0 if (v_idx == 0 or v_idx == 1) else 1.0
 
-        local_pos = 0.5 * ti.Vector([sx * extent[0], sy * extent[1]])
-        rotMat = self.cached_rotation_matrix[rigidIdx]
-        offset = rotMat @ local_pos
-       
+        local_pos = 0.5 * np.array([sx * extent[0], sy * extent[1]], dtype=np.float32)
+        rotMat = self.cached_rotation_matrix.numpy()[rigidIdx]
+        return center + rotMat @ local_pos
 
-        return center + offset
-
-    @ti.func
-    def getPrimitiveRigidBBox(self, rigidId: ti.i32):
+    def getPrimitiveRigidBBox(self, rigidId: int):
         """Compute and store AABB for a single primitive rigid based on packed params."""
-        rigid_type = self.rigidDomainIds[rigidId][1]
-        # Mesh rigids have their AABB computed in the dedicated mesh loop;
-        # skip here to avoid overwriting with zeros (no primitive geometry).
-        if rigid_type != RigidType.MESH:
-            center = self.rigidParams[rigidId, 0]
-            rotMat = self.cached_rotation_matrix[rigidId]
+        # Host path: launch full bbox update (cheap for small scenes).
+        self.updateBBox()
 
-            lb = ti.Vector.zero(ti.f32, self.d)
-            ub = ti.Vector.zero(ti.f32, self.d)
-
-            # ── Compound sub-colliders ──────────────────────────────────
-            n_sub = self.compound_count[rigidId]
-            if n_sub > 0:
-                base = self.compound_offset[rigidId]
-                # Initialize lb/ub from first sub-collider
-                wp0 = rotMat @ self.compound_local_pos[base] + center
-                r0 = self.compound_radius[base]
-                for dim in ti.static(range(self.d)):
-                    lb[dim] = wp0[dim] - r0
-                    ub[dim] = wp0[dim] + r0
-                for k in range(1, n_sub):
-                    wp = rotMat @ self.compound_local_pos[base + k] + center
-                    rk = self.compound_radius[base + k]
-                    for dim in ti.static(range(self.d)):
-                        lb[dim] = ti.min(lb[dim], wp[dim] - rk)
-                        ub[dim] = ti.max(ub[dim], wp[dim] + rk)
-            else:
-                # ── Single shape ────────────────────────────────────────
-                type = self.rigidDomainIds[rigidId][1]
-                primary = self.rigidParams[rigidId, 1]
-                radius = self.radius[rigidId]
-                if type == RigidType.BALL:
-                    lb, ub = getBallBBox(center, radius, rotMat)
-                elif type == RigidType.BOX:
-                    info = getBoxBBox(center, primary, rotMat)
-                    lb = info[0]
-                    ub = info[1]
-                elif type == RigidType.CAPSULE:
-                    lcdir = primary
-                    lb, ub = getCapsuleBBox(center, lcdir, radius, rotMat)
-
-            # Get global domain index and write to global AABB
-            domain_idx = self.rigidDomainIds[rigidId][0]
-            self.aabb[domain_idx, 0] = lb  # Lower bound
-            self.aabb[domain_idx, 1] = ub  # Upper bound
-
-    @ti.kernel
     def updateMeshCoords(self):
-        """Transform mesh boundary vertices to world space (no AABB).
+        """Transform mesh boundary vertices to world space and refresh mesh AABBs."""
+        if self.numMesh <= 0:
+            return
 
-        Reads rest-pose vertices from the instancing pool, applies
-        scale + cached_rotation_matrix + translation, and writes the
-        result to ``meshBoundaryCoords``.  This is the lightweight
-        alternative to ``updateBBox`` when only the transformed vertex
-        positions are needed.
-        """
-        for i in range(self.numMesh):
-            rigidIndice = self.mesh2RigidIndices[i]
-            pool_id = self.instance_pool_id[rigidIndice]
-            pool_node_offset = 0
-            num_nodes = 0
-            if pool_id >= 0:
-                pool_node_offset = self.pool_node_offset[pool_id]
-                num_nodes = self.pool_node_count[pool_id]
-            else:
-                pool_node_offset = self.meshBoundaryNodeOffset[i]
-                num_nodes = self.meshBoundaryNodeCount[i]
+        mesh2rigid = self.mesh2RigidIndices.numpy()
+        node_off = self.meshBoundaryNodeOffset.numpy()
+        node_cnt = self.meshBoundaryNodeCount.numpy()
+        pool_ids = self.instance_pool_id.numpy()
+        pool_node_off = self.pool_node_offset.numpy()
+        pool_node_cnt = self.pool_node_count.numpy()
+        pool_lrs = self.pool_boundary_lrs.numpy()
+        params = self.rigidParams.numpy()
+        quat = self.quat.numpy()
+        scales = self.meshRigidScale.numpy()
+        offsets = self.meshRigidOffset.numpy()
+        domain_ids = self.rigidDomainIds.numpy()
+        coords = self.meshBoundaryCoords.numpy().copy()
+        aabb = self.aabb.numpy().copy() if self.aabb is not None else None
 
-            legacy_node_offset = self.meshBoundaryNodeOffset[i]
-            center = self.rigidParams[rigidIndice, 0]
-            scale = self.meshRigidScale[rigidIndice]
-            offset = self.meshRigidOffset[rigidIndice]
+        for mid in range(self.numMesh):
+            rid = int(mesh2rigid[mid])
+            if rid < 0:
+                continue
+            pool_id = int(pool_ids[rid])
+            if pool_id < 0:
+                continue
+            n_off = int(node_off[mid])
+            n_cnt = int(node_cnt[mid])
+            p_off = int(pool_node_off[pool_id])
+            p_cnt = int(pool_node_cnt[pool_id])
+            n_use = min(n_cnt, p_cnt)
+            if n_use <= 0:
+                continue
 
-            for nid in range(num_nodes):
-                lr = self.pool_boundary_lrs[pool_node_offset + nid]
-                scaled = ti.Vector([lr[k] * scale[k] for k in ti.static(range(self.d))])
-                coord = center + offset + self.cached_rotation_matrix[rigidIndice] @ scaled
-                self.meshBoundaryCoords[legacy_node_offset + nid] = coord
+            center = params[rid, 0]
+            angle = float(quat[rid])
+            c = float(np.cos(angle))
+            s = float(np.sin(angle))
+            R = np.array([[c, -s], [s, c]], dtype=np.float32)
+            scale = scales[rid]
+            offset = offsets[rid]
 
-    @ti.kernel
+            lb = np.array([1e30, 1e30], dtype=np.float32)
+            ub = np.array([-1e30, -1e30], dtype=np.float32)
+            for i in range(n_use):
+                lr = pool_lrs[p_off + i]
+                local = np.array([float(lr[0]) * float(scale[0]), float(lr[1]) * float(scale[1])], dtype=np.float32)
+                world = center + offset + R @ local
+                coords[n_off + i] = world
+                lb = np.minimum(lb, world)
+                ub = np.maximum(ub, world)
+
+            if aabb is not None:
+                domain_idx = int(domain_ids[rid][0])
+                aabb[domain_idx, 0] = lb
+                aabb[domain_idx, 1] = ub
+
+        self.meshBoundaryCoords.assign(coords)
+        if aabb is not None:
+            self.aabb.assign(aabb)
+
     def updateBBox(self):
         """Recompute all primitive and mesh rigid bounding boxes (kernel)."""
-        for i in range(self.numRigids):
-            considercontact = self.rigidDomainIds[i][2]
-            self.getPrimitiveRigidBBox(i)
-
-        for i in range(self.numMesh):
-            rigidIndice = self.mesh2RigidIndices[i]
-
-            # Get pool geometry ID to read lrs directly from pool (memory efficient!)
-            pool_id = self.instance_pool_id[rigidIndice]
-            pool_node_offset = 0
-            num_nodes = 0
-            if pool_id >= 0:
-                # Read from shared pool geometry
-                pool_node_offset = self.pool_node_offset[pool_id]
-                num_nodes = self.pool_node_count[pool_id]
-            else:
-                # Fallback to legacy (shouldn't happen with current implementation)
-                pool_node_offset = self.meshBoundaryNodeOffset[i]
-                num_nodes = self.meshBoundaryNodeCount[i]
-
-            # Get legacy offset for writing transformed coords (per-instance)
-            legacy_node_offset = self.meshBoundaryNodeOffset[i]
-
-            # Get current transform (center, rotation, scale, offset)
-            center = self.rigidParams[rigidIndice, 0]
-            scale = self.meshRigidScale[rigidIndice]
-            offset = self.meshRigidOffset[rigidIndice]
-
-            # Initialize bbox with first transformed node
-            lb = ti.Vector([1e30 for _ in range(self.d)])
-            ub = ti.Vector([-1e30 for _ in range(self.d)])
-
-            # Transform each boundary node and update bbox
-            # Also update meshBoundaryCoords for contact detection
-            for nid in range(num_nodes):
-                # Read local position directly from pool (memory efficient - shared across all instances!)
-                lr = self.pool_boundary_lrs[pool_node_offset + nid]
-
-                # Apply scale, rotation, and translation (in that order)
-                scaled = ti.Vector([lr[i] * scale[i] for i in ti.static(range(self.d))])
-                coord = center + offset + self.cached_rotation_matrix[rigidIndice] @ scaled
-
-                # CRITICAL: Update meshBoundaryCoords for contact detection (per-instance)
-                self.meshBoundaryCoords[legacy_node_offset + nid] = coord
-
-                lb = ti.min(coord, lb)
-                ub = ti.max(coord, ub)
-
-            # Get global domain index and write to global AABB
-            domain_idx = self.rigidDomainIds[rigidIndice][0]
-            self.aabb[domain_idx, 0] = lb  # Lower bound
-            self.aabb[domain_idx, 1] = ub  # Upper bound
-
-        num_analytical = self.numAnalytical if self.movingAnalytical else 0
-
-        buffer = 0.1
-        large_span = 100.0
-        for i in range(num_analytical):
-            idx = i + self.numRigids
-            normal_local = self.rigidParams[idx, 1]
-            normal_world = self.cached_rotation_matrix[idx] @ normal_local
-
-            # update bbox
-            p = self.rigidParams[idx, 0]  # point on plane
-            lb = ti.Vector.zero(ti.f32, self.d)
-            ub = ti.Vector.zero(ti.f32, self.d)
-            tangent = ti.Vector([-normal_world[1], normal_world[0]])
-            # single tangent in 2D (perpendicular to normal)
-            lo_raw = p - tangent * large_span - normal_world * buffer
-            hi_raw = p + tangent * large_span + normal_world * buffer
-            # Ensure component-wise min/max so lo <= hi even if tangent points negative
-            lb = ti.Vector([min(float(lo_raw[i]), float(hi_raw[i])) for i in range(self.d)])
-            ub = ti.Vector([max(float(lo_raw[i]), float(hi_raw[i])) for i in range(self.d)])
-         
-            self.aabb[idx, 0] = lb
-            self.aabb[idx, 1] = ub
+        if self.aabb is None:
+            return
+        wp.launch(
+            _update_bbox_wp,
+            dim=1,
+            inputs=[
+                int(self.numRigids),
+                int(self.numAnalytical),
+                1 if self.movingAnalytical else 0,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.radius,
+                self.cached_rotation_matrix,
+                self.aabb,
+            ],
+        )
 
     # ===============================================================================
     # Some util functions
@@ -3540,19 +4674,24 @@ class RigidManager:
         if n == 0:
             return 0.0
 
-        V_np = self.V.to_numpy()[:n]
-        W_np = self.RotV.to_numpy()[:n]
+        V_np = self.V.numpy()[:n]
+        W_np = self.RotV.numpy()[:n]
 
-        rigid_ids = self.rigidDomainIds.to_numpy()[:n]
+        rigid_ids = self.rigidDomainIds.numpy()[:n]
         rigid_type = rigid_ids[:, 1]
-        rigid_params_np = self.rigidParams.to_numpy()[:n]
+        rigid_params_np = self.rigidParams.numpy()[:n]
         centers = rigid_params_np[:, 0, :]
         primary = rigid_params_np[:, 1, :]
-        radius_np = self.radius.to_numpy()[:n]
+        radius_np = self.radius.numpy()[:n]
 
         boundary_radius = np.zeros(n, dtype=np.float32)
         center_speed = np.linalg.norm(V_np, axis=1)
-        omega_speed = np.linalg.norm(W_np, axis=1)
+        # 2D RotV is a scalar per rigid (1-D); 3D would be a vector.
+        W_np = np.asarray(W_np)
+        if W_np.ndim == 1:
+            omega_speed = np.abs(W_np.astype(np.float32))
+        else:
+            omega_speed = np.linalg.norm(W_np, axis=1)
 
         # Primitive shapes
         ball_mask = rigid_type == int(RigidType.BALL)
@@ -3563,11 +4702,11 @@ class RigidManager:
         boundary_radius[cyl_cap_mask] = np.linalg.norm(primary[cyl_cap_mask], axis=1) + radius_np[cyl_cap_mask]
 
         # Compound sub-colliders: override with sub-collider envelope.
-        compound_count = self.compound_count.to_numpy()[:n]
-        compound_offset = self.compound_offset.to_numpy()[:n]
+        compound_count = self.compound_count.numpy()[:n]
+        compound_offset = self.compound_offset.numpy()[:n]
         if np.any(compound_count > 0):
-            sub_pos = self.compound_local_pos.to_numpy()
-            sub_radius = self.compound_radius.to_numpy()
+            sub_pos = self.compound_local_pos.numpy()
+            sub_radius = self.compound_radius.numpy()
             for rid in np.where(compound_count > 0)[0]:
                 off = int(compound_offset[rid])
                 cnt = int(compound_count[rid])
@@ -3580,10 +4719,10 @@ class RigidManager:
         # Mesh rigids: exact farthest transformed boundary node from center.
         mesh_mask = rigid_type == int(RigidType.MESH)
         if np.any(mesh_mask):
-            rigid2mesh = self.rigid2MeshIndices.to_numpy()[:n]
-            mesh_node_off = self.meshBoundaryNodeOffset.to_numpy()
-            mesh_node_cnt = self.meshBoundaryNodeCount.to_numpy()
-            mesh_coords = self.meshBoundaryCoords.to_numpy()
+            rigid2mesh = self.rigid2MeshIndices.numpy()[:n]
+            mesh_node_off = self.meshBoundaryNodeOffset.numpy()
+            mesh_node_cnt = self.meshBoundaryNodeCount.numpy()
+            mesh_coords = self.meshBoundaryCoords.numpy()
             for rid in np.where(mesh_mask)[0]:
                 mid = int(rigid2mesh[rid])
                 if mid < 0:
@@ -3606,17 +4745,34 @@ class RigidManager:
         """Batch draw all rigids efficiently by caching to_numpy() calls.
 
         Args:
-            gui: Taichi GUI object
+            gui: Viewer object (circle / line / lines)
             domains: List of domain objects
             colors: List of colors (one per domain), or None for default colors
-            resolution: Resolution parameter for drawing
+            resolution: Legacy pixel scale for GUIs without world-space helpers
         """
-        # Cache all numpy arrays once
+        # Prefer true world-space drawing when Viewer provides it (avoids
+        # radius*resolution vs window-width mismatch that oversized spheres).
+        circle = getattr(gui, "circle_world", None) or (
+            lambda pos, radius, color=0xFFFFFF: gui.circle(pos, color=color, radius=radius * resolution)
+        )
+        line = getattr(gui, "line_world", None) or (
+            lambda a, b, radius=0.002, color=0xFFFFFF: gui.line(a, b, radius=radius * resolution, color=color)
+        )
+        lines = gui.lines
+        # Cache all numpy arrays once (Warp 1.14+ forbids host item indexing).
         if self.numMesh > 0:
-            all_boundary_coords = self.meshBoundaryCoords.to_numpy()
-            all_boundary_elements = self.meshBoundaryElements.to_numpy()
+            all_boundary_coords = self.meshBoundaryCoords.numpy()
+            all_boundary_elements = self.meshBoundaryElements.numpy()
+            mesh_node_offsets = self.meshBoundaryNodeOffset.numpy()
+            mesh_node_counts = self.meshBoundaryNodeCount.numpy()
+            mesh_elem_offsets = self.meshBoundaryElementOffset.numpy()
+            mesh_elem_counts = self.meshBoundaryElementCount.numpy()
+            rigid2mesh = self.rigid2MeshIndices.numpy()
 
-        all_rigid_params = self.rigidParams.to_numpy()
+        all_rigid_params = self.rigidParams.numpy()
+        all_domain_ids = self.rigidDomainIds.numpy()
+        all_rot = self.cached_rotation_matrix.numpy()
+        all_radius = self.radius.numpy()
         # all_shape_coords removed
 
         # Draw each domain using cached data
@@ -3626,16 +4782,16 @@ class RigidManager:
 
             color = colors[i] if colors is not None and i < len(colors) else 0xFFFFFF
             ndOffset = domain.ndOffset
-            rtype = int(self.rigidDomainIds[ndOffset][1])
-            rotMat = self.cached_rotation_matrix[ndOffset].to_numpy()
+            rtype = int(all_domain_ids[ndOffset][1])
+            rotMat = all_rot[ndOffset]
 
             if rtype == RigidType.MESH:
                 # Draw mesh rigid
-                mesh_local_id = self.rigid2MeshIndices[ndOffset]
-                node_offset = self.meshBoundaryNodeOffset[mesh_local_id]
-                num_nodes = self.meshBoundaryNodeCount[mesh_local_id]
-                elem_offset = self.meshBoundaryElementOffset[mesh_local_id]
-                num_elems = self.meshBoundaryElementCount[mesh_local_id]
+                mesh_local_id = int(rigid2mesh[ndOffset])
+                node_offset = int(mesh_node_offsets[mesh_local_id])
+                num_nodes = int(mesh_node_counts[mesh_local_id])
+                elem_offset = int(mesh_elem_offsets[mesh_local_id])
+                num_elems = int(mesh_elem_counts[mesh_local_id])
 
                 # Slice from cached arrays
                 pos = all_boundary_coords[node_offset : node_offset + num_nodes, :2]
@@ -3643,13 +4799,13 @@ class RigidManager:
 
                 # 2D: draw edges
                 a, b = elements[:, 0], elements[:, 1]
-                gui.lines(pos[a], pos[b], radius=2, color=color)
+                lines(pos[a], pos[b], radius=2, color=color)
                 
             elif rtype == RigidType.BALL:
                 # Draw ball
                 center = all_rigid_params[ndOffset, 0, :2]
-                radius = self.radius[ndOffset]
-                gui.circle(center, radius=radius * resolution, color=color)
+                radius = float(all_radius[ndOffset])
+                circle(center, radius=radius, color=color)
 
             elif rtype == RigidType.BOX:
                 # Draw box
@@ -3670,7 +4826,7 @@ class RigidManager:
                 vertices = (rotMat @ corners_local.T).T + center
 
                 for j in range(4):
-                    gui.line(vertices[j], vertices[(j + 1) % 4], radius=2, color=color)
+                    line(vertices[j], vertices[(j + 1) % 4], radius=0.002, color=color)
            
 
             elif rtype == RigidType.CAPSULE:
@@ -3679,12 +4835,12 @@ class RigidManager:
                 lcdir = all_rigid_params[ndOffset, 1, :]
                 lc = (rotMat @ lcdir)[:2] + center
                 uc = center * 2 - lc
-                radius = self.radius[ndOffset]
+                radius = float(all_radius[ndOffset])
 
                 # Draw center line
-                gui.line(lc, uc, radius=radius * resolution, color=color)
+                line(lc, uc, radius=radius, color=color)
 
                 if rtype == RigidType.CAPSULE:
                     # Draw end caps
-                    gui.circle(lc, radius=radius * resolution, color=color)
-                    gui.circle(uc, radius=radius * resolution, color=color)
+                    circle(lc, radius=radius, color=color)
+                    circle(uc, radius=radius, color=color)

@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,12 +20,12 @@ from flatworld import (
     RigidBodyDomain,
     SolidProp,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_cylinder_wheel_rolling(headless=False):
 
-    ti.init(offline_cache=True, arch=ti.cpu, kernel_profiler=False)
+    init_sim()
 
     domains = []
 

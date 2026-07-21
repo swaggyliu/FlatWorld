@@ -10,11 +10,12 @@ sys.path.append(parent_dir)
 
 from flatworld import BallRigid, ExplicitLoop, FixedAll, Gravity, RigidBodyDomain
 from flatworld import PrismaticJoint, RevoluteJoint, WeldJoint
-import taichi as ti
+from test_utils import init_sim
+
+init_sim()
+
 
 def test_revolute_joint_link_preservation_2d():
-    ti.init(arch=ti.cpu)
-
     anchor_pos = [0.5, 0.9]
     lower_pos = [0.5, 0.7]
     radius = 0.02
@@ -34,8 +35,6 @@ def test_revolute_joint_link_preservation_2d():
 
 
 def test_weld_joint_2d():
-    ti.init(arch=ti.cpu)
-
     pos_a = [0.5, 0.9]
     pos_b = [0.5, 0.7]
 
@@ -52,8 +51,6 @@ def test_weld_joint_2d():
 
 
 def test_prismatic_joint_2d():
-    ti.init(arch=ti.cpu)
-
     pos_a = [0.5, 0.9]
     pos_b = [0.5, 0.7]
 
@@ -72,8 +69,6 @@ def test_prismatic_joint_2d():
 
 
 def test_double_pendulum_2d():
-    ti.init(arch=ti.cpu)
-
     p0 = [0.5, 0.9]
     p1 = [0.6, 0.7]
     p2 = [0.7, 0.5]

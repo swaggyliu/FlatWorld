@@ -1,6 +1,6 @@
 # Flat World 物理引擎 — 理论与实现文档
 
-> **Flat World**（FlatWorld）是基于 [Taichi](https://www.taichi-lang.org/) 的实时多物理场仿真平台，支持 **刚体动力学**、**有限元法（FEM）**、**弹簧-质量系统**，以及三种静态地面表示：**解析平面（Ground）**、**高度场（HeightField）**、**体素网格（Voxel）**。
+> **Flat World**（FlatWorld）是基于 [NVIDIA Warp](https://nvidia.github.io/warp/) 的实时多物理场仿真平台，支持 **刚体动力学**、**有限元法（FEM）**、**弹簧-质量系统**，以及三种静态地面表示：**解析平面（Ground）**、**高度场（HeightField）**、**体素网格（Voxel）**。
 
 ---
 
@@ -25,8 +25,8 @@
 | 组件 | 说明 |
 |------|------|
 | 语言 | Python 3 |
-| 计算后端 | Taichi（GPU/CPU 并行内核） |
-| 依赖 | numpy, scipy, meshio, tetgen, pymeshlab, usd-core, pytest |
+| 计算后端 | NVIDIA Warp（GPU/CPU 并行内核） |
+| 依赖 | warp-lang, numpy, scipy, meshio, tetgen, pymeshlab, usd-core, pytest |
 
 ### 1.2 目录结构
 
@@ -607,11 +607,11 @@ pytest test2D
 ### 9.1 FEM 自由落体
 
 ```python
-import taichi as ti
 import numpy as np
 from flatworld import Mesh, FemDomain, SolidProp, Elastic, Gravity, ExplicitLoop
+from flatworld.wp_init import ensure_warp
 
-ti.init(arch=ti.gpu)
+ensure_warp()
 
 conn = np.array([[0, 1, 3], [0, 3, 2]], dtype=np.int32)
 coords = np.array([[0.5, 0.5], [0.7, 0.5], [0.5, 0.7], [0.7, 0.7]], dtype=np.float32)

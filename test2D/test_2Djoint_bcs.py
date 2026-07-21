@@ -2,7 +2,6 @@ from math import pi
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -24,7 +23,7 @@ from flatworld import (
     RigidBodyDomain,
 )
 from flatworld.joints import PrismaticJoint, RevoluteJoint, WeldJoint
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Djoint_rotation(headless=False):
@@ -38,7 +37,7 @@ def test_2Djoint_rotation(headless=False):
 
     The test shows various rotation behaviors through joints connecting rigid bodies.
     """
-    ti.init(offline_cache=True, arch=ti.cpu, default_fp=ti.f32, debug=False)
+    init_sim()
 
     radius = 0.04
 
@@ -179,12 +178,12 @@ def test_2Djoint_rotation(headless=False):
 
             gui.show()
 
-    currentOrigin1 = looper.rigidManager.rigidParams[1, 0].to_numpy()
-    currentOrigin2 = looper.rigidManager.rigidParams[3, 0].to_numpy()
-    currentOrigin3 = looper.rigidManager.rigidParams[5, 0].to_numpy()
-    currentOrigin4 = looper.rigidManager.rigidParams[7, 0].to_numpy()
-    currentOrigin5 = looper.rigidManager.rigidParams[9, 0].to_numpy()
-    currentOrigin6 = looper.rigidManager.rigidParams[11, 0].to_numpy()
+    currentOrigin1 = looper.rigidManager.rigidParams.numpy()[1, 0]
+    currentOrigin2 = looper.rigidManager.rigidParams.numpy()[3, 0]
+    currentOrigin3 = looper.rigidManager.rigidParams.numpy()[5, 0]
+    currentOrigin4 = looper.rigidManager.rigidParams.numpy()[7, 0]
+    currentOrigin5 = looper.rigidManager.rigidParams.numpy()[9, 0]
+    currentOrigin6 = looper.rigidManager.rigidParams.numpy()[11, 0]
 
     print("currentOrigin1:", currentOrigin1)
     print("currentOrigin2:", currentOrigin2)

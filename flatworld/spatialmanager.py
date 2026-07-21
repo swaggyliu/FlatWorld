@@ -1,34 +1,507 @@
-import taichi as ti
+"""Sort-based spatial hash for fast point-to-element queries (NVIDIA Warp).
+
+Algorithm (counting-sort, parallelized):
+    1. ``add_element`` — register each element's AABB + domain tag
+       (call from a parallel ``@wp.kernel``).
+    2. ``set_bounds``  — store grid bounding box (call from same kernel).
+    3. ``build()``     — Python method that launches a sequence of kernels.
+    4. ``query_point`` / ``query_point_with_buffer`` — map query position to
+       cell(s), iterate the contiguous slice, filter by ``domainID``.
+
+Device code must call the module-level ``@wp.func`` helpers with explicit
+array arguments (Warp kernels cannot access ``self`` fields).  Class methods
+``addElement`` / ``setBounds`` / ``queryPoint`` / ``queryPointWithBuffer`` are
+host helpers that wrap those funcs for Python / smoke tests.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import warp as wp
+
+from wp_init import ensure_warp
 
 
-@ti.data_oriented
+# ---------------------------------------------------------------------------
+# Device helpers (call from @wp.kernel / @wp.func with manager arrays)
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def add_element(
+    lb: wp.vec2,
+    ub: wp.vec2,
+    domain_id: int,
+    element_id: int,
+    buffer: float,
+    max_elements: int,
+    num_elements: wp.array(dtype=int),
+    domain_ids: wp.array(dtype=wp.vec2i),
+    element_bbox: wp.array(dtype=wp.vec2, ndim=2),
+    estimate_size: wp.array(dtype=float),
+    sum_size: wp.array(dtype=float),
+):
+    """Register one element AABB into the spatial hash (device)."""
+    idx = int(wp.atomic_add(num_elements, 0, 1))
+    if idx < max_elements:
+        domain_ids[idx] = wp.vec2i(domain_id, element_id)
+        buf = wp.vec2(buffer, buffer)
+        buffer_lb = lb - buf
+        buffer_ub = ub + buf
+        element_bbox[idx, 0] = buffer_lb
+        element_bbox[idx, 1] = buffer_ub
+        diag = wp.length(buffer_ub - buffer_lb)
+        wp.atomic_min(estimate_size, 0, diag)
+        wp.atomic_add(sum_size, 0, diag)
+    else:
+        wp.printf("[SortedSH] MAX_ELEMENTS exceeded!\n")
+
+
+@wp.func
+def set_bounds(
+    lb: wp.vec2,
+    ub: wp.vec2,
+    global_bbox: wp.array(dtype=wp.vec2),
+):
+    """Store grid bounding box (device)."""
+    global_bbox[0] = lb
+    global_bbox[1] = ub
+
+
+@wp.func
+def _point_to_cell_id(
+    pos: wp.vec2,
+    total_cells: wp.array(dtype=int),
+    global_bbox: wp.array(dtype=wp.vec2),
+    grid_size: wp.array(dtype=wp.vec2),
+    cell_numbers: wp.array(dtype=wp.vec2i),
+):
+    cid = int(-1)
+    if total_cells[0] > 0:
+        gs = grid_size[0]
+        cn = cell_numbers[0]
+        delta = pos - global_bbox[0]
+        rel = wp.vec2i(
+            int(wp.floor(delta[0] / gs[0])),
+            int(wp.floor(delta[1] / gs[1])),
+        )
+        valid = True
+        if rel[0] < 0 or rel[0] >= cn[0]:
+            valid = False
+        if rel[1] < 0 or rel[1] >= cn[1]:
+            valid = False
+        if valid:
+            cid = rel[0] + rel[1] * cn[0]
+    return cid
+
+
+@wp.func
+def query_point(
+    pos: wp.vec2,
+    domain_id: int,
+    max_query: int,
+    total_cells: wp.array(dtype=int),
+    global_bbox: wp.array(dtype=wp.vec2),
+    grid_size: wp.array(dtype=wp.vec2),
+    cell_numbers: wp.array(dtype=wp.vec2i),
+    cell_start: wp.array(dtype=int),
+    cell_end: wp.array(dtype=int),
+    sorted_elem_idx: wp.array(dtype=int),
+    domain_ids: wp.array(dtype=wp.vec2i),
+    query_elids: wp.array(dtype=int),
+):
+    """Single-cell query; writes element ids into ``query_elids``, returns count."""
+    num_potentials = int(0)
+    cid = _point_to_cell_id(pos, total_cells, global_bbox, grid_size, cell_numbers)
+    tc = total_cells[0]
+    if 0 <= cid < tc:
+        start = cell_start[cid]
+        end = cell_end[cid]
+        for p in range(start, end):
+            ei = sorted_elem_idx[p]
+            if ei >= 0:
+                did = domain_ids[ei][0]
+                if did == domain_id or domain_id == -1:
+                    if num_potentials < max_query:
+                        query_elids[num_potentials] = domain_ids[ei][1]
+                        num_potentials += 1
+    return num_potentials
+
+
+@wp.func
+def query_point_with_buffer(
+    pos: wp.vec2,
+    buffer: float,
+    domain_id: int,
+    max_query: int,
+    total_cells: wp.array(dtype=int),
+    global_bbox: wp.array(dtype=wp.vec2),
+    grid_size: wp.array(dtype=wp.vec2),
+    cell_numbers: wp.array(dtype=wp.vec2i),
+    cell_start: wp.array(dtype=int),
+    cell_end: wp.array(dtype=int),
+    sorted_elem_idx: wp.array(dtype=int),
+    domain_ids: wp.array(dtype=wp.vec2i),
+    query_elids: wp.array(dtype=int),
+):
+    """Multi-cell query with AABB buffer; deduplicates by element id."""
+    num_potentials = int(0)
+    tc = total_cells[0]
+    if tc > 0:
+        buf = wp.vec2(buffer, buffer)
+        qlb = pos - buf
+        qub = pos + buf
+        gs = grid_size[0]
+        cn = cell_numbers[0]
+        origin = global_bbox[0]
+
+        dlb = qlb - origin
+        dub = qub - origin
+        lx = int(wp.floor(dlb[0] / gs[0]))
+        ly = int(wp.floor(dlb[1] / gs[1]))
+        ux = int(wp.floor(dub[0] / gs[0]))
+        uy = int(wp.floor(dub[1] / gs[1]))
+
+        lx = int(wp.max(lx, 0))
+        ly = int(wp.max(ly, 0))
+        lx = int(wp.min(lx, cn[0] - 1))
+        ly = int(wp.min(ly, cn[1] - 1))
+        ux = int(wp.max(ux, 0))
+        uy = int(wp.max(uy, 0))
+        ux = int(wp.min(ux, cn[0] - 1))
+        uy = int(wp.min(uy, cn[1] - 1))
+
+        for ix in range(lx, ux + 1):
+            for iy in range(ly, uy + 1):
+                cid = ix + iy * cn[0]
+                if 0 <= cid < tc:
+                    start = cell_start[cid]
+                    end = cell_end[cid]
+                    for p in range(start, end):
+                        ei = sorted_elem_idx[p]
+                        if ei >= 0:
+                            did = domain_ids[ei][0]
+                            if did == domain_id or domain_id == -1:
+                                elem_id = domain_ids[ei][1]
+                                already = int(0)
+                                for k in range(num_potentials):
+                                    # Dedup by element id (not internal index ei)
+                                    if query_elids[k] == elem_id:
+                                        already = 1
+                                if already == 0 and num_potentials < max_query:
+                                    query_elids[num_potentials] = elem_id
+                                    num_potentials += 1
+    return num_potentials
+
+
+# ---------------------------------------------------------------------------
+# Build kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _reset_kernel(
+    num_elements: wp.array(dtype=int),
+    num_pairs: wp.array(dtype=int),
+    estimate_size: wp.array(dtype=float),
+    sum_size: wp.array(dtype=float),
+    total_cells: wp.array(dtype=int),
+):
+    num_elements[0] = 0
+    num_pairs[0] = 0
+    estimate_size[0] = 1e30
+    sum_size[0] = 0.0
+    total_cells[0] = 0
+
+
+@wp.kernel
+def _build_grid_kernel(
+    max_cells: int,
+    estimate_size: wp.array(dtype=float),
+    global_bbox: wp.array(dtype=wp.vec2),
+    cell_numbers: wp.array(dtype=wp.vec2i),
+    grid_size: wp.array(dtype=wp.vec2),
+    total_cells: wp.array(dtype=int),
+):
+    cell_size = estimate_size[0] * 1.5
+    extent = global_bbox[1] - global_bbox[0]
+
+    max_cells_f = float(max_cells)
+    max_per_dim = wp.pow(max_cells_f, 0.5)
+    max_per_dim = wp.max(max_per_dim, 1.0)
+
+    min_cs_x = extent[0] / max_per_dim
+    min_cs_y = extent[1] / max_per_dim
+    cell_size = wp.max(cell_size, min_cs_x)
+    cell_size = wp.max(cell_size, min_cs_y)
+
+    cs = cell_size + 1e-6
+    nx = int(wp.max(wp.ceil(extent[0] / cs), 1.0))
+    ny = int(wp.max(wp.ceil(extent[1] / cs), 1.0))
+    cell_numbers[0] = wp.vec2i(nx, ny)
+    grid_size[0] = wp.vec2(extent[0] / float(nx), extent[1] / float(ny))
+
+    total = nx * ny
+    total_cells[0] = int(wp.min(total, max_cells))
+
+
+@wp.kernel
+def _expand_pairs_kernel(
+    num_elements: wp.array(dtype=int),
+    num_pairs: wp.array(dtype=int),
+    max_pairs: int,
+    total_cells: wp.array(dtype=int),
+    global_bbox: wp.array(dtype=wp.vec2),
+    grid_size: wp.array(dtype=wp.vec2),
+    cell_numbers: wp.array(dtype=wp.vec2i),
+    element_bbox: wp.array(dtype=wp.vec2, ndim=2),
+    pair_cell_id: wp.array(dtype=int),
+    pair_elem_idx: wp.array(dtype=int),
+):
+    i = wp.tid()
+    ne = num_elements[0]
+    if i >= ne:
+        return
+
+    elb = element_bbox[i, 0]
+    eub = element_bbox[i, 1]
+    gs = grid_size[0]
+    cn = cell_numbers[0]
+    origin = global_bbox[0]
+    tc = total_cells[0]
+
+    dlb = elb - origin
+    dub = eub - origin
+    lx = int(wp.floor(dlb[0] / gs[0]))
+    ly = int(wp.floor(dlb[1] / gs[1]))
+    ux = int(wp.floor(dub[0] / gs[0]))
+    uy = int(wp.floor(dub[1] / gs[1]))
+
+    lx = int(wp.max(lx, 0))
+    ly = int(wp.max(ly, 0))
+    lx = int(wp.min(lx, cn[0] - 1))
+    ly = int(wp.min(ly, cn[1] - 1))
+    ux = int(wp.max(ux, 0))
+    uy = int(wp.max(uy, 0))
+    ux = int(wp.min(ux, cn[0] - 1))
+    uy = int(wp.min(uy, cn[1] - 1))
+
+    for ix in range(lx, ux + 1):
+        for iy in range(ly, uy + 1):
+            cid = ix + iy * cn[0]
+            if cid < tc:
+                pidx = int(wp.atomic_add(num_pairs, 0, 1))
+                if pidx < max_pairs:
+                    pair_cell_id[pidx] = cid
+                    pair_elem_idx[pidx] = i
+
+
+@wp.kernel
+def _clear_cell_count_kernel(
+    cell_count: wp.array(dtype=int),
+    total_cells: wp.array(dtype=int),
+):
+    c = wp.tid()
+    if c < total_cells[0]:
+        cell_count[c] = 0
+
+
+@wp.kernel
+def _count_pairs_kernel(
+    num_pairs: wp.array(dtype=int),
+    max_pairs: int,
+    total_cells: wp.array(dtype=int),
+    pair_cell_id: wp.array(dtype=int),
+    cell_count: wp.array(dtype=int),
+):
+    p = wp.tid()
+    np_ = int(wp.min(num_pairs[0], max_pairs))
+    if p >= np_:
+        return
+    tc = total_cells[0]
+    cid = pair_cell_id[p]
+    if 0 <= cid < tc:
+        wp.atomic_add(cell_count, cid, 1)
+
+
+@wp.kernel
+def _prefix_sum_kernel(
+    cell_count: wp.array(dtype=int),
+    cell_offset: wp.array(dtype=int),
+    total_cells: wp.array(dtype=int),
+):
+    # Serial exclusive prefix-sum over cells (launch dim=1).
+    tc = total_cells[0]
+    if tc > 0:
+        cell_offset[0] = 0
+        for c in range(1, tc):
+            cell_offset[c] = cell_offset[c - 1] + cell_count[c - 1]
+
+
+@wp.kernel
+def _scatter_reset_cursors_kernel(
+    cell_count: wp.array(dtype=int),
+    cell_offset: wp.array(dtype=int),
+    total_cells: wp.array(dtype=int),
+):
+    c = wp.tid()
+    if c < total_cells[0]:
+        cell_count[c] = cell_offset[c]
+
+
+@wp.kernel
+def _scatter_pairs_kernel(
+    num_pairs: wp.array(dtype=int),
+    max_pairs: int,
+    total_cells: wp.array(dtype=int),
+    pair_cell_id: wp.array(dtype=int),
+    pair_elem_idx: wp.array(dtype=int),
+    cell_count: wp.array(dtype=int),
+    sorted_elem_idx: wp.array(dtype=int),
+):
+    p = wp.tid()
+    np_ = int(wp.min(num_pairs[0], max_pairs))
+    if p >= np_:
+        return
+    tc = total_cells[0]
+    cid = pair_cell_id[p]
+    if 0 <= cid < tc:
+        dest = int(wp.atomic_add(cell_count, cid, 1))
+        if dest < max_pairs:
+            sorted_elem_idx[dest] = pair_elem_idx[p]
+
+
+@wp.kernel
+def _write_cell_ranges_kernel(
+    cell_count: wp.array(dtype=int),
+    cell_offset: wp.array(dtype=int),
+    cell_start: wp.array(dtype=int),
+    cell_end: wp.array(dtype=int),
+    total_cells: wp.array(dtype=int),
+):
+    c = wp.tid()
+    if c < total_cells[0]:
+        cell_start[c] = cell_offset[c]
+        cell_end[c] = cell_count[c]
+
+
+@wp.kernel
+def _host_add_element_kernel(
+    lb: wp.vec2,
+    ub: wp.vec2,
+    domain_id: int,
+    element_id: int,
+    buffer: float,
+    max_elements: int,
+    num_elements: wp.array(dtype=int),
+    domain_ids: wp.array(dtype=wp.vec2i),
+    element_bbox: wp.array(dtype=wp.vec2, ndim=2),
+    estimate_size: wp.array(dtype=float),
+    sum_size: wp.array(dtype=float),
+):
+    add_element(
+        lb,
+        ub,
+        domain_id,
+        element_id,
+        buffer,
+        max_elements,
+        num_elements,
+        domain_ids,
+        element_bbox,
+        estimate_size,
+        sum_size,
+    )
+
+
+@wp.kernel
+def _host_set_bounds_kernel(
+    lb: wp.vec2,
+    ub: wp.vec2,
+    global_bbox: wp.array(dtype=wp.vec2),
+):
+    set_bounds(lb, ub, global_bbox)
+
+
+@wp.kernel
+def _host_query_point_kernel(
+    pos: wp.vec2,
+    domain_id: int,
+    max_query: int,
+    total_cells: wp.array(dtype=int),
+    global_bbox: wp.array(dtype=wp.vec2),
+    grid_size: wp.array(dtype=wp.vec2),
+    cell_numbers: wp.array(dtype=wp.vec2i),
+    cell_start: wp.array(dtype=int),
+    cell_end: wp.array(dtype=int),
+    sorted_elem_idx: wp.array(dtype=int),
+    domain_ids: wp.array(dtype=wp.vec2i),
+    query_elids: wp.array(dtype=int),
+    out_count: wp.array(dtype=int),
+):
+    out_count[0] = query_point(
+        pos,
+        domain_id,
+        max_query,
+        total_cells,
+        global_bbox,
+        grid_size,
+        cell_numbers,
+        cell_start,
+        cell_end,
+        sorted_elem_idx,
+        domain_ids,
+        query_elids,
+    )
+
+
+@wp.kernel
+def _host_query_point_with_buffer_kernel(
+    pos: wp.vec2,
+    buffer: float,
+    domain_id: int,
+    max_query: int,
+    total_cells: wp.array(dtype=int),
+    global_bbox: wp.array(dtype=wp.vec2),
+    grid_size: wp.array(dtype=wp.vec2),
+    cell_numbers: wp.array(dtype=wp.vec2i),
+    cell_start: wp.array(dtype=int),
+    cell_end: wp.array(dtype=int),
+    sorted_elem_idx: wp.array(dtype=int),
+    domain_ids: wp.array(dtype=wp.vec2i),
+    query_elids: wp.array(dtype=int),
+    out_count: wp.array(dtype=int),
+):
+    out_count[0] = query_point_with_buffer(
+        pos,
+        buffer,
+        domain_id,
+        max_query,
+        total_cells,
+        global_bbox,
+        grid_size,
+        cell_numbers,
+        cell_start,
+        cell_end,
+        sorted_elem_idx,
+        domain_ids,
+        query_elids,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Manager
+# ---------------------------------------------------------------------------
+
+
 class SpatialHashManager:
     """Sort-based spatial hash for fast point-to-element queries.
 
-    Algorithm (counting-sort, **parallelized**):
-        1. ``addElement`` — register each element's AABB + domain tag
-           (called from a parallel ``@ti.kernel``).
-        2. ``setBounds``  — store grid bounding box (call from same kernel).
-        3. ``build()``    — **Python method** that launches a sequence of
-           parallel ``@ti.kernel`` s:
-
-           a. Compute grid dimensions, clamp cell size to avoid overflow.
-           b. Expand elements to (cellID, elemIdx) pairs — parallel.
-           c. Count pairs per cell — parallel.
-           d. Exclusive prefix-sum → cell offsets — serial (cells only).
-           e. Scatter pairs + write ``cellStart``/``cellEnd`` — parallel.
-
-        4. ``queryPoint`` / ``queryPointWithBuffer`` — map query position to
-           cell(s), iterate the contiguous slice, filter by ``domainID``.
-
-    Memory is O(N + C).  No per-cell capacity limit.
-    Build is O(N + C) work, spread across GPU threads.
-
     Args:
-        d:            Spatial dimension (2 or 3).
+        d: Spatial dimension (2 only; 3D expand path was never complete).
         max_elements: Upper bound on boundary elements.
-        max_cells:    Upper bound on grid cells.
-        max_elements_per_cell: *Ignored* (API compatibility).
+        max_cells: Upper bound on grid cells.
+        max_elements_per_cell: Ignored (API compatibility).
         max_query_results: Max results returned per query call.
     """
 
@@ -40,327 +513,297 @@ class SpatialHashManager:
         max_elements_per_cell: int = 200,
         max_query_results: int = 512,
     ):
+        ensure_warp()
+        if d != 2:
+            raise ValueError(f"SpatialHashManager Warp migration supports d=2 only (got {d})")
+
         self.d = d
         self.MAX_ELEMENTS = max_elements
         self.MAX_CELLS = max_cells
-        self.max_cells_per_element = 3**d  # worst-case cells/elem
+        self.max_cells_per_element = 3**d
         self.MAX_PAIRS = max_elements * self.max_cells_per_element
         self.MAX_QUERY = max_query_results
-        self.MAX_ELEMENTS_PER_CELL = max_elements_per_cell  # legacy alias
+        self.MAX_ELEMENTS_PER_CELL = max_elements_per_cell
 
         mem_mb = (
             self.MAX_ELEMENTS * (d * 4 * 2 + 8)
-            + self.MAX_PAIRS * 8  # pairCellId + pairElemIdx
-            + self.MAX_PAIRS * 4  # _sortedElemIdx
-            + self.MAX_CELLS * 16  # count + offset + start + end
+            + self.MAX_PAIRS * 8
+            + self.MAX_PAIRS * 4
+            + self.MAX_CELLS * 16
         ) / 1e6
         print(
             f"[SortedSpatialHash] d={d}, elems={max_elements}, "
             f"cells={max_cells}, pairs={self.MAX_PAIRS} (~{mem_mb:.0f} MB)"
         )
 
-        # ── Grid metadata ──
-        self.globalbbox = ti.Vector.field(d, ti.f32, shape=2)
-        self.cellNumbers = ti.Vector.field(d, ti.i32, shape=())
-        self.total_cells = ti.field(ti.i32, shape=())
-        self.gridSize = ti.Vector.field(d, ti.f32, shape=())
-        self.estimateSize = ti.field(ti.f32, shape=())
-        self._sumSize = ti.field(ti.f32, shape=())
+        # Grid metadata
+        self.globalbbox = wp.zeros(2, dtype=wp.vec2)
+        self.cellNumbers = wp.zeros(1, dtype=wp.vec2i)
+        self.total_cells = wp.zeros(1, dtype=int)
+        self.gridSize = wp.zeros(1, dtype=wp.vec2)
+        self.estimateSize = wp.zeros(1, dtype=float)
+        self._sumSize = wp.zeros(1, dtype=float)
 
-        # ── Per-element (filled by addElement) ──
-        self.numElements = ti.field(ti.i32, shape=())
-        self.domainIds = ti.Vector.field(2, ti.i32, shape=self.MAX_ELEMENTS)
-        self.elementbbox = ti.Vector.field(d, ti.f32, shape=(self.MAX_ELEMENTS, 2))
+        # Per-element
+        self.numElements = wp.zeros(1, dtype=int)
+        self.domainIds = wp.zeros(self.MAX_ELEMENTS, dtype=wp.vec2i)
+        self.elementbbox = wp.zeros((self.MAX_ELEMENTS, 2), dtype=wp.vec2)
 
-        # ── Pair arrays: unsorted input ──
-        self.numPairs = ti.field(ti.i32, shape=())
-        self.pairCellId = ti.field(ti.i32, shape=self.MAX_PAIRS)
-        self.pairElemIdx = ti.field(ti.i32, shape=self.MAX_PAIRS)
+        # Pair arrays
+        self.numPairs = wp.zeros(1, dtype=int)
+        self.pairCellId = wp.zeros(self.MAX_PAIRS, dtype=int)
+        self.pairElemIdx = wp.zeros(self.MAX_PAIRS, dtype=int)
 
-        # ── Sorted output (cellId implicit via cellStart/End) ──
-        self._sortedElemIdx = ti.field(ti.i32, shape=self.MAX_PAIRS)
+        self._sortedElemIdx = wp.zeros(self.MAX_PAIRS, dtype=int)
 
-        # ── Cell scratch + result ──
-        self._cellCount = ti.field(ti.i32, shape=self.MAX_CELLS)
-        self._cellOffset = ti.field(ti.i32, shape=self.MAX_CELLS)
-        self.cellStart = ti.field(ti.i32, shape=self.MAX_CELLS)
-        self.cellEnd = ti.field(ti.i32, shape=self.MAX_CELLS)
+        self._cellCount = wp.zeros(self.MAX_CELLS, dtype=int)
+        self._cellOffset = wp.zeros(self.MAX_CELLS, dtype=int)
+        self.cellStart = wp.zeros(self.MAX_CELLS, dtype=int)
+        self.cellEnd = wp.zeros(self.MAX_CELLS, dtype=int)
 
-        # Potential query results (returned by queryPoint / queryPointWithBuffer)
-        self.queryElids = ti.field(ti.i32, shape=self.MAX_QUERY)
+        self.queryElids = wp.zeros(self.MAX_QUERY, dtype=int)
+        self._query_count = wp.zeros(1, dtype=int)
 
-    # ================================================================
-    #  Reset  (call from Python before each populate cycle)
-    # ================================================================
-    @ti.kernel
     def reset(self):
-        self.numElements[None] = 0
-        self.numPairs[None] = 0
-        self.estimateSize[None] = 1e30
-        self._sumSize[None] = 0.0
-        self.total_cells[None] = 0
+        """Reset counters before a populate cycle (host)."""
+        wp.launch(
+            _reset_kernel,
+            dim=1,
+            inputs=[
+                self.numElements,
+                self.numPairs,
+                self.estimateSize,
+                self._sumSize,
+                self.total_cells,
+            ],
+        )
 
-    # ================================================================
-    #  addElement  (@ti.func — call from a parallel kernel)
-    # ================================================================
-    @ti.func
-    def addElement(self, lb, ub, domainID: ti.i32, elementid: ti.i32, buffer):
-        idx = ti.atomic_add(self.numElements[None], 1)
-        if idx < self.MAX_ELEMENTS:
-            self.domainIds[idx][0] = domainID
-            self.domainIds[idx][1] = elementid
+    def addElement(self, lb, ub, domainID: int, elementid: int, buffer: float):
+        """Host helper to register one element. Device code: ``add_element``."""
+        lb_v = wp.vec2(float(lb[0]), float(lb[1]))
+        ub_v = wp.vec2(float(ub[0]), float(ub[1]))
+        wp.launch(
+            _host_add_element_kernel,
+            dim=1,
+            inputs=[
+                lb_v,
+                ub_v,
+                int(domainID),
+                int(elementid),
+                float(buffer),
+                self.MAX_ELEMENTS,
+                self.numElements,
+                self.domainIds,
+                self.elementbbox,
+                self.estimateSize,
+                self._sumSize,
+            ],
+        )
 
-            bufferlb = lb - buffer
-            bufferub = ub + buffer
-            self.elementbbox[idx, 0] = bufferlb
-            self.elementbbox[idx, 1] = bufferub
-
-            diag = (bufferub - bufferlb).norm()
-            ti.atomic_min(self.estimateSize[None], diag)
-            ti.atomic_add(self._sumSize[None], diag)
-        else:
-            print(f"\033[91m[SortedSH] MAX_ELEMENTS ({self.MAX_ELEMENTS}) " f"exceeded!\033[0m")
-
-    # ================================================================
-    #  setBounds  (@ti.func — call at end of addElement kernel)
-    # ================================================================
-    @ti.func
     def setBounds(self, lb, ub):
-        """Store grid bounding box from inside a Taichi kernel."""
-        self.globalbbox[0] = lb
-        self.globalbbox[1] = ub
+        """Host helper to store grid bounds. Device code: ``set_bounds``."""
+        lb_v = wp.vec2(float(lb[0]), float(lb[1]))
+        ub_v = wp.vec2(float(ub[0]), float(ub[1]))
+        wp.launch(
+            _host_set_bounds_kernel,
+            dim=1,
+            inputs=[lb_v, ub_v, self.globalbbox],
+        )
 
-    # ================================================================
-    #  build  (Python method — launches parallel kernels)
-    # ================================================================
     def build(self, lb=None, ub=None):
-        """Build the spatial hash after elements have been added.
-
-        Call from **Python** (not from inside a kernel).
-
-        Args:
-            lb, ub: Optional grid bounds (list / ndarray).  If omitted the
-                    bounds stored by ``setBounds()`` inside the addElement
-                    kernel are used.
-        """
+        """Build the spatial hash after elements have been added (host)."""
         if lb is not None:
-            self.globalbbox[0] = lb
-            self.globalbbox[1] = ub
-        self._build_grid_kernel()
-        if self.numElements[None] == 0:
+            self.setBounds(lb, ub)
+
+        wp.launch(
+            _build_grid_kernel,
+            dim=1,
+            inputs=[
+                self.MAX_CELLS,
+                self.estimateSize,
+                self.globalbbox,
+                self.cellNumbers,
+                self.gridSize,
+                self.total_cells,
+            ],
+        )
+
+        ne = int(self.numElements.numpy()[0])
+        if ne == 0:
             return
-        self._expand_pairs_kernel()
-        self._count_pairs_kernel()
-        self._prefix_sum_kernel()
-        self._scatter_and_index_kernel()
 
-    # ── K1: cell sizing (single-thread, clamp to MAX_CELLS) ─────────
-    @ti.kernel
-    def _build_grid_kernel(self):
-        cellSize = self.estimateSize[None] * 1.5
+        self.numPairs.zero_()
+        wp.launch(
+            _expand_pairs_kernel,
+            dim=ne,
+            inputs=[
+                self.numElements,
+                self.numPairs,
+                self.MAX_PAIRS,
+                self.total_cells,
+                self.globalbbox,
+                self.gridSize,
+                self.cellNumbers,
+                self.elementbbox,
+                self.pairCellId,
+                self.pairElemIdx,
+            ],
+        )
 
-        # print(f"Estimated cell size: {cellSize:.4f} (sumSize={self._sumSize[None]:.4f}, estimateSize={self.estimateSize[None]:.4f})")
+        tc = int(self.total_cells.numpy()[0])
+        np_ = int(min(int(self.numPairs.numpy()[0]), self.MAX_PAIRS))
 
-        extent = self.globalbbox[1] - self.globalbbox[0]
+        if tc > 0:
+            wp.launch(
+                _clear_cell_count_kernel,
+                dim=tc,
+                inputs=[self._cellCount, self.total_cells],
+            )
+        if np_ > 0:
+            wp.launch(
+                _count_pairs_kernel,
+                dim=np_,
+                inputs=[
+                    self.numPairs,
+                    self.MAX_PAIRS,
+                    self.total_cells,
+                    self.pairCellId,
+                    self._cellCount,
+                ],
+            )
 
-        # Clamp cell size so total_cells cannot exceed MAX_CELLS
-        max_cells_f = ti.cast(self.MAX_CELLS, ti.f32)
-        max_per_dim = ti.pow(max_cells_f, 1.0 / self.d)
-        max_per_dim = ti.max(max_per_dim, 1.0)
-        for k in ti.static(range(self.d)):
-            min_cs = extent[k] / max_per_dim
-            cellSize = ti.max(cellSize, min_cs)
+        wp.launch(
+            _prefix_sum_kernel,
+            dim=1,
+            inputs=[self._cellCount, self._cellOffset, self.total_cells],
+        )
 
-        gridNums = extent / (cellSize + 1e-6)
-        self.cellNumbers[None] = ti.max(ti.ceil(gridNums).cast(ti.i32), ti.Vector([1 for _ in range(self.d)]))
-        self.gridSize[None] = extent / self.cellNumbers[None].cast(ti.f32)
-        # print(f"SpatialHash gridSize: {self.gridSize[None]}, cellNumbers: {self.cellNumbers[None]}")
+        if tc > 0:
+            wp.launch(
+                _scatter_reset_cursors_kernel,
+                dim=tc,
+                inputs=[self._cellCount, self._cellOffset, self.total_cells],
+            )
+        if np_ > 0:
+            wp.launch(
+                _scatter_pairs_kernel,
+                dim=np_,
+                inputs=[
+                    self.numPairs,
+                    self.MAX_PAIRS,
+                    self.total_cells,
+                    self.pairCellId,
+                    self.pairElemIdx,
+                    self._cellCount,
+                    self._sortedElemIdx,
+                ],
+            )
+        if tc > 0:
+            wp.launch(
+                _write_cell_ranges_kernel,
+                dim=tc,
+                inputs=[
+                    self._cellCount,
+                    self._cellOffset,
+                    self.cellStart,
+                    self.cellEnd,
+                    self.total_cells,
+                ],
+            )
 
-        total = 1
-        for k in ti.static(range(self.d)):
-            total *= self.cellNumbers[None][k]
-        self.total_cells[None] = ti.min(total, self.MAX_CELLS)
+    def queryPoint(self, pos, domainID: int) -> int:
+        """Host helper. Device code: ``query_point`` with explicit arrays."""
+        pos_v = wp.vec2(float(pos[0]), float(pos[1]))
+        wp.launch(
+            _host_query_point_kernel,
+            dim=1,
+            inputs=[
+                pos_v,
+                int(domainID),
+                self.MAX_QUERY,
+                self.total_cells,
+                self.globalbbox,
+                self.gridSize,
+                self.cellNumbers,
+                self.cellStart,
+                self.cellEnd,
+                self._sortedElemIdx,
+                self.domainIds,
+                self.queryElids,
+                self._query_count,
+            ],
+        )
+        return int(self._query_count.numpy()[0])
 
-    # ── K2: expand elements → (cell, elem) pairs  (parallel) ────────
-    @ti.kernel
-    def _expand_pairs_kernel(self):
-        self.numPairs[None] = 0
-        for i in range(self.numElements[None]):
-            elb = self.elementbbox[i, 0]
-            eub = self.elementbbox[i, 1]
+    def queryPointWithBuffer(self, pos, buffer: float, domainID: int) -> int:
+        """Host helper. Device code: ``query_point_with_buffer``."""
+        pos_v = wp.vec2(float(pos[0]), float(pos[1]))
+        wp.launch(
+            _host_query_point_with_buffer_kernel,
+            dim=1,
+            inputs=[
+                pos_v,
+                float(buffer),
+                int(domainID),
+                self.MAX_QUERY,
+                self.total_cells,
+                self.globalbbox,
+                self.gridSize,
+                self.cellNumbers,
+                self.cellStart,
+                self.cellEnd,
+                self._sortedElemIdx,
+                self.domainIds,
+                self.queryElids,
+                self._query_count,
+            ],
+        )
+        return int(self._query_count.numpy()[0])
 
-            lpos = ti.floor((elb - self.globalbbox[0]) / self.gridSize[None]).cast(ti.i32)
-            upos = ti.floor((eub - self.globalbbox[0]) / self.gridSize[None]).cast(ti.i32)
-
-            lpos = ti.max(lpos, ti.Vector.zero(ti.i32, self.d))
-            lpos = ti.min(lpos, self.cellNumbers[None] - 1)
-            upos = ti.max(upos, ti.Vector.zero(ti.i32, self.d))
-            upos = ti.min(upos, self.cellNumbers[None] - 1)
-
-            for ix in range(lpos[0], upos[0] + 1):
-                for iy in range(lpos[1], upos[1] + 1):
-                    cid = ix + iy * self.cellNumbers[None][0]
-                    if cid < self.total_cells[None]:
-                        pidx = ti.atomic_add(self.numPairs[None], 1)
-                        if pidx < self.MAX_PAIRS:
-                            self.pairCellId[pidx] = cid
-                            self.pairElemIdx[pidx] = i
-           
-    # ── K3: count pairs per cell  (parallel) ────────────────────────
-    @ti.kernel
-    def _count_pairs_kernel(self):
-        tc = self.total_cells[None]
-        np_ = ti.min(self.numPairs[None], self.MAX_PAIRS)
-        # Clear counts
-        for c in range(tc):
-            self._cellCount[c] = 0
-        # Accumulate (atomic — safe under parallelism)
-        for p in range(np_):
-            cid = self.pairCellId[p]
-            if 0 <= cid < tc:
-                ti.atomic_add(self._cellCount[cid], 1)
-
-    # ── K4: exclusive prefix-sum  (serial over cells) ───────────────
-    @ti.kernel
-    def _prefix_sum_kernel(self):
-        tc = self.total_cells[None]
-        self._cellOffset[0] = 0
-        ti.loop_config(serialize=True)
-        for c in range(1, tc):
-            self._cellOffset[c] = self._cellOffset[c - 1] + self._cellCount[c - 1]
-
-    # ── K5: scatter pairs + set cell ranges  (parallel) ─────────────
-    @ti.kernel
-    def _scatter_and_index_kernel(self):
-        tc = self.total_cells[None]
-        np_ = ti.min(self.numPairs[None], self.MAX_PAIRS)
-        # Reset cursors to offsets
-        for c in range(tc):
-            self._cellCount[c] = self._cellOffset[c]
-        # Scatter (atomic cursor increment)
-        for p in range(np_):
-            cid = self.pairCellId[p]
-            if 0 <= cid < tc:
-                dest = ti.atomic_add(self._cellCount[cid], 1)
-                if dest < self.MAX_PAIRS:
-                    self._sortedElemIdx[dest] = self.pairElemIdx[p]
-        # Final cell ranges
-        for c in range(tc):
-            self.cellStart[c] = self._cellOffset[c]
-            self.cellEnd[c] = self._cellCount[c]
-
-    # ================================================================
-    #  Point → linearised cell ID
-    # ================================================================
-    @ti.func
-    def _point_to_cell_id(self, pos):
-        cid = -1
-        if self.total_cells[None] > 0:
-            rel = ti.floor((pos - self.globalbbox[0]) / self.gridSize[None]).cast(ti.i32)
-            valid = True
-            for k in ti.static(range(self.d)):
-                if rel[k] < 0 or rel[k] >= self.cellNumbers[None][k]:
-                    valid = False
-            if valid:
-                cid = rel[0] + rel[1] * self.cellNumbers[None][0]
-             
-        return cid
-
-    # ================================================================
-    #  queryPoint  (single cell, filter by domainID)
-    # ================================================================
-    @ti.func
-    def queryPoint(self, pos: ti.template(), domainID: ti.i32):
-        numPotentials = 0
-
-        cid = self._point_to_cell_id(pos)
-        if 0 <= cid < self.total_cells[None]:
-            start = self.cellStart[cid]
-            end = self.cellEnd[cid]
-            for p in range(start, end):
-                ei = self._sortedElemIdx[p]
-                if (ei >= 0 and self.domainIds[ei][0] == domainID) or (ei >= 0 and domainID == -1):
-                    if numPotentials < self.MAX_QUERY:
-                        self.queryElids[numPotentials] = self.domainIds[ei][1]
-                        numPotentials += 1
-        return numPotentials
-
-    # ================================================================
-    #  queryPointWithBuffer  (multi-cell, filter, deduplicate)
-    # ================================================================
-    @ti.func
-    def queryPointWithBuffer(self, pos: ti.template(), buffer: ti.f32, domainID: ti.i32):
-        numPotentials = 0
-
-        if self.total_cells[None] > 0:
-            qlb = pos - buffer
-            qub = pos + buffer
-
-            lpos = ti.floor((qlb - self.globalbbox[0]) / self.gridSize[None]).cast(ti.i32)
-            upos = ti.floor((qub - self.globalbbox[0]) / self.gridSize[None]).cast(ti.i32)
-
-            lpos = ti.max(lpos, ti.Vector.zero(ti.i32, self.d))
-            lpos = ti.min(lpos, self.cellNumbers[None] - 1)
-            upos = ti.max(upos, ti.Vector.zero(ti.i32, self.d))
-            upos = ti.min(upos, self.cellNumbers[None] - 1)
-
-            # print(f"Querying SH with buffer={buffer:.4f}, lpos={lpos}, upos={upos}")
-
-            for I in ti.grouped(ti.ndrange((lpos[0], upos[0] + 1), (lpos[1], upos[1] + 1))):
-                cid = I[0] + I[1] * self.cellNumbers[None][0]
-                if 0 <= cid < self.total_cells[None]:
-                    start = self.cellStart[cid]
-                    end = self.cellEnd[cid]
-                    for p in range(start, end):
-                        ei = self._sortedElemIdx[p]
-                        if (ei >= 0 and self.domainIds[ei][0] == domainID) or (ei >= 0 and domainID == -1):
-                            already = False
-                            for k in range(numPotentials):
-                                if self.queryElids[k] == self.domainIds[ei][1]:
-                                    already = True
-                                    break
-                            if not already and numPotentials < self.MAX_QUERY:
-                                self.queryElids[numPotentials] = self.domainIds[ei][1]
-                                numPotentials += 1
-           
-        return numPotentials
-
-    # ================================================================
-    #  Pretty-print
-    # ================================================================
     def __str__(self):
+        ne = int(self.numElements.numpy()[0])
+        np_ = int(self.numPairs.numpy()[0])
+        tc = int(self.total_cells.numpy()[0])
+        cn = self.cellNumbers.numpy()[0]
+        gs = self.gridSize.numpy()[0]
+        bb0 = self.globalbbox.numpy()[0]
+        bb1 = self.globalbbox.numpy()[1]
+        cell_start = self.cellStart.numpy()
+        cell_end = self.cellEnd.numpy()
+        sorted_idx = self._sortedElemIdx.numpy()
+
         lines = [
             f"SortedSpatialHash ({self.d}D)",
-            f"  Elements: {self.numElements[None]}/{self.MAX_ELEMENTS}",
-            f"  Pairs (elem x cell): {self.numPairs[None]}/{self.MAX_PAIRS}",
-            f"  Grid: {self.cellNumbers[None].to_numpy()}",
-            f"  Cell size: {self.gridSize[None].to_numpy()}",
-            f"  Total cells: {self.total_cells[None]}/{self.MAX_CELLS}",
-            f"  BBox: {self.globalbbox[0].to_numpy()} -> {self.globalbbox[1].to_numpy()}",
+            f"  Elements: {ne}/{self.MAX_ELEMENTS}",
+            f"  Pairs (elem x cell): {np_}/{self.MAX_PAIRS}",
+            f"  Grid: {cn}",
+            f"  Cell size: {gs}",
+            f"  Total cells: {tc}/{self.MAX_CELLS}",
+            f"  BBox: {bb0} -> {bb1}",
             "",
         ]
 
         non_empty = 0
         max_occ = 0
-        for i in range(self.total_cells[None]):
-            cnt = self.cellEnd[i] - self.cellStart[i]
+        for i in range(tc):
+            cnt = int(cell_end[i] - cell_start[i])
             if cnt > 0:
                 non_empty += 1
                 max_occ = max(max_occ, cnt)
 
         lines.append(
-            f"  Non-empty cells: {non_empty}/{self.total_cells[None]} "
-            f"({100*non_empty/max(self.total_cells[None], 1):.1f}%)"
+            f"  Non-empty cells: {non_empty}/{tc} "
+            f"({100 * non_empty / max(tc, 1):.1f}%)"
         )
         lines.append(f"  Max elements in a cell: {max_occ}")
-
         lines.append("  Cell contents (first 10 non-empty):")
+
         shown = 0
-        for i in range(min(self.total_cells[None], 10000)):
-            s, e = self.cellStart[i], self.cellEnd[i]
+        for i in range(min(tc, 10000)):
+            s, e = int(cell_start[i]), int(cell_end[i])
             cnt = e - s
             if cnt > 0:
-                elems = [int(self._sortedElemIdx[j]) for j in range(s, min(e, s + 10))]
+                elems = [int(sorted_idx[j]) for j in range(s, min(e, s + 10))]
                 tag = f"... ({cnt} total)" if cnt > 10 else ""
                 lines.append(f"    Cell {i}: {elems}{tag}")
                 shown += 1

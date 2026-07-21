@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,12 +21,12 @@ from flatworld import (
     RigidBodyDomain,
     SolidProp,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Drigid_contact(headless=False):
 
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
     numberRigid = 25
     domains = []
     colors = []
@@ -83,8 +82,8 @@ def test_2Drigid_contact(headless=False):
     print("\nPerforming quantitative penetration test...")
     # Get center positions and radii from rigid manager
     mgr = looper.rigidManager
-    params_np = mgr.rigidParams.to_numpy()
-    radius_np = mgr.radius.to_numpy()
+    params_np = mgr.rigidParams.numpy()
+    radius_np = mgr.radius.numpy()
     num_rigids = mgr.numRigids
 
     overlap_count = 0

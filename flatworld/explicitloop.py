@@ -2,15 +2,72 @@ from bvh import CollisionDetector
 from definitions import *
 from femcontact import ContactFlexRigid, contactHelper, ContactSpringRigid
 from femspringmanager import FemSpringManager
-from mixedcontact import MixedContact
+from mixedcontact import MixedContact, _assign_scalar, _host_np
 from rigidmanager import RigidManager
+from wp_init import ensure_warp
 import numpy as np
-import os
-import taichi as ti
-import time
+import warp as wp
 
 
-@ti.data_oriented
+# ---------------------------------------------------------------------------
+# Device kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _scan_bvh_pairs_stamp_kernel(
+    pairs: wp.array(dtype=wp.vec2i),
+    num_pairs: int,
+    stamp: int,
+    max_domains: int,
+    domain_type: wp.array(dtype=int),
+    bvh_domain_stamp: wp.array(dtype=int),
+    has_fem_spring_bvh_pair: wp.array(dtype=int),
+    fem_type: int,
+    spring_type: int,
+):
+    has_fem_spring_bvh_pair[0] = 0
+    for p in range(num_pairs):
+        a = pairs[p][0]
+        b = pairs[p][1]
+        if 0 <= a < max_domains:
+            bvh_domain_stamp[a] = stamp
+            ta = domain_type[a]
+            if ta == fem_type or ta == spring_type:
+                has_fem_spring_bvh_pair[0] = 1
+        if 0 <= b < max_domains:
+            bvh_domain_stamp[b] = stamp
+            tb = domain_type[b]
+            if tb == fem_type or tb == spring_type:
+                has_fem_spring_bvh_pair[0] = 1
+
+
+@wp.kernel
+def _filter_out_rigid_rigid_pairs_kernel(
+    collision_pairs: wp.array(dtype=wp.vec2i),
+    num_pairs: int,
+    max_domains: int,
+    domain_type: wp.array(dtype=int),
+    rigid_type: int,
+    out_pairs: wp.array(dtype=wp.vec2i),
+    out_count: wp.array(dtype=int),
+):
+    """Copy BVH pairs excluding rigid-rigid pairs when disabled by config."""
+    out_count[0] = 0
+    for p in range(num_pairs):
+        a = collision_pairs[p][0]
+        b = collision_pairs[p][1]
+        keep = True
+        if 0 <= a < max_domains and 0 <= b < max_domains:
+            ta = domain_type[a]
+            tb = domain_type[b]
+            if ta == rigid_type and tb == rigid_type:
+                keep = False
+        if keep:
+            out_idx = int(wp.atomic_add(out_count, 0, 1))
+            out_pairs[out_idx] = wp.vec2i(a, b)
+
+
 class ExplicitLoop(MixedContact):
     def __init__(
         self,
@@ -44,6 +101,7 @@ class ExplicitLoop(MixedContact):
             max_contact_velocity: Deprecated — ignored.  Spatial hashes are
                 rebuilt lazily each substep / every 1/600 s with no velocity buffer.
         """
+        ensure_warp()
 
         self.domains = domains
         self._consider_rigid_rigid_contact = considerRigidRigidContact
@@ -68,23 +126,21 @@ class ExplicitLoop(MixedContact):
 
         self.numDomains = len(domains)
         self._max_domains = self.numDomains + 10
-        # Consolidated AABB field: aabb[i][0] = lower bound, aabb[i][1] = upper bound
-        # Better memory locality when accessing domain bounding boxes
-        # Indexed by global domain index
-        self.aabb = ti.Vector.field(self.d, ti.f32, (self._max_domains, 2))
-        self._bvh_pairs_work = ti.Vector.field(2, ti.i32, shape=tree_size)
-        self._bvh_pairs_work_count = ti.field(ti.i32, shape=())
-        self._bvh_pairs_work_count[None] = 0
-        self._bvh_domain_stamp = ti.field(ti.i32, self._max_domains)
-        self._bvh_active_stamp = ti.field(ti.i32, shape=())
-        self._bvh_active_stamp[None] = 1
-        self._use_bvh_domain_mask = ti.field(ti.i32, shape=())
-        self._use_bvh_domain_mask[None] = 0
-        self._has_fem_spring_bvh_pair = ti.field(ti.i32, shape=())
-        self._has_fem_spring_bvh_pair[None] = 1
-        self._domain_type = ti.field(ti.i32, self._max_domains)
+        # Consolidated AABB field: aabb[i, 0] = lower bound, aabb[i, 1] = upper bound
+        self.aabb = wp.zeros((self._max_domains, 2), dtype=wp.vec2)
+        self._bvh_pairs_work = wp.zeros(tree_size, dtype=wp.vec2i)
+        self._bvh_pairs_work_count = wp.zeros(1, dtype=int)
+        self._bvh_domain_stamp = wp.zeros(self._max_domains, dtype=int)
+        self._bvh_active_stamp = wp.zeros(1, dtype=int)
+        _assign_scalar(self._bvh_active_stamp, 1)
+        self._use_bvh_domain_mask = wp.zeros(1, dtype=int)
+        self._has_fem_spring_bvh_pair = wp.zeros(1, dtype=int)
+        _assign_scalar(self._has_fem_spring_bvh_pair, 1)
+
+        domain_types = np.zeros(self._max_domains, dtype=np.int32)
         for i in range(self.numDomains):
-            self._domain_type[i] = int(self.domains[i].type)
+            domain_types[i] = int(self.domains[i].type)
+        self._domain_type = wp.array(domain_types, dtype=int)
 
         self.stableTime = 1.0
         rigid_domains = [d for d in domains if d.type == DomainType.RIGID or d.type == DomainType.ANALYTICAL]
@@ -116,8 +172,8 @@ class ExplicitLoop(MixedContact):
         self.useAdapative = useAdapativeDT
         self.damping = damping
         self.contacts = []
-        self._counter_py = 0  # Python-side counter (avoids [None] sync per substep)
-     
+        self._counter_py = 0  # Python-side counter (avoids scalar sync per substep)
+
         # Contact subcycling: auto-compute from stable-time ratio after contacts are built.
         self._rigid_contact_subcycle = 1
         self._domain_min_stable_time = self.stableTime
@@ -125,8 +181,8 @@ class ExplicitLoop(MixedContact):
         self._rigid_contact_subcycle_max = 8
 
         self.numContacts = 0
-        MAX_CONTACTS = max(128, len(domains) * 2)  # Heuristic max contacts based on domain count
-        self.contactPairIds = ti.Vector.field(2, ti.i32, MAX_CONTACTS)  # Here the max number of contact is MAX_CONTACTS
+        MAX_CONTACTS = max(128, len(domains) * 2)
+        contact_pair_buf = np.zeros((MAX_CONTACTS, 2), dtype=np.int32)
 
         # Count objects that will be added to BVH
         num_contact_domains = sum(1 for d in domains if d.considerContact or d.considerGroundContact)
@@ -140,23 +196,24 @@ class ExplicitLoop(MixedContact):
         print("Preparing FEM/Rigid contact detection...")
 
         # Pre-compute AABBs for rigid/analytical domains in one batch kernel
-        # (avoids 60,000+ individual Python→Taichi reads via getBBox)
         if self.rigidManager is not None:
             self.rigidManager.precompute_rigid_transforms()
             self.rigidManager.updateBBox()
 
         # Now collect BVH candidates — getBBox just reads from the already-filled aabb field
         bvh_candidates = []  # (domain_index, env_id)
+        aabb_np = self.aabb.numpy()
         for i in range(len(domains)):
             if self.domains[i].considerContact:
                 # For rigid domains, aabb is already populated by updateBBox above
                 # For FEM/spring domains, we still need to call getBBox individually
                 if self.domains[i].type != DomainType.RIGID:
                     lb, ub = self.domains[i].getBBox()
-                    self.aabb[i, 0] = lb
-                    self.aabb[i, 1] = ub
+                    aabb_np[i, 0] = np.asarray(lb, dtype=np.float32).reshape(2)
+                    aabb_np[i, 1] = np.asarray(ub, dtype=np.float32).reshape(2)
                 domain_env_id = getattr(self.domains[i], "env_id", -1)
                 bvh_candidates.append((i, domain_env_id))
+        self.aabb.assign(aabb_np)
 
         ids_np = np.array([c[0] for c in bvh_candidates], dtype=np.int32)
         env_ids_np = np.array([c[1] for c in bvh_candidates], dtype=np.int32)
@@ -178,8 +235,6 @@ class ExplicitLoop(MixedContact):
         )
 
         if has_fem_or_spring:
-            # Only run the O(N²) loop when there are FEM/Spring domains
-            # that genuinely need contactHelper pairs
             contact_domains = [(i, domains[i]) for i in range(len(domains)) if domains[i].considerContact]
             print(f"Building FEM/Spring contacts among {len(contact_domains)} domains...")
             for idx_a, (i, dom_i) in enumerate(contact_domains):
@@ -217,36 +272,36 @@ class ExplicitLoop(MixedContact):
                             print("Domain j:", dom_j, "name:", getattr(dom_j, "name", "N/A"))
                             contact.tied = True
                         self.contacts.append(contact)
-                        self.contactPairIds[self.numContacts] = ti.Vector([i, j])
+                        contact_pair_buf[self.numContacts, 0] = i
+                        contact_pair_buf[self.numContacts, 1] = j
                         self.numContacts += 1
         else:
             print(f"Pure rigid/analytical scene -- skipping O(N^2) contact pair search ({len(bvh_candidates)} domains)")
 
+        self.contactPairIds = wp.array(contact_pair_buf, dtype=wp.vec2i)
+
         if self.bvh is not None:
-            print("Starting BVH build with", self.bvh.object_count[None], "objects for contact detection...")
+            print("Starting BVH build with", int(self.bvh.object_count.numpy()[0]), "objects for contact detection...")
         else:
             print("BVH disabled (<=1 contact candidate) -- skipping BVH build")
         # Detect multi-env: if any domain has env_id >= 0, use per-env BVH
         self._bvh_env_groups = None  # kept for rebuild
         has_multi_env = any(eid >= 0 for eid in env_ids_np) if len(bvh_candidates) > 1 else False
-        if self.bvh is not None and has_multi_env and self.bvh.object_count[None] > 1:
-            # Group BVH object indices by env_id
+        if self.bvh is not None and has_multi_env and int(self.bvh.object_count.numpy()[0]) > 1:
             from collections import defaultdict
 
             env_groups = defaultdict(list)
             for bvh_obj_idx, (_, eid) in enumerate(bvh_candidates):
                 if eid >= 0:
                     env_groups[eid].append(bvh_obj_idx)
-                # env_id=-1 (ground/analytical) excluded from per-env BVH;
-                # their contacts are handled by the batched contact kernels.
             self._bvh_env_groups = dict(env_groups)
             print(
                 f"Per-env BVH: {len(env_groups)} envs, "
                 f"skipping {sum(1 for _,e in bvh_candidates if e<0)} ground domains"
             )
             self.bvh.build_per_env(self._bvh_env_groups)
-        elif self.bvh is not None and self.bvh.object_count[None] > 1:
-            print("Building BVH for contact detection with", self.bvh.object_count[None], "objects...")
+        elif self.bvh is not None and int(self.bvh.object_count.numpy()[0]) > 1:
+            print("Building BVH for contact detection with", int(self.bvh.object_count.numpy()[0]), "objects...")
             self.bvh.build()
 
         # Stable time before contact stiffness constraints (domain-only baseline)
@@ -268,10 +323,6 @@ class ExplicitLoop(MixedContact):
             self._rigid_contact_min_stable_time = self._domain_min_stable_time
 
         # Auto subcycle count for Phase 2 (full SH query for new contacts).
-        # Phase 1 (cached element narrow phase) still runs every substep,
-        # maintaining correct forces for existing contacts.  Phase 2 only
-        # finds NEW contacts, so deferring it by a few substeps is safe:
-        # max delay = subcycle × dt which is tiny compared to contact margin.
         ratio = self._rigid_contact_min_stable_time / max(self._domain_min_stable_time, 1e-12)
         self._rigid_contact_subcycle = int(max(2, min(self._rigid_contact_subcycle_max, ratio)))
 
@@ -283,23 +334,11 @@ class ExplicitLoop(MixedContact):
         self.default_dt = dt
 
         # ── Batched contact optimization ─────────────────────────────────
-        # Replace N separate contact kernel launches with O(1) batched kernels.
-        # Build flat work-lists for each contact type once at initialization.
         self._build_batched_contacts()
-        # Active work-item compaction for rigid mesh contacts helps only when
-        # BVH domain-mask can reject many items. Keep it off by default.
         self._use_rigid_mesh_compaction = self._batched_rigid_mesh_count > 0
         self._needs_bvh_domain_mask = self._use_rigid_mesh_compaction or self._batched_flex_count > 0
-        # Flag: mesh rigid element AABBs need refresh after rigid body movement.
-        # Between rigid substeps the mesh coordinates don't change, so
-        # recomputing triangle AABBs every substep is wasted GPU work.
         self._rigid_mesh_aabb_dirty = True
 
-        # Refine subcycle: when contact margin is known, allow higher subcycle
-        # for scenarios with many substeps (small dt).  Phase 2 delay of
-        # (subcycle-1) × dt must remain well below the contact margin.
-        # Max penetration before correction = max_v × (subcycle-1) × dt.
-        # Keep penetration < margin / safety.
         if hasattr(self, "_rigid_sh_contact_margin") and self._rigid_sh_contact_margin > 0:
             max_v_estimate = 2.0  # conservative peak relative velocity [m/s]
             safety = 2.0
@@ -311,16 +350,8 @@ class ExplicitLoop(MixedContact):
             f"subcycle={self._rigid_contact_subcycle}"
         )
 
-        # Flag: contact preprocessing (activate_aabb, prefilter, build_workset)
-        # needs refresh.  Between rigid substeps the rigid AABBs / SH are
-        # unchanged, so the preprocessing results are nearly identical.
         self._rigid_contact_prefilter_dirty = True
 
-        # Cache BVH activity check to avoid reading [None] every substep
-        # Skip BVH broadphase only when NO subsystem needs it:
-        #  - Unbatched contacts use BVH for pair activation
-        #  - RigidManager uses BVH pairs for rigid-rigid/rigid-analytical detection
-        #    (unless skip_bvh is set, in which case it generates ground pairs directly)
         print(
             f"RigidManager: {self.rigidManager.numRigidInContact if self.rigidManager is not None else 0} rigid-in-contact domains"
         )
@@ -345,19 +376,9 @@ class ExplicitLoop(MixedContact):
         if self.skip_bvh:
             if self.rigidManager is not None:
                 self.rigidManager.skip_bvh = True
-            self._use_bvh_domain_mask[None] = 0
-            self._has_fem_spring_bvh_pair[None] = 0
+            _assign_scalar(self._use_bvh_domain_mask, 0)
+            _assign_scalar(self._has_fem_spring_bvh_pair, 0)
             print("No BVH broadphase needed for contacts -- skipping BVH in RigidManager")
-
-        # ── Lazy spatial hash rebuild ────────────────────────────────────
-        # Spatial hashes are rebuilt lazily during substeps:
-        #  - Rigid-rigid mesh: per-pair per-substep (handled by rigidmanager)
-        #  - FEM-rigid / FEM-FEM: every interval seconds, or when
-        #    max displacement exceeds 0.5 × cell_size.
-        # Queries search 3×3×3 cells (±1 cell around the query point).
-        # Interval must be much larger than dt so negative-cache skip epochs
-        # persist across many substeps.  Displacement-based rebuild catches
-        # fast-moving scenarios; time-based is a safety fallback.
 
         # Initial FEM spatial hash build (so first frame has valid data)
         if self._use_fem_spatial_hash and self.femSpringManager is not None:
@@ -367,7 +388,7 @@ class ExplicitLoop(MixedContact):
         if self._use_rigid_spatial_hash and self.rigidManager is not None and self.rigidManager.spatialHash is not None:
             margin = getattr(self, "_rigid_sh_contact_margin", 0.0)
             if hasattr(self, "_fem_contact_aabb_lb") and hasattr(self, "_bc_rigid_mesh_node_count"):
-                self._compute_fem_contact_aabb(self._bc_rigid_mesh_node_count[None])
+                self._compute_fem_contact_aabb(int(_host_np(self._bc_rigid_mesh_node_count)[0]))
                 print("contact margin for spatial hash:", margin)
                 self.rigidManager.populate_spatial_hash_filtered(
                     fem_lb=self._fem_contact_aabb_lb,
@@ -388,7 +409,6 @@ class ExplicitLoop(MixedContact):
         ib = int(b)
 
         # Accept Python-style negative indexing for tie specifications.
-        # Example: (-1, -2) targets the last two domains.
         n_domains = len(self.domains)
         if ia < 0:
             ia += n_domains
@@ -418,48 +438,43 @@ class ExplicitLoop(MixedContact):
     def _is_tie_pair(self, idx_a, idx_b):
         return (min(idx_a, idx_b), max(idx_a, idx_b)) in self._tie_pairs
 
-    @ti.kernel
-    def _scan_bvh_pairs_stamp(self, pairs: ti.template(), num_pairs: ti.i32, stamp: ti.i32):
-        self._has_fem_spring_bvh_pair[None] = 0
-        for p in range(num_pairs):
-            a = pairs[p][0]
-            b = pairs[p][1]
-            if 0 <= a < self._max_domains:
-                self._bvh_domain_stamp[a] = stamp
-                ta = self._domain_type[a]
-                if ta == int(DomainType.FEM) or ta == int(DomainType.SPRINGMASS):
-                    self._has_fem_spring_bvh_pair[None] = 1
-            if 0 <= b < self._max_domains:
-                self._bvh_domain_stamp[b] = stamp
-                tb = self._domain_type[b]
-                if tb == int(DomainType.FEM) or tb == int(DomainType.SPRINGMASS):
-                    self._has_fem_spring_bvh_pair[None] = 1
+    def _scan_bvh_pairs_stamp(self, pairs, num_pairs, stamp):
+        wp.launch(
+            _scan_bvh_pairs_stamp_kernel,
+            dim=1,
+            inputs=[
+                pairs,
+                int(num_pairs),
+                int(stamp),
+                int(self._max_domains),
+                self._domain_type,
+                self._bvh_domain_stamp,
+                self._has_fem_spring_bvh_pair,
+                int(DomainType.FEM),
+                int(DomainType.SPRINGMASS),
+            ],
+        )
 
-    @ti.kernel
-    def _filter_out_rigid_rigid_pairs(self, num_pairs: ti.i32):
-        """Copy BVH pairs excluding rigid-rigid pairs when disabled by config."""
-        self._bvh_pairs_work_count[None] = 0
-        rigid_type = ti.static(int(DomainType.RIGID))
-        for p in range(num_pairs):
-            a = self.bvh.collision_pairs[p][0]
-            b = self.bvh.collision_pairs[p][1]
-            keep = True
-            if 0 <= a < self._max_domains and 0 <= b < self._max_domains:
-                ta = self._domain_type[a]
-                tb = self._domain_type[b]
-                if ta == rigid_type and tb == rigid_type:
-                    keep = False
-            if keep:
-                out_idx = ti.atomic_add(self._bvh_pairs_work_count[None], 1)
-                self._bvh_pairs_work[out_idx] = ti.Vector([a, b])
+    def _filter_out_rigid_rigid_pairs(self, num_pairs):
+        wp.launch(
+            _filter_out_rigid_rigid_pairs_kernel,
+            dim=1,
+            inputs=[
+                self.bvh.collision_pairs,
+                int(num_pairs),
+                int(self._max_domains),
+                self._domain_type,
+                int(DomainType.RIGID),
+                self._bvh_pairs_work,
+                self._bvh_pairs_work_count,
+            ],
+        )
 
     def advance(self):
-        t_advance_start = time.perf_counter()
         num_bvh_pairs = 0
         pairs_field = self._bvh_pairs_work
         num_pairs_work = 0
         if not self.skip_bvh and self.bvh is not None:
-            t0 = time.perf_counter()
             # Update BVH: full rebuild every 100 steps, refit otherwise
             if self._counter_py % 100 == 0:
                 self.bvh.reset()
@@ -475,57 +490,48 @@ class ExplicitLoop(MixedContact):
                 self.bvh.detectInnerCollision_per_env()
             else:
                 self.bvh.detectInnerCollision()
-            num_bvh_pairs = self.bvh.pair_count[None]
+            num_bvh_pairs = int(self.bvh.pair_count.numpy()[0])
             num_pairs_work = num_bvh_pairs
             pairs_field = self.bvh.collision_pairs
             if (not self._consider_rigid_rigid_contact) and num_bvh_pairs > 0:
-                tf = time.perf_counter()
                 self._filter_out_rigid_rigid_pairs(num_bvh_pairs)
-                num_pairs_work = int(self._bvh_pairs_work_count[None])
+                num_pairs_work = int(self._bvh_pairs_work_count.numpy()[0])
                 pairs_field = self._bvh_pairs_work
 
             if self._needs_bvh_domain_mask:
                 if num_pairs_work > 0:
-                    next_stamp = self._bvh_active_stamp[None] + 1
+                    next_stamp = int(self._bvh_active_stamp.numpy()[0]) + 1
                     if next_stamp > 2000000000:
-                        self._bvh_domain_stamp.fill(0)
+                        self._bvh_domain_stamp.zero_()
                         next_stamp = 1
-                    self._bvh_active_stamp[None] = next_stamp
-                    self._use_bvh_domain_mask[None] = 1
+                    _assign_scalar(self._bvh_active_stamp, next_stamp)
+                    _assign_scalar(self._use_bvh_domain_mask, 1)
                     self._scan_bvh_pairs_stamp(pairs_field, num_pairs_work, next_stamp)
                 else:
-                    self._use_bvh_domain_mask[None] = 1
-                    self._has_fem_spring_bvh_pair[None] = 0
+                    _assign_scalar(self._use_bvh_domain_mask, 1)
+                    _assign_scalar(self._has_fem_spring_bvh_pair, 0)
             else:
-                self._use_bvh_domain_mask[None] = 0
-                self._has_fem_spring_bvh_pair[None] = 1 if num_pairs_work > 0 else 0
+                _assign_scalar(self._use_bvh_domain_mask, 0)
+                _assign_scalar(self._has_fem_spring_bvh_pair, 1 if num_pairs_work > 0 else 0)
         else:
             # BVH inactive: GPU fields already set once per frame in
-            # advanceWithTime(); skip per-substep writes to avoid
-            # cudaMemcpy(H2D) stream synchronization.
+            # advanceWithTime(); skip per-substep writes.
             pass
-
-        # Only activate batched contact kernels when BVH reports potential
-        # pairs involving at least one FEM/Spring domain.
-        # has_fem_spring_bvh_pair = self._has_fem_spring_bvh_pair[None] == 1
-        # run_batched_contacts = (not self._bvh_active) or has_fem_spring_bvh_pair
 
         # ── Batched contact kernels (see mixedcontact.py) ──
         self.run_batched_contacts(pairs_field, num_pairs_work)
 
         # Calculate FEM domains
         if self.femSpringManager is not None:
-            t0 = time.perf_counter()
             self.femSpringManager.substep(self.dt, self.damping)
 
-        # Rigid body substep — pass Taichi field directly (no numpy conversion)
+        # Rigid body substep
         if self.rigidManager is not None:
-            t0 = time.perf_counter()
             N = max(1, self.rigidManager.stableTime // self.dt)
             self.rigid_update_times += 1
             if self.rigid_update_times % N == 0:
                 if hasattr(self, "_fem_contact_aabb_lb") and hasattr(self, "_bc_rigid_mesh_node_count"):
-                    self._compute_fem_contact_aabb(self._bc_rigid_mesh_node_count[None])
+                    self._compute_fem_contact_aabb(int(_host_np(self._bc_rigid_mesh_node_count)[0]))
                     self.rigidManager.substep(
                         pairs_field,
                         num_pairs_work,
@@ -538,17 +544,15 @@ class ExplicitLoop(MixedContact):
                 else:
                     self.rigidManager.substep(pairs_field, num_pairs_work, N * self.dt, self.damping)
 
-            N2 = max(1, self.rigidManager.get_sh_update_interval() // self.dt)  # sh update interval
+            N2 = max(1, self.rigidManager.get_sh_update_interval() // self.dt)
             if self.rigid_update_times % N2 == 0:
                 self._rigid_contact_prefilter_dirty = True
-                self._rigid_mesh_aabb_dirty = True  # mesh coords changed
+                self._rigid_mesh_aabb_dirty = True
 
-                # several state variables need to be reset
                 if hasattr(self, "_bc_rigid_skip_epoch"):
-                    self._bc_rigid_skip_epoch.fill(-1)
+                    self._bc_rigid_skip_epoch.fill_(-1)
 
         self._counter_py += 1
-
 
     # ===================== Fixed-frame stepping helpers =====================
     def advanceWithTime(self, frame_dt: float = 1.0 / 60.0, verbose: bool = False):
@@ -561,24 +565,20 @@ class ExplicitLoop(MixedContact):
             verbose: If True, print debug information about substeps.
         """
 
-        # Set BVH-related GPU state ONCE per frame (not per substep) to avoid
-        # cudaMemcpy(H2D) stream synchronization on every substep.
+        # Set BVH-related GPU state ONCE per frame (not per substep).
         if self.skip_bvh or self.bvh is None:
-            self._use_bvh_domain_mask[None] = 0
-            self._has_fem_spring_bvh_pair[None] = 0
+            _assign_scalar(self._use_bvh_domain_mask, 0)
+            _assign_scalar(self._has_fem_spring_bvh_pair, 0)
 
         remaining = float(frame_dt)
         eps = 1e-12
-        # Loop with substeps not exceeding current stability estimate
         if verbose:
             print(f"Advancing fixed time step of {frame_dt} seconds")
             print(f"Current stable time step: {self.stableTime:.3e} seconds")
 
         substep_count = 0
         while remaining > eps:
-            # Use the most recent stability limit if adaptive, else fixed dt
             current_stable = self.stableTime if self.useAdapative else self.default_dt
-            # Clamp substep to remaining time
             sub_dt = max(min(current_stable, remaining), 1e-8)
             self.dt = sub_dt
             self.advance()
@@ -605,6 +605,11 @@ class ExplicitLoop(MixedContact):
         if manager is None or not hasattr(manager, "joints"):
             return {}
 
+        joint_id_a = manager.joint_id_a.numpy()
+        joint_id_b = manager.joint_id_b.numpy()
+        quat = manager.quat.numpy()
+        quat_initial = manager.quat_initial.numpy()
+
         angle_map = {}
         for j_idx, joint in enumerate(manager.joints):
             joint_name = getattr(joint, "name", "") or f"joint_{j_idx}"
@@ -615,14 +620,14 @@ class ExplicitLoop(MixedContact):
                     angle_map[joint_name] = None
                 continue
 
-            idx_a = int(manager.joint_id_a[j_idx])
-            idx_b = int(manager.joint_id_b[j_idx])
+            idx_a = int(joint_id_a[j_idx])
+            idx_b = int(joint_id_b[j_idx])
 
-            angle_a = float(manager.quat[idx_a][0] - manager.quat_initial[idx_a][0])
-            angle_b = float(manager.quat[idx_b][0] - manager.quat_initial[idx_b][0])
+            angle_a = float(quat[idx_a]) - float(quat_initial[idx_a])
+            angle_b = float(quat[idx_b]) - float(quat_initial[idx_b])
             angle = angle_b - angle_a
             angle = float(np.arctan2(np.sin(angle), np.cos(angle)))
-         
+
             angle_map[joint_name] = float(angle)
 
         return angle_map
@@ -639,23 +644,18 @@ class ExplicitLoop(MixedContact):
         Note: This does NOT reset boundary conditions - those should be
         managed by the caller (e.g., RL environment).
         """
-        # Reset time counter
         self._counter_py = 0
 
-        # Reset rigid bodies through RigidManager
-        # RigidManager.reset() will re-pack rigid parameters from initial origins
         if self.rigidManager is not None and (
             self.rigidManager.numRigids > 0 or self.rigidManager.numAnalytical > 0
         ):
             self.rigidManager.reset()
 
-        # Reset other domain types
         for domain in self.domains:
             if domain.type == DomainType.FEM or domain.type == DomainType.SPRINGMASS:
                 pass
 
-        # Reset BVH and contact states
-        if self.bvh is not None and self.bvh.object_count[None] > 1:
+        if self.bvh is not None and int(self.bvh.object_count.numpy()[0]) > 1:
             self.bvh.reset()
             self.bvh.update_objects(self.aabb, 1)
             if self._bvh_env_groups:
@@ -663,18 +663,17 @@ class ExplicitLoop(MixedContact):
             else:
                 self.bvh.build()
 
-        # Reset fixed FEM-rigid-mesh tie state.
         if hasattr(self, "_fixed_rigid_mesh_tie_initialized"):
-            self._fixed_rigid_mesh_tie_initialized[None] = 0
+            _assign_scalar(self._fixed_rigid_mesh_tie_initialized, 0)
 
         if hasattr(self, "_fixed_rigid_mesh_tie_found_count"):
-            self._fixed_rigid_mesh_tie_found_count[None] = 0
+            _assign_scalar(self._fixed_rigid_mesh_tie_found_count, 0)
 
         if hasattr(self, "_bc_rigid_tie_resolved"):
-            self._bc_rigid_tie_resolved.fill(0)
+            self._bc_rigid_tie_resolved.fill_(0)
 
         if hasattr(self, "_bc_rigid_cache_elem"):
-            self._bc_rigid_cache_elem.fill(-1)
+            self._bc_rigid_cache_elem.fill_(-1)
 
         if hasattr(self, "_bc_rigid_tie_weights"):
-            self._bc_rigid_tie_weights.fill(0.0)
+            self._bc_rigid_tie_weights.fill_(0.0)
