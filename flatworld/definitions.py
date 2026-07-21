@@ -1,5 +1,5 @@
 from enum import Enum
-import taichi as ti
+import warp as wp
 
 
 class DomainType:
@@ -84,9 +84,6 @@ class MaterialType:
 
 
 # ODE-style collision filtering bits.
-# Pair (a, b) is valid only when both are true:
-#   (collide_bits[a] & category_bits[b]) != 0
-#   (collide_bits[b] & category_bits[a]) != 0
 COLLISION_CATEGORY_ROBOT = 0b00000001
 COLLISION_CATEGORY_GROUND = 0b00000010
 COLLISION_CATEGORY_FOOT = 0b00000100
@@ -107,17 +104,36 @@ ROTATYPE = 0b010000000  # Enforce rotation acceleration
 TORQUETYPE = 0b100000000  # Enforce torque
 
 
-iVec3 = ti.types.vector(3, ti.i32)
-iVec4 = ti.types.vector(4, ti.i32)
-fVec2 = ti.types.vector(2, ti.f32)
-fVec3 = ti.types.vector(3, ti.f32)
-fVec4 = ti.types.vector(4, ti.f32)
-Mat2x2 = ti.types.matrix(2, 2, ti.f32)
-Mat3x3 = ti.types.matrix(3, 3, ti.f32)
-Mat3x2 = ti.types.matrix(3, 2, ti.f32)
-Mat2x3 = ti.types.matrix(2, 3, ti.f32)
-Mat4x3 = ti.types.matrix(4, 3, ti.f32)
-Mat3x4 = ti.types.matrix(3, 4, ti.f32)
-Mat4x4 = ti.types.matrix(4, 4, ti.f32)
-Mat3x6 = ti.types.matrix(3, 6, ti.f32)
-Mat6x12 = ti.types.matrix(6, 12, ti.f32)
+iVec3 = wp.vec3i
+iVec4 = wp.vec4i
+fVec2 = wp.vec2
+fVec3 = wp.vec3
+fVec4 = wp.vec4
+Mat2x2 = wp.mat22
+Mat3x3 = wp.mat33
+Mat4x4 = wp.mat44
+# Warp may not have all matrix aliases on all versions — keep as types for typing docs
+try:
+    Mat3x2 = wp.mat32
+except AttributeError:
+    Mat3x2 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
+try:
+    Mat2x3 = wp.mat23
+except AttributeError:
+    Mat2x3 = wp.types.matrix(shape=(2, 3), dtype=wp.float32)
+try:
+    Mat4x3 = wp.mat43
+except AttributeError:
+    Mat4x3 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
+try:
+    Mat3x4 = wp.mat34
+except AttributeError:
+    Mat3x4 = wp.types.matrix(shape=(3, 4), dtype=wp.float32)
+try:
+    Mat3x6 = wp.mat36
+except AttributeError:
+    Mat3x6 = None
+try:
+    Mat6x12 = wp.mat612
+except AttributeError:
+    Mat6x12 = None

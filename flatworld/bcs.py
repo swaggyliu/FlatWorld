@@ -1,7 +1,5 @@
 import abc
 from definitions import *
-import numpy as np
-import taichi as ti
 
 
 class BcBase(abc.ABC):
@@ -79,7 +77,6 @@ class EnforceRotVel(BcBase):
         self.rotVel = rotVelocity
         self.origin = origin
         self.type = BoundaryConditionType.ENFORCE_ROTATION_VELOCITY
-
 
     def processData(self):
         return ROTVTYPE, self.nds, self.rotVel

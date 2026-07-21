@@ -1,14 +1,13 @@
 from collections import defaultdict
 from definitions import *
 import numpy as np
-import taichi as ti
+import warp as wp
 
 # =============================================================================
 # Mesh
 # =============================================================================
 
 
-@ti.data_oriented
 class Mesh:
     def __init__(self, d, conns, coords, is_rigid=False):
         self.d = d
@@ -66,7 +65,6 @@ class Mesh:
                     edge_count[edge_reverse] += 1
                 else:
                     edge_count[edge] += 1
-
 
         # The number of occurrences is1The edge of is the boundary edge
         boundary_edges = [edge for edge, count in edge_count.items() if count == 1]
@@ -151,45 +149,52 @@ class Mesh:
         return boundaryNodeNormals
 
 
-@ti.func
-def getShapeFnsTri(self, psi: ti.float32, eta: ti.float32):
+# =============================================================================
+# FEM shape / B-matrix helpers (Warp device funcs for future femspringmanager)
+# =============================================================================
+
+_Mat23 = Mat2x3 if Mat2x3 is not None else wp.types.matrix(shape=(2, 3), dtype=wp.float32)
+_Mat34 = Mat3x4 if Mat3x4 is not None else wp.types.matrix(shape=(3, 4), dtype=wp.float32)
+_Mat3x6 = Mat3x6 if Mat3x6 is not None else wp.types.matrix(shape=(3, 6), dtype=wp.float32)
+_Mat6x12 = Mat6x12 if Mat6x12 is not None else wp.types.matrix(shape=(6, 12), dtype=wp.float32)
+
+
+@wp.func
+def getShapeFnsTri(psi: float, eta: float):
     """Return triangular linear shape functions evaluated at (psi,eta)."""
-    return ti.Vector([psi, eta, 1 - psi - eta], ti.float32)
+    return wp.vec3(psi, eta, 1.0 - psi - eta)
 
 
-@ti.func
-def getShapeFnsTet(self, psi: ti.float32, eta: ti.float32, gamma: ti.float32) -> fVec4:
+@wp.func
+def getShapeFnsTet(psi: float, eta: float, gamma: float):
     """Return linear tetrahedral shape functions evaluated at (psi,eta,gamma)."""
-    return ti.Vector([psi, eta, gamma, 1 - psi - eta - gamma], ti.float32)
+    return wp.vec4(psi, eta, gamma, 1.0 - psi - eta - gamma)
 
 
-@ti.func
-def getBoundaryShapeFns(self, psi: ti.float32, eta: ti.float32):
+@wp.func
+def getBoundaryShapeFns(psi: float, eta: float):
     """Return 1D shape functions for a boundary edge parameter psi."""
-    return ti.Vector([1 - psi, psi], ti.float32)
+    return wp.vec2(1.0 - psi, psi)
 
 
-@ti.func
-def getJacobian2D(c1, c2, c3, psi: ti.float32, eta: ti.float32, gamma: ti.f32):
+@wp.func
+def getJacobian2D(c1: wp.vec2, c2: wp.vec2, c3: wp.vec2, psi: float, eta: float, gamma: float):
     """Compute the 2x2 Jacobian for element i at param (psi,eta)."""
-    jac = ti.Matrix([[c1[0] - c3[0], c2[0] - c3[0]], [c1[1] - c3[1], c2[1] - c3[1]]])
-
-    return jac
+    return wp.mat22(c1[0] - c3[0], c2[0] - c3[0], c1[1] - c3[1], c2[1] - c3[1])
 
 
-@ti.func
-def getWeights2D(jac: Mat2x2) -> ti.float32:
+@wp.func
+def getWeights2D(jac: wp.mat22):
     """Return triangle area weight = 0.5 * |det(J)|."""
-    return abs(jac[0, 0] * jac[1, 1] - jac[0, 1] * jac[1, 0]) * 0.5
+    return wp.abs(jac[0, 0] * jac[1, 1] - jac[0, 1] * jac[1, 0]) * 0.5
 
 
-@ti.func
-def getBMatrix2D(psi: ti.float32, eta: ti.float32, gamma: ti.f32, F, J_inv):
+@wp.func
+def getBMatrix2D(psi: float, eta: float, gamma: float, F: wp.mat22, J_inv: wp.mat22):
     """Assemble the 3x6 B-matrix for linear triangular elasticity at param coords."""
-
-    shapeDparam = ti.Matrix([[1, 0, -1], [0, 1, -1]], ti.float32)
-    dndx = shapeDparam.transpose() @ J_inv  # 3 x 2 matrix
-    BMat = ti.Matrix.zero(ti.f32, 3, 6)
+    shapeDparam = _Mat23(1.0, 0.0, -1.0, 0.0, 1.0, -1.0)
+    dndx = wp.transpose(shapeDparam) @ J_inv  # 3 x 2 matrix
+    BMat = _Mat3x6(0.0)
     for i in range(3):
         BMat[0, 2 * i] = dndx[i, 0] * F[0, 0]
         BMat[0, 2 * i + 1] = dndx[i, 0] * F[1, 0]
@@ -197,35 +202,37 @@ def getBMatrix2D(psi: ti.float32, eta: ti.float32, gamma: ti.f32, F, J_inv):
         BMat[1, 2 * i + 1] = dndx[i, 1] * F[1, 1]
         BMat[2, 2 * i] = dndx[i, 1] * F[0, 0] + dndx[i, 0] * F[0, 1]
         BMat[2, 2 * i + 1] = dndx[i, 0] * F[1, 1] + dndx[i, 1] * F[1, 0]
-
     return BMat
 
 
-@ti.func
-def getJacobian3D(c1, c2, c3, c4, psi: ti.float32, eta: ti.float32, gamma: ti.float32) -> Mat3x3:
+@wp.func
+def getJacobian3D(c1: wp.vec3, c2: wp.vec3, c3: wp.vec3, c4: wp.vec3, psi: float, eta: float, gamma: float):
     """Compute the 3x3 Jacobian for tetrahedron i at param coords (psi,eta,gamma)."""
-    return ti.Matrix(
-        [
-            [c1[0] - c4[0], c2[0] - c4[0], c3[0] - c4[0]],
-            [c1[1] - c4[1], c2[1] - c4[1], c3[1] - c4[1]],
-            [c1[2] - c4[2], c2[2] - c4[2], c3[2] - c4[2]],
-        ]
+    return wp.mat33(
+        c1[0] - c4[0],
+        c2[0] - c4[0],
+        c3[0] - c4[0],
+        c1[1] - c4[1],
+        c2[1] - c4[1],
+        c3[1] - c4[1],
+        c1[2] - c4[2],
+        c2[2] - c4[2],
+        c3[2] - c4[2],
     )
 
 
-@ti.func
-def getWeights3D(jac: Mat3x3) -> ti.float32:
+@wp.func
+def getWeights3D(jac: wp.mat33):
     """Return tetrahedron volume weight = |det(J)| / 6."""
-    return (abs(jac.determinant())) * (1.0 / 6.0)
+    return wp.abs(wp.determinant(jac)) * (1.0 / 6.0)
 
 
-@ti.func
-def getBMatrix3D(psi: ti.float32, eta: ti.float32, gamma: ti.float32, F, J_inv):
+@wp.func
+def getBMatrix3D(psi: float, eta: float, gamma: float, F: wp.mat33, J_inv: wp.mat33):
     """Assemble the 6x12 B-matrix for linear tetrahedral elasticity at param coords."""
-    shapeDparam = ti.Matrix([[1, 0, 0, -1], [0, 1, 0, -1], [0, 0, 1, -1]], ti.float32)
-    dndx = shapeDparam.transpose() @ J_inv  # 4x3 matrix
-    # 6 x 12 matrix
-    BMat = ti.Matrix.zero(ti.f32, 6, 12)
+    shapeDparam = _Mat34(1.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 1.0, -1.0)
+    dndx = wp.transpose(shapeDparam) @ J_inv  # 4x3 matrix
+    BMat = _Mat6x12(0.0)
     for i in range(4):
         BMat[0, 3 * i] = dndx[i, 0] * F[0, 0]
         BMat[0, 3 * i + 1] = dndx[i, 0] * F[1, 0]
@@ -250,4 +257,3 @@ def getBMatrix3D(psi: ti.float32, eta: ti.float32, gamma: ti.float32, F, J_inv):
         BMat[5, 3 * i + 2] = dndx[i, 0] * F[2, 2] + dndx[i, 2] * F[2, 0]
 
     return BMat
-

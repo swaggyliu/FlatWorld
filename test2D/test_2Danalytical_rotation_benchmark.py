@@ -2,7 +2,6 @@ import math
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -10,7 +9,7 @@ sys.path.append(parent_dir)
 
 import argparse
 from flatworld import GroundDomain, BoxRigid, EnforceRotAcc, EnforceRotVel, ExplicitLoop, RigidBodyDomain
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Danalytical_rotation(headless=False):
@@ -22,7 +21,7 @@ def test_2Danalytical_rotation(headless=False):
 
     Both cause the analytical planes to rotate around a pivot point.
     """
-    ti.init(offline_cache=True, arch=ti.cpu, debug=False)
+    init_sim()
     pi = math.pi
     # Create rotating analytical barriers (walls) with rotation BCs
     # Wall 1: Vertical wall rotating with constant angular velocity (10 rad/s CCW)

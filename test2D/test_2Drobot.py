@@ -1,6 +1,5 @@
 import os
 import sys
-import taichi as ti
 import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,11 +24,11 @@ from flatworld.joints import RevoluteJoint, WeldJoint
 from flatworld.rigid import BoxRigid
 from flatworld.rigidmanager import RigidManager
 from math import pi
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_robot(headless=False, kernel_profile=False):
-    ti.init(offline_cache=True, arch=ti.cuda, default_fp=ti.f32, kernel_profiler=kernel_profile)
+    init_sim()
     gv = Gravity([0, -9.8])
     radius = 0.05
     center1 = [0.5, 0.85]
@@ -145,8 +144,9 @@ def test_robot(headless=False, kernel_profile=False):
     if kernel_profile:
         print("\nKERNEL PROFILER INFO:")
         print("=" * 60)
-        ti.profiler.print_kernel_profiler_info()
-        ti.profiler.clear_kernel_profiler_info()
+        # Warp profiler placeholder (was ti.profiler)
+        pass
+        # wp.synchronize()  # optional
 
     # ---------------------------------------------------------
     # Final Result Verification

@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -9,11 +8,11 @@ sys.path.append(parent_dir)
 
 import argparse
 from flatworld import Elastic, EnforceAcc, EnforceVel, ExplicitLoop, Fixed, Force, SolidProp, SpringMassDomain
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Dspring(headless=False):
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
 
     conn = np.array([[0, 1], [1, 2], [0, 2], [2, 3], [3, 1], [0, 3]], dtype=np.int32)
     coords = np.array([[0.5, 0.5], [0.7, 0.5], [0.5, 0.7], [0.7, 0.7]], dtype=np.float32)
@@ -39,10 +38,10 @@ def test_2Dspring(headless=False):
         t += frame_dt
 
         # rendering
-        totalEls = looper.femSpringManager.totalElements[None]
-        totalNds = looper.femSpringManager.totalNodes[None]
-        pos = looper.femSpringManager.coords.to_numpy()[:totalNds]
-        e2n = looper.femSpringManager.connectivity.to_numpy()[:totalEls]
+        totalEls = looper.femSpringManager.totalElements.numpy()[0]
+        totalNds = looper.femSpringManager.totalNodes.numpy()[0]
+        pos = looper.femSpringManager.coords.numpy()[:totalNds]
+        e2n = looper.femSpringManager.connectivity.numpy()[:totalEls]
         if gui is not None:
             gui.circles(pos, radius=2, color=0xFFAA33)
             a, b = pos[e2n[:, 0]], pos[e2n[:, 1]]

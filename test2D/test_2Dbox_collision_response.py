@@ -1,11 +1,11 @@
-"""2D box collision response tests."""
+"""2D box collision response tests (Warp)."""
 
 import os
 import sys
 
 import numpy as np
 import pytest
-import taichi as ti
+from test_utils import init_sim
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -14,9 +14,7 @@ sys.path.append(parent_dir)
 
 from flatworld import BoxRigid, ExplicitLoop, InitialVel, RigidBodyDomain
 
-
-if not ti.lang.impl.get_runtime().prog:
-    ti.init(arch=ti.cpu, debug=False)
+init_sim()
 
 
 def test_box_collision_2d():

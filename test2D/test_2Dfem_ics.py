@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -9,11 +8,11 @@ sys.path.append(parent_dir)
 
 import argparse
 from flatworld import Elastic, ExplicitLoop, FemDomain, Fixed, Force, InitialVel, Mesh, SolidProp
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Dfem_elastic(headless=False):
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
 
     conn = np.array([[0, 1, 3], [0, 3, 2]], dtype=np.int32)
     coords = np.array([[0.5, 0.5], [0.7, 0.5], [0.5, 0.7], [0.7, 0.7]], dtype=np.float32)

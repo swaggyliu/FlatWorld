@@ -2,7 +2,6 @@ import math
 import numpy as np
 import os
 import sys
-import taichi as ti
 import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,11 +25,11 @@ from flatworld import (
 )
 from flatworld.joints import RevoluteJoint
 from flatworld.rigidmanager import RigidManager
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_revolute_joint(headless=False, kernel_profile=True):
-    ti.init(offline_cache=True, arch=ti.cpu, kernel_profiler=False)
+    init_sim()
 
     radius = 0.05
     rigid1 = BallRigid(2, [0.5, 0.1], radius, 1.0)

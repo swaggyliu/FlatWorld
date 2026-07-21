@@ -1,18 +1,37 @@
-from bcs import EnforceAcc, EnforceRotAcc, EnforceRotVel, EnforceVel, Force, Torque
 from definitions import JointType
-import math
 import numpy as np
-import taichi as ti
 
 
-@ti.data_oriented
+def _to_np(x):
+    """Host copy of a Warp (.numpy) or Taichi (.to_numpy) array element/buffer."""
+    if hasattr(x, "numpy") and callable(getattr(x, "numpy")):
+        return x.numpy()
+    if hasattr(x, "to_numpy") and callable(getattr(x, "to_numpy")):
+        return x.to_numpy()
+    return np.asarray(x)
+
+
+def _vec_np(v):
+    return np.asarray(_to_np(v), dtype=np.float32).reshape(-1)
+
+
+def _patch_array(arr, index, value):
+    """Host write for Warp arrays (no ``arr[i] =`` from Python on Warp 1.14+)."""
+    if hasattr(arr, "numpy") and hasattr(arr, "assign"):
+        np_arr = arr.numpy()
+        np_arr[index] = value
+        arr.assign(np_arr)
+    else:
+        arr[index] = value
+
+
 class JointBase:
     """Base class for joints (lightweight placeholder)."""
 
     def __init__(self, id_a: int, id_b: int, anchor, bcs, name=""):
         self.id_a = id_a
         self.id_b = id_b
-        self.anchor = anchor
+        self.anchor = np.asarray(anchor, dtype=np.float32)
         self.bcs = bcs
         self.has_motor = 0
         self.name = name
@@ -32,16 +51,18 @@ class JointBase:
         self.manager = manager
 
         # compute body-local rest offsets from the initial anchor position
-        self.id_a = manager.domainToRigid[self.id_a]
-        self.id_b = manager.domainToRigid[self.id_b]
+        d2r = _to_np(manager.domainToRigid)
+        self.id_a = int(d2r[self.id_a])
+        self.id_b = int(d2r[self.id_b])
 
-        # Compute world-space offsets
-        l1_world = manager.rigidParams[self.id_a, 0] - self.anchor
-        l2_world = manager.rigidParams[self.id_b, 0] - self.anchor
+        # Compute world-space offsets (host reads via .numpy() for Warp arrays)
+        params = _to_np(manager.rigidParams)
+        l1_world = _vec_np(params[self.id_a, 0]) - self.anchor
+        l2_world = _vec_np(params[self.id_b, 0]) - self.anchor
 
         # Store local offsets for subclass registration
-        self.l1 = l1_world
-        self.l2 = l2_world
+        self.l1 = np.asarray(l1_world, dtype=np.float32)
+        self.l2 = np.asarray(l2_world, dtype=np.float32)
         # Safety check for anchor/joint capacity
         if manager.numAnchors >= manager.MAX_JOINTS:
             print(
@@ -53,19 +74,23 @@ class JointBase:
         joint_idx = manager.numAnchors
 
         # Register joint using the anchor
-        q0a = manager.quat[self.id_a].to_numpy()
-        q0b = manager.quat[self.id_b].to_numpy()
-        manager.joint_anchor[joint_idx] = self.anchor
+        quat_np = _to_np(manager.quat)
+        q0a = float(np.asarray(quat_np[self.id_a]).reshape(-1)[0])
+        q0b = float(np.asarray(quat_np[self.id_b]).reshape(-1)[0])
+        _patch_array(manager.joint_anchor, joint_idx, self.anchor)
         # Store θ_a0 - θ_b0 so angle_error = (θ_a - θ_a0) - (θ_b - θ_b0) = 0 at rest.
-        manager.joint_q0_rel_inv[joint_idx] = q0a - q0b
-        manager.joint_type[joint_idx] = self.jointType
-        manager.joint_id_a[joint_idx] = self.id_a
-        manager.joint_id_b[joint_idx] = self.id_b
-        manager.joint_l1[joint_idx] = self.l1
-        manager.joint_l2[joint_idx] = self.l2
-        manager.joint_axis[joint_idx] = self.axis if self.axis is not None else ti.Vector([0.0] * manager.d)
-        manager.kpd_field[joint_idx] = ti.Vector([self.stiff, self.damping])
-        manager.joint_params[joint_idx] = ti.Vector(
+        _patch_array(manager.joint_q0_rel_inv, joint_idx, q0a - q0b)
+        _patch_array(manager.joint_type, joint_idx, self.jointType)
+        _patch_array(manager.joint_id_a, joint_idx, self.id_a)
+        _patch_array(manager.joint_id_b, joint_idx, self.id_b)
+        _patch_array(manager.joint_l1, joint_idx, self.l1)
+        _patch_array(manager.joint_l2, joint_idx, self.l2)
+        axis = self.axis if self.axis is not None else np.zeros((manager.d,), dtype=np.float32)
+        _patch_array(manager.joint_axis, joint_idx, np.asarray(axis, dtype=np.float32))
+        _patch_array(manager.kpd_field, joint_idx, [self.stiff, self.damping])
+        _patch_array(
+            manager.joint_params,
+            joint_idx,
             [
                 self.position_bias,
                 self.angular_bias,
@@ -73,49 +98,54 @@ class JointBase:
                 self.limits[1],
                 self.velocity_limit,
                 self.effort_limit,
-            ]
+            ],
         )
-        manager.kpd_field[joint_idx] = ti.Vector([self.stiff, self.damping])
-        manager.joint_has_motor[joint_idx] = 1 if self.has_motor else 0
-        manager.joint_control_target[joint_idx] = (
-            self.motor_target_position if self.motor_target_position is not None else 0.0
+        _patch_array(manager.joint_has_motor, joint_idx, 1 if self.has_motor else 0)
+        _patch_array(
+            manager.joint_control_target,
+            joint_idx,
+            self.motor_target_position if self.motor_target_position is not None else 0.0,
         )
-        manager.joint_motor_target_mode[joint_idx] = 0
-        manager.joint_motor_target_vel[joint_idx] = 0.0
+        _patch_array(manager.joint_motor_target_mode, joint_idx, 0)
+        _patch_array(manager.joint_motor_target_vel, joint_idx, 0.0)
 
         self.anchor_id = joint_idx
 
     def draw(self, gui, color=0xFF0000, resolution=50):
-        """Return simple debug geometry for visualization.
+        """Debug draw for joints.
 
-        Returns a dict with:
-          - anchor: world-space anchor position (ti.Vector)
+        When the manager uses Warp arrays, rigidParams/quat must be read via
+        ``.numpy()`` (handled by ``_vec_np`` / ``_to_np``).
         """
-        aid = self.anchor_id if hasattr(self, "anchor_id") else -1
-        gui.circle(self.manager.rigidParams[aid, 0].to_numpy()[:2], radius=resolution * 0.01, color=color)
         anchor = self.getCurrentAnchorPoint()
-        gui.line(self.manager.rigidParams[self.id_a, 0].to_numpy()[:2], anchor[:2], radius=5, color=0x0000AA)
-        gui.line(self.manager.rigidParams[self.id_b, 0].to_numpy()[:2], anchor[:2], radius=5, color=0x0000AA)
+        gui.circle(anchor[:2], radius=resolution * 0.01, color=color)
+        params = _to_np(self.manager.rigidParams)
+        ref_a = _vec_np(params[self.id_a, 0])
+        ref_b = _vec_np(params[self.id_b, 0])
+        gui.line(ref_a[:2], anchor[:2], radius=5, color=0x0000AA)
+        gui.line(ref_b[:2], anchor[:2], radius=5, color=0x0000AA)
 
     def getCurrentAnchorPoint(self):
-        posa = self.manager.rigidParams[self.id_a, 0].to_numpy()
-        rota = self.manager.quat[self.id_a].to_numpy()
-        initial_rota = self.manager.quat_initial[self.id_a].to_numpy()
-        theta = rota[0] - initial_rota[0]
-        r_rel = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-        anchor = posa - r_rel @ self.l1.to_numpy()
+        # Host numpy reads — call .numpy() on Warp buffers when manager is migrated
+        params = _to_np(self.manager.rigidParams)
+        quat_np = _to_np(self.manager.quat)
+        quat_init_np = _to_np(self.manager.quat_initial)
+        posa = _vec_np(params[self.id_a, 0])
+        rota = float(np.asarray(quat_np[self.id_a]).reshape(-1)[0])
+        initial_rota = float(np.asarray(quat_init_np[self.id_a]).reshape(-1)[0])
+        theta = float(rota - initial_rota)
+        r_rel = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=np.float32)
+        l1 = np.asarray(self.l1, dtype=np.float32)
+        anchor = posa - r_rel @ l1
 
         return anchor
 
 
-@ti.data_oriented
 class RevoluteJoint(JointBase):
     """A simple revolute joint that constrains two rigid reference points to a
     common anchor while allowing relative rotation about a given axis.
 
-    This implementation is Taichi-friendly: use `solve(manager, ...)` to apply
-    positional and angular constraint forces/torques to the provided
-    `RigidManager` instance. The routine handles 2D and 3D manager layouts.
+    Use `attach(manager)` to register the joint on a `RigidManager`.
     """
 
     def __init__(
@@ -153,7 +183,6 @@ class RevoluteJoint(JointBase):
         self.id_a = int(id_a)
         self.id_b = int(id_b)
         self.jointType = JointType.Revolute
-        # store as python lists; kernels will construct ti.Vector at call-time
         self.axis = axis
         self.rpy = list(rpy) if rpy is not None else [0.0, 0.0, 0.0]
         if limits is not None:
@@ -172,24 +201,16 @@ class RevoluteJoint(JointBase):
         self.has_motor = 0
         if len(bcs) > 0 or self.motor_target_position is not None:
             self.has_motor = 1
-        # print(f"Creating RevoluteJoint {name} between {self.id_a} and {self.id_b} with anchor {anchor} and axis {axis}")
-        # print("RevoluteJoint with limits:", self.limits)
-        # print("RevoluteJoint velocity limit:", self.velocity_limit)
-        # print("RevoluteJoint effort limit:", self.effort_limit)
-        # print("RevoluteJoint has motor:", self.has_motor)
 
     def attach(self, manager):
         """Attach joint and register it in manager's unified storage."""
         super().attach(manager)
 
 
-@ti.data_oriented
 class WeldJoint(JointBase):
     """Weld joint: fully constrain translation and rotation between two rigids.
 
-    The joint computes body-local anchors via `attach(manager)` and applies
-    positional and angular penalty forces/torques in `_apply` to drive the
-    two attachment frames to coincide (both position and orientation).
+    The joint computes body-local anchors via `attach(manager)`.
     """
 
     def __init__(
@@ -209,15 +230,8 @@ class WeldJoint(JointBase):
         super().attach(manager)
 
 
-@ti.data_oriented
 class PrismaticJoint(JointBase):
-    """Prismatic joint: allows translation only along a given axis between two rigids.
-
-    Construct with body-local offsets `l1`, `l2` and an `axis` (length d). The
-    kernel `_apply(manager)` enforces coincidence of the two attachment points
-    in directions perpendicular to `axis` while allowing sliding along it. All
-    rotations are locked (penalty angular locking).
-    """
+    """Prismatic joint: allows translation only along a given axis between two rigids."""
 
     def __init__(
         self,
@@ -261,15 +275,8 @@ class PrismaticJoint(JointBase):
         super().attach(manager)
 
 
-@ti.data_oriented
 class SphericalJoint(JointBase):
-    """Spherical joint: constrains only translation DOFs (attachment points coincide).
-
-    The joint computes body-local anchor offsets with `attach(manager)` and
-    applies a positional penalty force in `_apply`. Rotation between bodies
-    is left free (no angular penalty), but torques resulting from the
-    positional force (lever arm) are applied to the bodies for correctness.
-    """
+    """Spherical joint: constrains only translation DOFs (attachment points coincide)."""
 
     def __init__(
         self,

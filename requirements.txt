@@ -1,11 +1,11 @@
-# --- Core dependencies ---
-taichi>=1.7.0
+warp-lang>=1.7.0
 numpy>=1.24
 scipy>=1.10
 tetgen>=0.6
 meshio>=5.3
 pymeshlab>=2023.12
 usd-core>=24.0
+matplotlib>=3.7
 
 # --- Testing (see also: pip install -e ".[dev]") ---
 pytest>=7.0

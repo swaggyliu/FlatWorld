@@ -1,10 +1,8 @@
 from definitions import *
 from numericaldomain import DomainBase
 import numpy as np
-import taichi as ti
 
 
-@ti.data_oriented
 class SpringMassDomain(DomainBase):
     def __init__(
         self,
@@ -54,27 +52,22 @@ class SpringMassDomain(DomainBase):
         self.domainIdx = domainIdx
 
     def getCurrentCoords(self):
-        ndStart = self.femManager.domainNodeOffset[self.domainIdx]
+        ndStart = int(self.femManager.domainNodeOffset.numpy()[self.domainIdx])
         ndEnd = ndStart + self.nnodes
-        return self.femManager.coords.to_numpy()[ndStart:ndEnd, :]
+        return self.femManager.coords.numpy()[ndStart:ndEnd, :]
 
     def getBBox(self):
         aabb = self.getBBoxKernel2D()
-
-        lb = ti.Vector([aabb[0, k] for k in ti.static(range(self.d))])
-        ub = ti.Vector([aabb[1, k] for k in ti.static(range(self.d))])
-        return lb, ub
+        return aabb[0], aabb[1]
 
     def getBBoxKernel2D(self):
         aabb = np.zeros((2, 2), dtype=np.float32)
         aabb[0, :] = np.min(self.coords, axis=0)
         aabb[1, :] = np.max(self.coords, axis=0)
-
         return aabb
 
     def getBBoxKernel3D(self):
         aabb = np.zeros((2, 3), dtype=np.float32)
         aabb[0, :] = np.min(self.coords, axis=0)
         aabb[1, :] = np.max(self.coords, axis=0)
-
         return aabb

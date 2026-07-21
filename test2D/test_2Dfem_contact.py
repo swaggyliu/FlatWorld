@@ -1,6 +1,5 @@
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -9,7 +8,7 @@ sys.path.append(parent_dir)
 import argparse
 from flatworld import Elastic, ExplicitLoop, FemDomain, FEMesher, Gravity, Mesh, SolidProp
 from multiprocessing import Queue
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def get_domains():
@@ -28,7 +27,7 @@ def get_domains():
 
 
 def test_2Dfem_contact(headless=False):
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
 
     domains = get_domains()
 
@@ -51,7 +50,7 @@ def test_2Dfem_contact(headless=False):
 
 
 def generate_disp_format_data():
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
     domains = get_domains()
 
     t = 0.0
@@ -68,7 +67,7 @@ def generate_disp_format_data():
 
 
 def get_mesh_format_data():
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
     return export_2d_meshes_as_json([domain.mesh for domain in get_domains()])
 
 

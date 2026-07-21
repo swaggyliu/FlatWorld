@@ -8,7 +8,6 @@ import math
 import numpy as np
 import os
 import sys
-import taichi as ti
 import time
 
 # Add parent directory to path
@@ -20,7 +19,7 @@ import argparse
 from flatworld import ExplicitLoop, FixedAll, Gravity, RigidBodyDomain
 from flatworld.joints import RevoluteJoint
 from flatworld.rigid import BallRigid
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_two_body_joint(headless=False):
@@ -31,10 +30,10 @@ def test_two_body_joint(headless=False):
 
     # initialization Taichi
     try:
-        ti.init(offline_cache=True, arch=ti.gpu)
+        init_sim()
         print("use GPU accelerate")
     except:
-        ti.init(offline_cache=True, arch=ti.cpu)
+        init_sim()
         print("use CPU calculate")
 
     # Rigid body parameters

@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -20,11 +19,11 @@ from flatworld import (
     InitialVel,
     RigidBodyDomain,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Drigidrot(headless=False):
-    ti.init(offline_cache=True, arch=ti.cpu, debug=False)
+    init_sim()
 
     rigid1 = BoxRigid(2, [0.5, 0.4], [0.1, 0.1], [0.0], 100.0)
     rigid2 = BoxRigid(2, [0.4, 0.6], [0.1, 0.1], [0.0], 100.0)

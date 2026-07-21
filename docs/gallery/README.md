@@ -1,6 +1,6 @@
 # Flat World Gallery
 
-Screenshots captured from **live Taichi rendering** of `test2D` demos (off-screen `ti.GUI`, one frame per scene).
+Screenshots captured from **live Warp rendering** of `test2D` demos (headless `warp.render.OpenGLRenderer` via `flatworld.viewer.Viewer`, one frame per scene).
 
 ## Regenerate
 
@@ -10,7 +10,7 @@ python scripts/capture_gallery.py
 python scripts/capture_gallery.py --only domino,fem-elastic
 ```
 
-Requires a working Taichi backend (CPU/CUDA). Images are written to this folder and `manifest.json` is updated automatically.
+Requires NVIDIA Warp with a working OpenGL backend (CPU/CUDA + GL or software GL). Images are written to this folder and `manifest.json` is updated automatically.
 
 All scenes use a unified background color: `0x112F41`.
 

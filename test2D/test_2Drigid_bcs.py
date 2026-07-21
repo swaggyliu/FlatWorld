@@ -2,7 +2,6 @@ import math
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -26,14 +25,14 @@ from flatworld import (
     SolidProp,
     Torque,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 # BENCHMARK MODE: Set to True to skip visualization and eliminate 41% rendering overhead
 BENCHMARK_MODE = True
 
 
 def test_2Drigid_bcs(headless=False):
-    ti.init(offline_cache=True, arch=ti.gpu)
+    init_sim()
     pi = math.pi
     radius = 0.01
     bcs2 = [EnforceAcc([0], [50, 0])]
@@ -155,9 +154,9 @@ def test_2Drigid_bcs(headless=False):
             pos11 = rigiddomain11.getCurrentRefPoint()
             pos12 = rigiddomain12.getCurrentRefPoint()
             mgr = looper.rigidManager
-            quat_arr = mgr.quat.to_numpy()
+            quat_arr = mgr.quat.numpy()
             idx13 = int(rigiddomain13.ndOffset)
-            angle13 = float(quat_arr[idx13][0])
+            angle13 = float(quat_arr[idx13])
             # pos13 = np.array([math.cos(angle13), math.sin(angle13)])
 
             checks = {

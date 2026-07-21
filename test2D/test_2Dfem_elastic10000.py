@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -9,11 +8,11 @@ sys.path.append(parent_dir)
 
 import argparse
 from flatworld import Elastic, ExplicitLoop, FemDomain, Gravity, Mesh, SolidProp
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Dfem_elastic(headless=False):
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
 
     numEl = 100
     dx = 0.6 / numEl
@@ -48,7 +47,7 @@ def test_2Dfem_elastic(headless=False):
     while gui is None or gui.running:
         looper.advanceWithTime(frame_dt)
         t += frame_dt
-        pos = looper.femSpringManager.coords.to_numpy()
+        pos = looper.femSpringManager.coords.numpy()
         if pos[0, 1] < 0.0:
             print("The time is: ", t)
             assert np.isclose(t, np.sqrt(0.6), atol=frame_dt)

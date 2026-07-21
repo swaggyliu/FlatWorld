@@ -1,6 +1,6 @@
 """
 Utility functions for test suite
-Provides headless mode detection and GUI initialization helpers
+Provides headless mode detection and GUI / Warp init helpers
 """
 
 import os
@@ -8,96 +8,56 @@ import sys
 
 
 def is_display_available():
-    """
-    Check if a display/GUI environment is available.
-
-    Returns:
-        bool: True if display is available, False otherwise
-    """
-    # Check for explicit headless flag in environment
+    """Check if a display/GUI environment is available."""
     if os.environ.get("HEADLESS", "").lower() in ("1", "true", "yes"):
         return False
 
-    # Check for CI environment variables
     ci_vars = ["CI", "CONTINUOUS_INTEGRATION", "GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI"]
     if any(os.environ.get(var) for var in ci_vars):
         return False
 
-    # Platform-specific checks
+    # Pytest + live OpenGL in one process is unstable on Windows (access
+    # violations inside Warp/pyglet). Opt in with FLATWORLD_GUI=1.
+    gui_opt_in = os.environ.get("FLATWORLD_GUI", "").lower() in ("1", "true", "yes")
+    if not gui_opt_in and ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")):
+        return False
+
     if sys.platform.startswith("linux"):
-        # Check for DISPLAY environment variable on Linux
         if not os.environ.get("DISPLAY"):
             return False
 
-    # If all checks pass, assume display is available
     return True
 
 
 def should_use_gui():
-    """
-    Determine if GUI should be used based on environment.
-    Can be overridden with --headless command line argument.
-
-    Returns:
-        bool: True if GUI should be used, False for headless mode
-    """
+    """Determine if GUI should be used based on environment."""
     return is_display_available()
 
 
-GALLERY_BG = 0x112F41
+def create_gui_if_available(title, res=(720, 720), background_color=0x112F41):
+    """Create a Warp-backed Viewer if a display is available.
 
-
-def create_gui_if_available(title, res=(720, 720), background_color=GALLERY_BG):
+    Under HEADLESS/CI, returns None so physics tests skip OpenGL entirely
+    (avoids flaky/hanging headless GL). Gallery capture should construct
+    ``Viewer(..., headless=True)`` directly when off-screen pixels are needed.
     """
-    Create a Taichi GUI if display is available, otherwise return None.
+    from flatworld.viewer import GALLERY_BG, create_viewer
 
-    Args:
-        title (str): Window title
-        res (tuple): Resolution (width, height)
-        background_color (int): Background color in hex format
+    if background_color is None:
+        background_color = GALLERY_BG
 
-    Returns:
-        ti.GUI or None: GUI object if display available, None otherwise
-    """
-    import taichi as ti
-
-    if is_display_available():
-        try:
-            return ti.GUI(title, res=res, background_color=background_color, show_gui=True)
-        except Exception as e:
-            print(f"Warning: Failed to create GUI: {e}")
-            print("Falling back to headless mode...")
-            return None
-    else:
-        print(f"Running in headless mode (no display available)")
+    if not is_display_available():
         return None
+    return create_viewer(title, res=res, background_color=background_color, headless=False)
 
 
 def create_window_if_available(title, size=(720, 720)):
-    """
-    Create a Taichi 3D `Window` if display is available, otherwise return None.
-    """
-    import taichi as ti
-
-    if is_display_available():
-        try:
-            return ti.ui.Window(title, size)
-        except Exception as e:
-            print(f"Warning: Failed to create ti.ui.Window: {e}")
-            print("Falling back to headless mode...")
-            return None
-    else:
-        print(f"Running in headless mode (no display available)")
-        return None
+    """3D window helper — maps to Viewer for Warp."""
+    return create_gui_if_available(title, res=size)
 
 
 def parse_test_args():
-    """
-    Parse common test arguments including --headless flag.
-
-    Returns:
-        argparse.Namespace: Parsed arguments
-    """
+    """Parse common test arguments including --headless flag."""
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -105,3 +65,15 @@ def parse_test_args():
         "--headless", action="store_true", help="Run without GUI (auto-detected if no display available)"
     )
     return parser.parse_args()
+
+
+def init_sim(prefer_cuda: bool = True, device: str | None = None) -> str:
+    """Initialize Warp for a test module."""
+    from flatworld.wp_init import init_warp
+
+    # CI / explicit env prefers CPU unless overridden
+    if device is None and os.environ.get("FLATWORLD_DEVICE"):
+        device = os.environ["FLATWORLD_DEVICE"]
+    if device is None and os.environ.get("CI"):
+        prefer_cuda = False
+    return init_warp(device=device, prefer_cuda=prefer_cuda)

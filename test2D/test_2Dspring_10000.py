@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -20,11 +19,11 @@ from flatworld import (
     SolidProp,
     SpringMassDomain,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Dspring(headless=False):
-    ti.init(offline_cache=True, arch=ti.gpu)
+    init_sim()
 
     numEl = 100
     dx = 0.6 / numEl
@@ -62,8 +61,8 @@ def test_2Dspring(headless=False):
         t += frame_dt
 
         # render
-        pos = looper.femSpringManager.coords.to_numpy()[: looper.femSpringManager.totalNodes[None]]
-        e2n = looper.femSpringManager.connectivity.to_numpy()[: looper.femSpringManager.totalElements[None]]
+        pos = looper.femSpringManager.coords.numpy()[: looper.femSpringManager.totalNodes.numpy()[0]]
+        e2n = looper.femSpringManager.connectivity.numpy()[: looper.femSpringManager.totalElements.numpy()[0]]
         a, b = pos[e2n[:, 0]], pos[e2n[:, 1]]
         if gui is not None:
             gui.circles(pos, radius=2, color=0xFFAA33)

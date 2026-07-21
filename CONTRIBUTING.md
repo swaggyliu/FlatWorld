@@ -27,7 +27,7 @@ CI runs on Ubuntu with `HEADLESS=1` and `CI=true` (no display required).
 
 ## Code style
 
-- Match the surrounding module: naming, imports, and Taichi kernel patterns.
+- Match the surrounding module: naming, imports, and Warp kernel patterns.
 - Keep changes focused; avoid unrelated refactors in the same PR.
 - Add or update tests when fixing bugs or adding features.
 

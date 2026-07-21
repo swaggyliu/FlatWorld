@@ -1,6 +1,5 @@
 import os
 import sys
-import taichi as ti
 import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,11 +22,11 @@ from flatworld.rigid import BallRigid, BoxRigid
 from flatworld.rigidmanager import RigidManager
 from math import pi
 import numpy as np
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_linkage(headless=False, kernel_profile=False):
-    ti.init(offline_cache=True, arch=ti.cpu, default_fp=ti.f32, kernel_profiler=False)
+    init_sim()
     gv = Gravity([0, -9.8])
     fixall = FixedAll([0])
     radius = 0.05
@@ -103,7 +102,7 @@ def test_linkage(headless=False, kernel_profile=False):
         # fps = 1.0 / avg_time if avg_time > 0 else 0
         # gui.text(f'Time: {t:.4f} s', pos=(0.02, 0.95), color=0x000000, font_size=24)
         # gui.text(f'FPS: {fps:.1f} ({avg_time*1000:.2f}ms/frame)', pos=(0.02, 0.90), color=0x000000, font_size=20)
-        # gui.text(f'Substeps: {looper.counter[None]}', pos=(0.02, 0.85), color=0x000000, font_size=20)
+        # gui.text(f'Substeps: {looper.counter.numpy()[0]}', pos=(0.02, 0.85), color=0x000000, font_size=20)
 
         if gui is not None:
             gui.show()

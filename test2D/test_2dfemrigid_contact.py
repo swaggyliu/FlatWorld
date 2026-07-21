@@ -2,7 +2,6 @@ from math import pi
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -21,7 +20,7 @@ from flatworld import (
     RigidBodyDomain,
     SolidProp,
 )
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 import time
 
 
@@ -32,7 +31,7 @@ def test_2Dfemrigid_contact(headless=False):
     - MeshRigid (triangle mesh rigid body)
     """
 
-    ti.init(offline_cache=True, arch=ti.cpu, kernel_profiler=False)
+    init_sim()
 
     # Create FEM deformable body (circle in the middle-bottom)
     msh = FEMesher(2)

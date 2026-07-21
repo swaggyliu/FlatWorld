@@ -2,7 +2,7 @@ import math
 import numpy as np
 import os
 import sys
-import taichi as ti
+from test_utils import init_sim, create_gui_if_available
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -24,7 +24,7 @@ from flatworld import (
 
 def edu_2d_1_4():
 
-    ti.init(offline_cache=True, arch=ti.cpu)
+    init_sim()
     rigid1 = BallRigid(2, [0.3, 0.3], 0.2, 1.0)
     rigid2 = BallRigid(2, [0.3 + math.sqrt(0.08), 0.2], 0.1, 1.0)
     bcs = [Gravity([0, -10.0])]
@@ -36,7 +36,10 @@ def edu_2d_1_4():
     frame_dt = 1.0 / 60.0
     looper = ExplicitLoop(0.0, domains, useAdapativeDT=True)
 
-    gui = ti.GUI("EDU2D", res=(720, 720), background_color=0xFFFFFF)
+    gui = create_gui_if_available('EDU2D', res=(720, 720), background_color=0x112F41)
+    if gui is None:
+        print('No display; skipping GUI loop')
+        return
     t = 0.0
     while gui.running and t < 10.0:
         # advance exactly one visual frame using adaptive substeps

@@ -1,9 +1,30 @@
 from definitions import *
 from numericaldomain import DomainBase
-import taichi as ti
+import numpy as np
 
 
-@ti.data_oriented
+def _to_np(x):
+    if hasattr(x, "numpy") and callable(getattr(x, "numpy")):
+        return x.numpy()
+    if hasattr(x, "to_numpy") and callable(getattr(x, "to_numpy")):
+        return x.to_numpy()
+    return np.asarray(x)
+
+
+def _vec_np(v):
+    return np.asarray(_to_np(v), dtype=np.float32).reshape(-1)
+
+
+def _patch_array(arr, index, value):
+    """Host write for Warp 1.14+ (no ``arr[i] =`` from Python)."""
+    if hasattr(arr, "numpy") and hasattr(arr, "assign"):
+        np_arr = arr.numpy()
+        np_arr[index] = value
+        arr.assign(np_arr)
+    else:
+        arr[index] = value
+
+
 class RigidBodyDomain(DomainBase):
     def __init__(
         self,
@@ -45,7 +66,7 @@ class RigidBodyDomain(DomainBase):
         self.category_bits = category_bits
         self.collide_bits = collide_bits
 
-    def attach(self, rigidManager, offset: ti.i32, domain_idx: int):
+    def attach(self, rigidManager, offset: int, domain_idx: int):
         """Attach this rigid domain to the RigidManager at the given offset.
 
         Args:
@@ -80,23 +101,21 @@ class RigidBodyDomain(DomainBase):
                 collide_bits = collide_bits & (~COLLISION_CATEGORY_GROUND)
         collide_bits = int(collide_bits) & 0b11111111
 
-        rigidManager.rigidDomainIds[self.ndOffset] = ti.Vector(
-            [
-                domain_idx,
-                self.rigid.rtype,
-                consider_flag,
-            ]
+        _patch_array(
+            rigidManager.rigidDomainIds,
+            self.ndOffset,
+            [domain_idx, self.rigid.rtype, consider_flag],
         )
         print(
             f"Attaching RigidBodyDomain '{self.name}' at offset {self.ndOffset} with category_bits={bin(category_bits)} and collide_bits={bin(collide_bits)}"
         )
-        rigidManager.category_bits[self.ndOffset] = category_bits
-        rigidManager.collide_bits[self.ndOffset] = collide_bits
+        _patch_array(rigidManager.category_bits, self.ndOffset, category_bits)
+        _patch_array(rigidManager.collide_bits, self.ndOffset, collide_bits)
 
         # Store reverse mapping (domain_idx -> rigid_idx) for fast lookup
-        rigidManager.domainToRigid[domain_idx] = self.ndOffset
+        _patch_array(rigidManager.domainToRigid, domain_idx, self.ndOffset)
         # Set per-rigid friction coefficient (default 0.0)
-        rigidManager.contactParams[self.ndOffset] = ti.Vector([self.friction, self.restitution])
+        _patch_array(rigidManager.contactParams, self.ndOffset, [self.friction, self.restitution])
 
         # Register visual mesh data for VTU export (if provided)
         if self.visual_mesh is not None:
@@ -113,24 +132,29 @@ class RigidBodyDomain(DomainBase):
         self,
     ):
         # Get bounding box using global domain index
-        domain_idx = int(self.rigidManager.rigidDomainIds[self.ndOffset][0])
-        return self.rigidManager.aabb[domain_idx, 0], self.rigidManager.aabb[domain_idx, 1]
+        domain_ids = _to_np(self.rigidManager.rigidDomainIds)
+        domain_idx = int(np.asarray(domain_ids[self.ndOffset]).reshape(-1)[0])
+        aabb = _to_np(self.rigidManager.aabb)
+        return aabb[domain_idx, 0], aabb[domain_idx, 1]
 
     def getCurrentRefPoint(self):
-        return self.rigidManager.rigidParams[self.ndOffset, 0].to_numpy()
+        params = _to_np(self.rigidManager.rigidParams)
+        return _vec_np(params[self.ndOffset, 0])
 
     def getCurrentRefAngles(self):
         """Return the current reference orientation angles (Euler angles) of the rigid body."""
-        angle = float(self.rigidManager.quat[self.ndOffset][0])
+        quat = _to_np(self.rigidManager.quat)
+        angle = float(np.asarray(quat[self.ndOffset]).reshape(-1)[0])
         if hasattr(self.rigidManager, "visual_angle"):
-            angle += float(self.rigidManager.visual_angle[self.ndOffset])
-        return ti.Vector([angle]).to_numpy()
+            vis = _to_np(self.rigidManager.visual_angle)
+            angle += float(np.asarray(vis[self.ndOffset]).reshape(-1)[0])
+        return np.array([angle], dtype=np.float32)
 
     def getCurrentVelocity(self):
-        return self.rigidManager.V[self.ndOffset].to_numpy()
+        return _vec_np(_to_np(self.rigidManager.V)[self.ndOffset])
 
     def getCurrentAngularVelocity(self):
-        return self.rigidManager.RotV[self.ndOffset].to_numpy()
+        return _vec_np(_to_np(self.rigidManager.RotV)[self.ndOffset])
 
     def draw(self, gui, color=0xFFFFFF, resolution=10):
         self.rigid.draw(gui, self.rigidManager, self.ndOffset, color, resolution)

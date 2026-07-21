@@ -1,15 +1,90 @@
-from contact_detection import (
-    detectPointToMeshBoundaries, pointToEdgeContact
-)
+from contact_detection import pointToEdgeContact
 from definitions import *
-import taichi as ti
-from utils import *
+from wp_init import ensure_warp
+import warp as wp
 
 
-@ti.data_oriented
+# ---------------------------------------------------------------------------
+# Spring–FEM contact kernel (2D)
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _spring_flex_contact_kernel(
+    num_nodes: int,
+    node_offset: int,
+    penalty: float,
+    friction_coeff: float,
+    fem_domain_idx: int,
+    num_bound_elements: int,
+    domain_boundary_elem_offset: wp.array(dtype=int),
+    boundary_elements: wp.array(dtype=wp.vec3i),
+    coords: wp.array(dtype=wp.vec2),
+    V: wp.array(dtype=wp.vec2),
+    Fext: wp.array(dtype=wp.vec2),
+):
+    tid = wp.tid()
+    if tid >= num_nodes:
+        return
+
+    global_node_idx = node_offset + tid
+    node_coord = coords[global_node_idx]
+    node_vel = V[global_node_idx]
+
+    element_offset = domain_boundary_elem_offset[fem_domain_idx]
+
+    best_penetration = float(1e9)
+    best_normal = wp.vec2(0.0, 0.0)
+    weights = wp.vec2(0.0, 0.0)
+    target_n0 = 0
+    target_n1 = 0
+    found_contact = int(0)
+
+    for j in range(num_bound_elements):
+        elem_id = j + element_offset
+        if elem_id < 0:
+            break
+
+        elem_conn = boundary_elements[elem_id]
+        n0 = coords[elem_conn[0]]
+        n1 = coords[elem_conn[1]]
+        pen, normal, cp, is_inside, w = pointToEdgeContact(node_coord, n0, n1, 2)
+
+        if pen < best_penetration and wp.abs(pen) < 1.0 and is_inside:
+            best_penetration = pen
+            best_normal = normal
+            weights = w
+            target_n0 = elem_conn[0]
+            target_n1 = elem_conn[1]
+            found_contact = 1
+
+    if found_contact == 1 and best_penetration < 0.0:
+        normal_force = -best_normal * penalty * best_penetration
+        total_force = normal_force
+
+        if friction_coeff > 1e-9:
+            surf_vel = V[target_n0] * weights[0] + V[target_n1] * weights[1]
+            relative_vel = node_vel - surf_vel
+            tangential_vel = relative_vel - wp.dot(relative_vel, best_normal) * best_normal
+            friction_force = wp.vec2(0.0, 0.0)
+
+            tlen = wp.length(tangential_vel)
+            if tlen > 1e-9:
+                friction_dir = -tangential_vel / tlen
+                friction_magnitude = friction_coeff * wp.length(normal_force)
+                friction_force = friction_dir * friction_magnitude
+
+            total_force = normal_force + friction_force
+
+        wp.atomic_add(Fext, global_node_idx, total_force)
+        wp.atomic_add(Fext, target_n0, -(total_force * weights[0]))
+        wp.atomic_add(Fext, target_n1, -(total_force * weights[1]))
+
+
 class ContactBase:
     def __init__(self, domain1, domain2, type, is_tied=False):
         """Create a Contact controller for two domains and a contact type."""
+        ensure_warp()
         self.domain1 = domain1
         self.domain2 = domain2
         self.penalty = 1.0
@@ -65,12 +140,10 @@ class ContactBase:
         )
         return stableTime
 
-    @ti.kernel
-    def update(self, dt: ti.f32):
+    def update(self, dt: float):
         pass
 
-    @ti.kernel
-    def calculate(self, dt: ti.f32):
+    def calculate(self, dt: float):
         pass
 
 
@@ -79,7 +152,6 @@ class ContactBase:
 # ====================================================================
 
 
-@ti.data_oriented
 class ContactFlexAnalytical(ContactBase):
     def __init__(self, domain1, domain2, type, is_tied=False):
         super().__init__(domain1, domain2, type, is_tied)
@@ -89,7 +161,6 @@ class ContactFlexAnalytical(ContactBase):
         self.stableTime = self.calStableTime(self.penalty, self.domain1)
 
 
-@ti.data_oriented
 class ContactFlexFlex(ContactBase):
     def __init__(self, domain1, domain2, type, is_tied=False):
         super().__init__(domain1, domain2, type, is_tied)
@@ -99,7 +170,6 @@ class ContactFlexFlex(ContactBase):
         self.stableTime = min(self.stableTime, self.calStableTime(self.penalty, self.domain2))
 
 
-@ti.data_oriented
 class ContactFlexRigid(ContactBase):
     def __init__(self, domain1, domain2, type, is_tied=False):
         super().__init__(domain1, domain2, type, is_tied)
@@ -109,8 +179,6 @@ class ContactFlexRigid(ContactBase):
         self.stableTime = self.calStableTime(self.penalty, self.domain1)
 
 
-
-@ti.data_oriented
 class ContactFlexHeightField(ContactBase):
     def __init__(self, domain1, domain2, type):
         super().__init__(domain1, domain2, type)
@@ -120,7 +188,6 @@ class ContactFlexHeightField(ContactBase):
         self.stableTime = self.calStableTime(self.penalty, self.domain1)
 
 
-@ti.data_oriented
 class ContactFlexVoxelMap(ContactBase):
     def __init__(self, domain1, domain2, type):
         super().__init__(domain1, domain2, type)
@@ -130,7 +197,6 @@ class ContactFlexVoxelMap(ContactBase):
         self.stableTime = self.calStableTime(self.penalty, self.domain1)
 
 
-@ti.data_oriented
 class ContactSpringFlex(ContactBase):
     _SPRING_PENALTY_SCALE = 100.0  # fixed multiplier for spring contacts
 
@@ -145,104 +211,35 @@ class ContactSpringFlex(ContactBase):
         self.penalty = min(penalty_spring, penalty_fem) * self._SPRING_PENALTY_SCALE
         self.stableTime = self.calStableTime(self.penalty, self.domain2)
 
-    @ti.func
-    def _detect_node_mesh_contact(self, nodeCoord, domain):
-        """Helper: detect contact between a point and mesh boundary elements by direct iteration.
+    def calculate(self, dt: float):
+        """Compute contact forces between SpringMass and FEM using direct iteration."""
+        if abs(dt) < 1e-9:
+            return
 
-        Returns: (found_contact, best_penetration, best_normal)
-        """
-        best_penetration = ti.f32(1e9)
-        best_normal = ti.Vector.zero(ti.f32, ti.static(self.domain1.d))
-        weights = ti.Vector.zero(ti.f32, ti.static(self.domain1.d))
-        targetElconn = ti.Vector.zero(ti.i32, ti.static(self.domain1.d))
+        mgr = self.domain1.femManager
+        node_offset = int(mgr.domainNodeOffset.numpy()[self.domain1.domainIdx])
+        friction_coeff = max(self.domain1.friction, self.domain2.friction)
+        num_bound = int(self.domain2.mesh.numBoundElements)
 
-        found_contact = False
-        target_mesh = domain.mesh
-        elementOffset = domain.femManager.domainBoundaryElemOffset[domain.domainIdx]
-
-        # Direct iteration over all boundary elements
-        for j in range(target_mesh.numBoundElements):
-            elem_id = j + elementOffset
-            if elem_id < 0:
-                break  # No more valid elements
-
-            # Get element nodes
-            elem_conn = domain.femManager.boundaryElements[elem_id]
-
-            pen = ti.f32(1e9)
-            normal = ti.Vector.zero(ti.f32, ti.static(self.domain1.d))
-            cp = nodeCoord
-            is_inside = False
-
-            # 2D: edge contact
-            n0 = domain.femManager.coords[elem_conn[0]]
-            n1 = domain.femManager.coords[elem_conn[1]]
-            pen, normal, cp, is_inside, weights = pointToEdgeContact(nodeCoord, n0, n1, self.domain1.d)
-
-            if pen < best_penetration and ti.abs(pen) < 1.0 and is_inside:
-                best_penetration = pen
-                best_normal = normal
-                targetElconn = elem_conn
-                found_contact = True
-
-        return found_contact, best_penetration, best_normal, weights, targetElconn
-
-    @ti.kernel
-    def calculate(self, dt: ti.f32):
-        """Kernel: compute contact forces between SpringMass and FEM using direct iteration."""
-        numLoops = self.domain1.nnodes
-        if ti.abs(dt) < 1e-9:
-            numLoops = 0
-
-        # Get SpringMass node offset in femSpringManager
-        node_offset = self.domain1.femManager.domainNodeOffset[self.domain1.domainIdx]
-        friction_coeff = ti.max(self.domain1.friction, self.domain2.friction)
-
-        # Domain1 (SpringMass) nodes against Domain2 (FEM) mesh
-        for i in range(numLoops):
-            global_node_idx = node_offset + i
-            nodeCoord = self.domain1.femManager.coords[global_node_idx]
-            node_vel = self.domain1.femManager.V[global_node_idx]
-
-            found_contact, penetration, normal, weights, targetElconn = self._detect_node_mesh_contact(
-                nodeCoord, self.domain2
-            )
-
-            if found_contact and penetration < 0.0:
-                # Normal force
-                normal_force = -normal * self.penalty * penetration
-                total_force = normal_force
-
-                # Friction force (simplified - relative to mesh surface)
-                # Estimate contact surface velocity from element nodes
-                if friction_coeff > 1e-9:
-                    surf_vel = ti.Vector.zero(ti.f32, self.domain1.d)
-                    surf_vel += self.domain2.femManager.V[targetElconn[0]] * weights[0]
-                    surf_vel += self.domain2.femManager.V[targetElconn[1]] * weights[1]
-
-                    relative_vel = node_vel - surf_vel
-                    tangential_vel = relative_vel - relative_vel.dot(normal) * normal
-                    friction_force = ti.Vector.zero(ti.f32, self.domain1.d)
-
-                    if tangential_vel.norm() > 1e-9:
-                        friction_dir = -tangential_vel.normalized()
-                        friction_magnitude = friction_coeff * normal_force.norm()
-                        friction_force = friction_dir * friction_magnitude
-                    else:
-                        friction_force = ti.Vector.zero(ti.f32, self.domain1.d)
-
-                    # Apply total force
-                    total_force = normal_force + friction_force
-
-                # Apply force to domain1 (SpringMass)
-                self.domain1.femManager.Fext[global_node_idx] += total_force
-
-                # Apply equal and opposite force to domain2 (distributed to element nodes)
-                self.domain2.femManager.Fext[targetElconn[0]] -= total_force * weights[0]
-                self.domain2.femManager.Fext[targetElconn[1]] -= total_force * weights[1]
+        wp.launch(
+            _spring_flex_contact_kernel,
+            dim=int(self.domain1.nnodes),
+            inputs=[
+                int(self.domain1.nnodes),
+                node_offset,
+                float(self.penalty),
+                float(friction_coeff),
+                int(self.domain2.domainIdx),
+                num_bound,
+                mgr.domainBoundaryElemOffset,
+                mgr.boundaryElements,
+                mgr.coords,
+                mgr.V,
+                mgr.Fext,
+            ],
+        )
 
 
-@ti.data_oriented
 class ContactSpringRigid(ContactBase):
     _SPRING_PENALTY_SCALE = 100.0
 
@@ -256,7 +253,6 @@ class ContactSpringRigid(ContactBase):
         self.stableTime = 0.5 * (self.domain1.mass / self.penalty) ** 0.5
 
 
-@ti.data_oriented
 class ContactSpringAnalytical(ContactBase):
     _SPRING_PENALTY_SCALE = 100.0
 
@@ -270,7 +266,6 @@ class ContactSpringAnalytical(ContactBase):
         self.stableTime = 0.5 * (self.domain1.mass / self.penalty) ** 0.5
 
 
-@ti.data_oriented
 class ContactSpringHeightField(ContactBase):
     _SPRING_PENALTY_SCALE = 100.0
 

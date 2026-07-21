@@ -1,60 +1,95 @@
-"""2D contact-detection and geometry-contact tests."""
+"""2D contact-detection and geometry-contact tests (Warp)."""
 
 import os
 import sys
 
 import pytest
-import taichi as ti
+import warp as wp
+from test_utils import init_sim
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
+from flatworld.contact_detection import detectPointToAnalyticalPlane, pointToEdgeContact
 
-if not ti.lang.impl.get_runtime().prog:
-    ti.init(offline_cache=True, arch=ti.cpu)
+init_sim()
+
+
+@wp.kernel
+def _k_plane_above(out: wp.array(dtype=float)):
+    p, _n, _c = detectPointToAnalyticalPlane(
+        wp.vec2(0.5, 1.0),
+        wp.vec2(0.0, 0.0),
+        wp.vec2(0.0, 1.0),
+    )
+    out[0] = p
+
+
+@wp.kernel
+def _k_plane_below(out: wp.array(dtype=float)):
+    p, _n, _c = detectPointToAnalyticalPlane(
+        wp.vec2(0.5, -0.5),
+        wp.vec2(0.0, 0.0),
+        wp.vec2(0.0, 1.0),
+    )
+    out[0] = p
+
+
+@wp.kernel
+def _k_plane_on(out: wp.array(dtype=float)):
+    p, _n, _c = detectPointToAnalyticalPlane(
+        wp.vec2(0.5, 0.0),
+        wp.vec2(0.0, 0.0),
+        wp.vec2(0.0, 1.0),
+    )
+    out[0] = p
+
+
+@wp.kernel
+def _k_edge_contact(out: wp.array(dtype=wp.vec2)):
+    p, _n, _c, is_inside, _w = pointToEdgeContact(
+        wp.vec2(0.5, 0.01),
+        wp.vec2(0.0, 0.0),
+        wp.vec2(1.0, 0.0),
+        2,
+    )
+    inside_f = 0.0
+    if is_inside:
+        inside_f = 1.0
+    out[0] = wp.vec2(p, inside_f)
+
+
+@wp.kernel
+def _k_edge_outside(out: wp.array(dtype=int)):
+    _p, _n, _c, is_inside, _w = pointToEdgeContact(
+        wp.vec2(2.0, 0.0),
+        wp.vec2(0.0, 0.0),
+        wp.vec2(1.0, 0.0),
+        2,
+    )
+    if is_inside:
+        out[0] = 1
+    else:
+        out[0] = 0
+
+
+def _run_float(kernel) -> float:
+    out = wp.zeros(1, dtype=float)
+    wp.launch(kernel, dim=1, inputs=[out])
+    return float(out.numpy()[0])
 
 
 def test_detect_point_to_plane_above_2d():
-    from flatworld.contact_detection import detectPointToAnalyticalPlane
-
-    @ti.kernel
-    def test_kernel() -> ti.f32:
-        point = ti.Vector([0.5, 1.0])
-        plane_point = ti.Vector([0.0, 0.0])
-        plane_normal = ti.Vector([0.0, 1.0])
-        p, _, _ = detectPointToAnalyticalPlane(point, plane_point, plane_normal)
-        return p
-
-    assert test_kernel() > 0
+    assert _run_float(_k_plane_above) > 0
 
 
 def test_detect_point_to_plane_below_2d():
-    from flatworld.contact_detection import detectPointToAnalyticalPlane
-
-    @ti.kernel
-    def test_kernel() -> ti.f32:
-        point = ti.Vector([0.5, -0.5])
-        plane_point = ti.Vector([0.0, 0.0])
-        plane_normal = ti.Vector([0.0, 1.0])
-        p, _, _ = detectPointToAnalyticalPlane(point, plane_point, plane_normal)
-        return p
-
-    assert test_kernel() < 0
+    assert _run_float(_k_plane_below) < 0
 
 
 def test_detect_point_on_plane_2d():
-    from flatworld.contact_detection import detectPointToAnalyticalPlane
-
-    @ti.kernel
-    def test_kernel() -> ti.f32:
-        point = ti.Vector([0.5, 0.0])
-        plane_point = ti.Vector([0.0, 0.0])
-        plane_normal = ti.Vector([0.0, 1.0])
-        p, _, _ = detectPointToAnalyticalPlane(point, plane_point, plane_normal)
-        return p
-
-    assert abs(test_kernel()) < 1e-5
+    assert abs(_run_float(_k_plane_on)) < 1e-5
 
 
 def test_ball_on_analytical_plane_stops_2d():
@@ -73,33 +108,17 @@ def test_ball_on_analytical_plane_stops_2d():
 
 
 def test_point_to_edge_contact_2d():
-    from flatworld.contact_detection import pointToEdgeContact
-
-    @ti.kernel
-    def test_kernel() -> ti.types.vector(2, ti.f32):
-        point = ti.Vector([0.5, 0.01])
-        edge_n0 = ti.Vector([0.0, 0.0])
-        edge_n1 = ti.Vector([1.0, 0.0])
-        p, _, _, is_inside, _ = pointToEdgeContact(point, edge_n0, edge_n1, 2)
-        return ti.Vector([p, ti.cast(is_inside, ti.f32)])
-
-    result = test_kernel()
+    out = wp.zeros(1, dtype=wp.vec2)
+    wp.launch(_k_edge_contact, dim=1, inputs=[out])
+    result = out.numpy()[0]
     assert result[0] < 1.0
     assert int(result[1]) == 1
 
 
 def test_point_to_edge_outside_projection_2d():
-    from flatworld.contact_detection import pointToEdgeContact
-
-    @ti.kernel
-    def test_kernel() -> ti.i32:
-        point = ti.Vector([2.0, 0.0])
-        edge_n0 = ti.Vector([0.0, 0.0])
-        edge_n1 = ti.Vector([1.0, 0.0])
-        _, _, _, is_inside, _ = pointToEdgeContact(point, edge_n0, edge_n1, 2)
-        return is_inside
-
-    assert test_kernel() == 0
+    out = wp.zeros(1, dtype=int)
+    wp.launch(_k_edge_outside, dim=1, inputs=[out])
+    assert int(out.numpy()[0]) == 0
 
 
 if __name__ == "__main__":

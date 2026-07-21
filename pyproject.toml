@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flatworld"
 version = "0.1.0"
-description = "Taichi-based 2D/3D physics engine with FEM, rigid bodies, and mixed contact"
+description = "Warp-based 2D/3D physics engine with FEM, rigid bodies, and mixed contact"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [{ name = "Dongyu Liu" }]
-keywords = ["taichi", "physics", "fem", "rigid-body", "simulation"]
+keywords = ["warp", "physics", "fem", "rigid-body", "simulation"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -19,13 +19,14 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "taichi>=1.7.0",
+    "warp-lang>=1.7.0",
     "numpy>=1.24",
     "scipy>=1.10",
     "tetgen>=0.6",
     "meshio>=5.3",
     "pymeshlab>=2023.12",
     "usd-core>=24.0",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]

@@ -2,7 +2,6 @@ import math
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -22,12 +21,12 @@ from flatworld import (
     RigidBodyDomain,
 )
 from flatworld.joints import RevoluteJoint, WeldJoint
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2Dsolar_system(headless=False):
 
-    ti.init(arch=ti.cpu, debug=False)
+    init_sim()
     sun_radius_vis = 0.06
 
     earth_orbit_radius = 0.25
@@ -84,7 +83,7 @@ def test_2Dsolar_system(headless=False):
 
         # Get current positions from rigidManager
         # mgr = looper.rigidManager
-        # params = mgr.rigidParams.to_numpy()
+        # params = mgr.rigidParams.numpy()
         # pos_sun = params[0, 0, :2]      # rigiddomain1 (index 0)
         # pos_earth = params[1, 0, :2]    # rigiddomain2 (index 1)
         # pos_moon = params[2, 0, :2]     # rigiddomain3 (index 2)

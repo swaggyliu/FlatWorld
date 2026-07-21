@@ -1,7 +1,6 @@
 import numpy as np
 import os
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -10,12 +9,12 @@ sys.path.append(parent_dir)
 import argparse
 from flatworld import BallRigid, Elastic, ExplicitLoop, FemDomain, FEMesher, Gravity, Mesh, RigidBodyDomain, SolidProp
 # from learning import RigidExport
-# from test_utils import create_gui_if_available
+# from test_utils import create_gui_if_available, init_sim
 
 
 # def test_2Drigid_contact(headless=False):
 
-#     ti.init(offline_cache=True, arch=ti.cpu)
+#     init_sim()
 #     export = RigidExport()
 
 #     rigid1 = BallRigid(2, [0.5, 0.8], 0.1, 1.0)

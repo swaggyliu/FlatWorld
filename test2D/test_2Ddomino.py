@@ -8,7 +8,6 @@ import os
 
 # Add parent directory to path
 import sys
-import taichi as ti
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -19,12 +18,12 @@ from flatworld import GroundDomain
 from flatworld.definitions import *
 from flatworld.explicitloop import ExplicitLoop
 from flatworld import BallRigid, BoxRigid
-from test_utils import create_gui_if_available
+from test_utils import create_gui_if_available, init_sim
 
 
 def test_2drigid_domino(headless=False):
 
-    ti.init(offline_cache=True, arch=ti.cuda, device_memory_GB=4.0, debug=False)
+    init_sim()
 
     # scene parameters
     d = 2  # 2D simulation
@@ -80,7 +79,9 @@ def test_2drigid_domino(headless=False):
 
     # Set the initial speed for the trigger ball
     ball_rigid_idx = ball_domain.ndOffset
-    looper.rigidManager.V[ball_rigid_idx] = ti.Vector(ball_initial_velocity)
+    v_np = looper.rigidManager.V.numpy()
+    v_np[ball_rigid_idx] = ball_initial_velocity
+    looper.rigidManager.V.assign(v_np)
 
     # createGUI
     window_width = 800
@@ -140,6 +141,8 @@ def test_2drigid_domino(headless=False):
 
             gui.show()
 
+    if gui is not None:
+        gui.close()
     print("Simulation ends")
 
 
