@@ -57,7 +57,8 @@ def _partition_objects(
 ):
     """Insertion-sort partition of sorted_indices[start:end] by center[axis]."""
     for i in range(start + 1, end):
-        key_idx = sorted_indices[i]
+        # Warp 1.15+: array loads used as indices must be plain ints (not refs).
+        key_idx = int(sorted_indices[i])
         key_value = objects[key_idx].center[axis]
         j = int(i - 1)
         done = int(0)
@@ -65,10 +66,11 @@ def _partition_objects(
             if done == 0:
                 do_shift = int(0)
                 if j >= start:
-                    if objects[sorted_indices[j]].center[axis] > key_value:
+                    sj = int(sorted_indices[j])
+                    if objects[sj].center[axis] > key_value:
                         do_shift = 1
                 if do_shift == 1:
-                    sorted_indices[j + 1] = sorted_indices[j]
+                    sorted_indices[j + 1] = int(sorted_indices[j])
                     j = j - 1
                 else:
                     done = 1
@@ -95,8 +97,8 @@ def _build_node(
         level_width = 1 << itn
         for lp in range(level_width):
             offset = level_width - 1
-            start = starts[offset + lp]
-            end = ends[offset + lp]
+            start = int(starts[offset + lp])
+            end = int(ends[offset + lp])
             node = nodes[node_index]
 
             count = end - start
@@ -105,7 +107,7 @@ def _build_node(
                 aabb_max = wp.vec2(-1e9, -1e9)
 
                 for i in range(start, end):
-                    idx = sorted_indices[i]
+                    idx = int(sorted_indices[i])
                     obj = objects[idx]
                     aabb_min = wp.min(aabb_min, obj.aabb_min)
                     aabb_max = wp.max(aabb_max, obj.aabb_max)
@@ -114,7 +116,8 @@ def _build_node(
                 node.aabb_max = aabb_max
 
                 if count <= MAX_OBJECTS_PER_LEAF:
-                    node.primitive_id = objects[sorted_indices[start]].primitive_id
+                    leaf_idx = int(sorted_indices[start])
+                    node.primitive_id = int(objects[leaf_idx].primitive_id)
                     node.left_child = -1
                     node.right_child = -1
                     node.is_leaf = 1
@@ -133,13 +136,13 @@ def _build_node(
                         left_index = -1
                     else:
                         node_count[0] = node_count[0] + 1
-                        left_index = node_count[0]
+                        left_index = int(node_count[0])
 
                     if end - mid < MAX_OBJECTS_PER_LEAF:
                         right_index = -1
                     else:
                         node_count[0] = node_count[0] + 1
-                        right_index = node_count[0]
+                        right_index = int(node_count[0])
 
                     child_offset = (1 << (itn + 1)) - 1
                     starts[child_offset + 2 * lp] = start
@@ -184,8 +187,8 @@ def _build_subtree_func(
         level_width = 1 << itn
         for lp in range(level_width):
             offset = level_width - 1
-            start = starts[offset + lp]
-            end = ends[offset + lp]
+            start = int(starts[offset + lp])
+            end = int(ends[offset + lp])
             node = nodes[node_index]
 
             count = end - start
@@ -194,7 +197,7 @@ def _build_subtree_func(
                 aabb_max = wp.vec2(-1e9, -1e9)
 
                 for i in range(start, end):
-                    idx = sorted_indices[i]
+                    idx = int(sorted_indices[i])
                     obj = objects[idx]
                     aabb_min = wp.min(aabb_min, obj.aabb_min)
                     aabb_max = wp.max(aabb_max, obj.aabb_max)
@@ -203,7 +206,8 @@ def _build_subtree_func(
                 node.aabb_max = aabb_max
 
                 if count <= MAX_OBJECTS_PER_LEAF:
-                    node.primitive_id = objects[sorted_indices[start]].primitive_id
+                    leaf_idx = int(sorted_indices[start])
+                    node.primitive_id = int(objects[leaf_idx].primitive_id)
                     node.left_child = -1
                     node.right_child = -1
                     node.is_leaf = 1
@@ -222,13 +226,13 @@ def _build_subtree_func(
                         left_index = -1
                     else:
                         node_count[0] = node_count[0] + 1
-                        left_index = node_count[0]
+                        left_index = int(node_count[0])
 
                     if end - mid < MAX_OBJECTS_PER_LEAF:
                         right_index = -1
                     else:
                         node_count[0] = node_count[0] + 1
-                        right_index = node_count[0]
+                        right_index = int(node_count[0])
 
                     child_offset = (1 << (itn + 1)) - 1
                     starts[child_offset + 2 * lp] = start
@@ -270,7 +274,7 @@ def _add_one_object_kernel(
 ):
     lb = aabb_arrays[pid, 0]
     ub = aabb_arrays[pid, 1]
-    idx = object_count[0]
+    idx = int(object_count[0])
     if idx < max_nodes:
         buffer = wp.vec2(0.0, 0.0)
         if set_buffer_zone == 1:
@@ -295,12 +299,13 @@ def _add_objects_batch_kernel(
     objects: wp.array(dtype=Object2D),
     object_count: wp.array(dtype=int),
 ):
+    base = int(object_count[0])
     for k in range(count):
-        pid = ids[k]
-        eid = env_ids[k]
+        pid = int(ids[k])
+        eid = int(env_ids[k])
         lb = aabb_arrays[pid, 0]
         ub = aabb_arrays[pid, 1]
-        idx = object_count[0] + k
+        idx = base + k
         if idx < max_nodes:
             buffer = 0.1 * (ub - lb)
             obj = Object2D()
@@ -310,7 +315,7 @@ def _add_objects_batch_kernel(
             obj.primitive_id = pid
             obj.env_id = eid
             objects[idx] = obj
-    object_count[0] = object_count[0] + count
+    object_count[0] = base + count
 
 
 @wp.kernel
@@ -324,7 +329,7 @@ def _update_objects_kernel(
     if i >= object_count[0]:
         return
     obj = objects[i]
-    pid = obj.primitive_id
+    pid = int(obj.primitive_id)
     lb = aabb_arrays[pid, 0]
     ub = aabb_arrays[pid, 1]
     if set_buffer_zone == 1:
@@ -392,18 +397,20 @@ def _refit_kernel(
     node_count: wp.array(dtype=int),
 ):
     # Serial bottom-up refit (launch dim=1) — children must be ready first.
-    nc = node_count[0]
+    nc = int(node_count[0])
     for istep in range(nc):
         i = nc - istep - 1
         node_i = nodes[i]
-        if node_i.is_leaf == 1:
-            pid = node_i.primitive_id
+        if int(node_i.is_leaf) == 1:
+            pid = int(node_i.primitive_id)
             node_i.aabb_min = aabb_arrays[pid, 0]
             node_i.aabb_max = aabb_arrays[pid, 1]
             nodes[i] = node_i
         else:
-            left_node = nodes[node_i.left_child]
-            right_node = nodes[node_i.right_child]
+            left_i = int(node_i.left_child)
+            right_i = int(node_i.right_child)
+            left_node = nodes[left_i]
+            right_node = nodes[right_i]
             node_i.aabb_min = wp.min(left_node.aabb_min, right_node.aabb_min)
             node_i.aabb_max = wp.max(left_node.aabb_max, right_node.aabb_max)
             nodes[i] = node_i
@@ -420,7 +427,7 @@ def _detect_inner_collision_kernel(
     max_pairs: int,
 ):
     ia = wp.tid()
-    nc = node_count[0]
+    nc = int(node_count[0])
     if ia >= nc:
         return
 
@@ -429,32 +436,32 @@ def _detect_inner_collision_kernel(
     stack_size = int(1)
 
     node_a = nodes[node_a_idx]
-    node_a_is_leaf = node_a.is_leaf
+    node_a_is_leaf = int(node_a.is_leaf)
     node_a_aabb_min = node_a.aabb_min
     node_a_aabb_max = node_a.aabb_max
-    node_a_prim_id = node_a.primitive_id
+    node_a_prim_id = int(node_a.primitive_id)
 
     while stack_size > 0:
         stack_size = stack_size - 1
-        node_b_idx = stack[ia, stack_size]
+        node_b_idx = int(stack[ia, stack_size])
 
         node_b = nodes[node_b_idx]
-        node_b_is_leaf = node_b.is_leaf
+        node_b_is_leaf = int(node_b.is_leaf)
         node_b_aabb_min = node_b.aabb_min
         node_b_aabb_max = node_b.aabb_max
-        node_b_prim_id = node_b.primitive_id
-        node_b_left = node_b.left_child
-        node_b_right = node_b.right_child
+        node_b_prim_id = int(node_b.primitive_id)
+        node_b_left = int(node_b.left_child)
+        node_b_right = int(node_b.right_child)
 
         if (node_a_is_leaf == 1) and (node_a_idx > node_b_idx):
             if aabb_intersect(node_a_aabb_min, node_a_aabb_max, node_b_aabb_min, node_b_aabb_max):
                 if node_b_is_leaf == 1:
                     if node_a_prim_id != node_b_prim_id:
-                        # Index objects by primitive_id (same as original Taichi).
+                        # Index objects by primitive_id (same as original implementation).
                         obj_a = objects[node_a_prim_id]
                         obj_b = objects[node_b_prim_id]
                         skip_pair = int(0)
-                        if obj_a.env_id >= 0 and obj_b.env_id >= 0:
+                        if int(obj_a.env_id) >= 0 and int(obj_b.env_id) >= 0:
                             skip_pair = 1
                         if skip_pair == 0:
                             pair_index = int(wp.atomic_add(pair_count, 0, 1))
@@ -481,32 +488,32 @@ def _detect_inner_collision_per_env_kernel(
     max_pairs: int,
 ):
     ia = wp.tid()
-    nc = node_count[0]
+    nc = int(node_count[0])
     if ia >= nc:
         return
 
     node_a_idx = nc - 1 - ia
     node_a = nodes[node_a_idx]
-    node_a_is_leaf = node_a.is_leaf
+    node_a_is_leaf = int(node_a.is_leaf)
     node_a_aabb_min = node_a.aabb_min
     node_a_aabb_max = node_a.aabb_max
-    node_a_prim_id = node_a.primitive_id
+    node_a_prim_id = int(node_a.primitive_id)
 
-    root = node_subtree_root[node_a_idx]
+    root = int(node_subtree_root[node_a_idx])
     stack[ia, 0] = root
     stack_size = int(1)
 
     while stack_size > 0:
         stack_size = stack_size - 1
-        node_b_idx = stack[ia, stack_size]
+        node_b_idx = int(stack[ia, stack_size])
 
         node_b = nodes[node_b_idx]
-        node_b_is_leaf = node_b.is_leaf
+        node_b_is_leaf = int(node_b.is_leaf)
         node_b_aabb_min = node_b.aabb_min
         node_b_aabb_max = node_b.aabb_max
-        node_b_prim_id = node_b.primitive_id
-        node_b_left = node_b.left_child
-        node_b_right = node_b.right_child
+        node_b_prim_id = int(node_b.primitive_id)
+        node_b_left = int(node_b.left_child)
+        node_b_right = int(node_b.right_child)
 
         if (node_a_is_leaf == 1) and (node_a_idx > node_b_idx):
             if aabb_intersect(node_a_aabb_min, node_a_aabb_max, node_b_aabb_min, node_b_aabb_max):
