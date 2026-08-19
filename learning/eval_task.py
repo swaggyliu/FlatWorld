@@ -62,6 +62,7 @@ def main():
             recorded["actions"].append(actions)
             recorded["goal"].append(r["goal"])
             recorded["success"].append(r["success"])
+            recorded["target_idx"].append(r["target_idx"])
         records.append({k: v for k, v in r.items() if k != "frames"})
         if (i + 1) % 10 == 0 or i == 0:
             rate = n_success / (i + 1)
@@ -97,6 +98,7 @@ def main():
             actions=np.array(recorded["actions"], dtype=object),
             goal=np.asarray(recorded["goal"], dtype=np.float32),
             success=np.asarray(recorded["success"]),
+            target_idx=np.asarray(recorded["target_idx"]),
         )
 
     print("-" * 60)

@@ -295,6 +295,21 @@ class PushToGoalTask:
         settle_frame = self.budget
 
         t = 0
+
+        def hold_zero():
+            """Zero force for one planning stride (momentum/settle pause)."""
+            nonlocal obs, t
+            self.env.set_force((0.0, 0.0))
+            for _ in range(self.stride):
+                obs = self.env.step(np.zeros(2, dtype=np.float32))
+                t += 1
+                if t >= self.budget:
+                    break
+            if record:
+                frames["obj_states"].append(obs["obj_states"])
+                frames["contact_mask"].append(obs["contact_mask"])
+                frames["actions"].append(np.zeros(2, dtype=np.float32))
+
         while t < self.budget:
             cur = self.env._observe()  # fresh observation (same as last step's obs)
             target_pos = cur["obj_states"][self.target_idx, :2]
@@ -306,6 +321,30 @@ class PushToGoalTask:
                 settle_frame = t
                 self.env.set_force((0.0, 0.0))
                 break
+            is_box = int(self.env.obj_types[self.target_idx]) == 1
+            if is_box:
+                # Boxes are pushed with a force just above their max slide
+                # force, which on a light / low-friction box means up to
+                # ~6 m/s^2 of acceleration. The kinematic push prior is
+                # velocity-blind, so built-up momentum can carry the box
+                # far past the goal. Two velocity-gated pauses fix that:
+                # - momentum gate: while the box moves faster than 0.25 m/s,
+                #   hold zero force and let friction bleed the kinetic energy
+                #   (bounded overshoot v^2 / (2 mu g) <= ~0.01 m)
+                # - settle window: inside the tolerance, stop pushing at
+                #   any speed below the gate -- friction stops a 0.25 m/s
+                #   box within ~1 cm, while "topping off" a nearly-arrived
+                #   box only adds kick + coast momentum (and pressing it
+                #   keeps PGS contact jitter above the success speed check)
+                if target_vel > 0.25 or d < self.tol:
+                    hold_zero()
+                    continue
+            elif d < 0.75 * self.tol:
+                # Balls roll smoothly and the release-coast prior already
+                # stops the push early; inside 0.75*tol a zero-force glide
+                # lets rolling resistance finish the job
+                hold_zero()
+                continue
 
             z0 = self.planner.encode_obs(cur)
             # center distance between EE and target at contact
@@ -315,18 +354,39 @@ class PushToGoalTask:
             # 0.06) are pushed at the EE floor height with a force cap
             # between their max slide force (mu*m*g <= 2.5 N) and min tip
             # force (m*g*0.12/0.102 >= 3.54 N), so they always slide and
-            # never tip. Balls roll and may use the full actuator range.
+            # never tip. Both types get an intentionally overestimated
+            # release coast (see below).
             ee_floor = self.cfg.scene.ee_radius + 0.005
             if int(self.env.obj_types[self.target_idx]) == 1:      # box
                 contact_y = ee_floor
-                slip = 0.06        # sliding friction lag
-                coast = 0.0        # boxes stop almost immediately
-                fcap = 2.9         # slide-without-tip window
+                slip = 0.02        # near-zero lag: pushed boxes track the
+                                  # contact front (force is above the slide
+                                  # threshold, so they do not trail it)
+                coast = 0.1        # small residual release coast: the
+                                  # momentum gate caps the box speed at
+                                  # 0.25 m/s, so the true coast after
+                                  # release is <= ~1 cm (v^2 / 2 mu g).
+                                  # A larger prior coast stops the push
+                                  # short of the goal and the box stalls
+                                  # just outside the tolerance
+                fcap = 2.7         # slide-without-tip window, close to the
+                                  # max slide force: slow push, little
+                                  # release momentum
             else:                                                  # ball
                 contact_y = max(float(goal[1]), ee_floor)
                 slip = 0.0         # rolling: stays at the contact front
-                coast = 0.4        # rolls on ~40% of the push distance
-                fcap = 4.5         # gentler push: less momentum to dissipate
+                coast = 0.9        # strongly overestimate release rolling
+                                  # (clamped to 0.15 m): a pushed ball
+                                  # accelerates hard (low mass, Coulomb
+                                  # rolling resistance), so stopping the
+                                  # push early and letting it roll in is
+                                  # the only reliable way to land on the
+                                  # goal; undershoot is recoverable, over-
+                                  # shoot is not (push-right-only prior)
+                fcap = 3.0         # gentle push: the approach kick plus
+                                  # release momentum must stay below the
+                                  # modeled coast or the ball overshoots
+                                  # unrecoverably
             action = self.planner.plan(z0, self.ee_idx, self.target_idx, goal,
                                        standoff, contact_y, slip, coast, fcap,
                                        states_now=cur["obj_states"])

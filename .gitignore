@@ -63,6 +63,9 @@ depracted/
 # learning module: generated data / checkpoints / logs / debug dumps
 learning/data/
 learning/checkpoints/
-learning/results/
+learning/results/*
+!learning/results/*.png
+!learning/results/*.json
+!learning/results/*.csv
 *.txt
 !requirements.txt

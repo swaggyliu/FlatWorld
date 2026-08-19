@@ -18,45 +18,64 @@ from learning.configs.default import Config
 from learning.env.flatworld_wrapper import PushSceneEnv
 
 
+def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray) -> np.ndarray:
+    """Soft workspace walls shared by ALL collection modes.
+
+    With the real (wide) box geometry the EE gets blocked by the pile and
+    ejected upward by the contact solver; an unbounded collector then spends
+    episodes at y > 1 m being yanked back down, which both biases the action
+    distribution (mean Fy ~ -2 N) and buries the force -> motion signal.
+    The barrier force is part of the stored action, so the model still
+    learns the true applied-force-to-motion mapping.
+    """
+    c = cfg.collect
+    k = c.barrier_k
+    if ee_pos[0] < c.x_lo:
+        a[0] += k * (c.x_lo - ee_pos[0])
+    elif ee_pos[0] > c.x_hi:
+        a[0] -= k * (ee_pos[0] - c.x_hi)
+    if ee_pos[1] < c.y_lo:
+        a[1] += k * (c.y_lo - ee_pos[1])
+    elif ee_pos[1] > c.y_hi:
+        a[1] -= k * (ee_pos[1] - c.y_hi)
+    return a
+
+
 def sample_action(rng: np.random.Generator, cfg: Config, prev: np.ndarray,
                   ee_pos: np.ndarray, obj_pos: np.ndarray,
-                  mode: str = "attract", push_cmd: np.ndarray = None) -> np.ndarray:
+                  mode: str = "attract", cmd: np.ndarray = None) -> np.ndarray:
     """Smooth random force. Three collection modes (see run_rollout):
 
-    - "attract": OU noise + weak attraction toward the nearest object.
-      Guarantees rich contact data.
-    - "free": symmetric OU noise only (plus soft workspace barriers).
-      Teaches the true force -> EE-motion mapping and the "objects stay
-      still without contact" gating; the attraction-biased data alone
-      makes the model believe the EE drifts right regardless of force.
+    - "free": unbiased force sweep -- a constant random force held for a
+      random interval (re-sampled by the caller). Teaches the true
+      force -> EE-motion mapping in BOTH axes with no directional bias;
+      the attraction-biased data alone makes the model believe force has
+      almost no effect on the EE.
+    - "attract": OU noise + capped attraction toward the nearest object
+      with a vertical deadband near the ground band, so the EE approaches
+      at push height instead of being pressed into the ground plane.
     - "push": constant commanded force toward/away from the nearest
       object, alternating on a timer (push ... withdraw ...). Teaches
       contact making/breaking and that released objects stop moving.
     """
     c = cfg.collect
-    if mode == "push" and push_cmd is not None:
-        a = push_cmd + 0.3 * c.ou_sigma * rng.standard_normal(2)
+    if mode in ("push", "free") and cmd is not None:
+        a = cmd + 0.2 * c.ou_sigma * rng.standard_normal(2)
     else:
         a = c.ou_theta * prev + c.ou_sigma * rng.standard_normal(2)
         if mode == "attract":
             d = obj_pos - ee_pos
             dist = float(np.linalg.norm(d))
             u = d / max(dist, 1e-6)
-            mag = np.clip(dist * c.attract_gain, 0.0, c.force_max * 0.7)
+            mag = np.clip(dist * c.attract_gain, 0.0, c.attract_cap)
+            # vertical deadband: near the ground the attraction is
+            # horizontal-only (the EE must not dig into the ground plane
+            # while approaching an object resting on it)
+            if ee_pos[1] < 0.16:
+                u[1] = 0.0
+                u = u / max(float(np.linalg.norm(u)), 1e-6)
             a = a + u * mag
-        else:
-            # soft barriers keep the free-space walk inside the working
-            # volume [x 0.15..1.70, y 0.12..0.30] without biasing the
-            # force distribution inside it
-            k = 12.0
-            if ee_pos[0] < 0.15:
-                a[0] += k * (0.15 - ee_pos[0])
-            elif ee_pos[0] > 1.70:
-                a[0] -= k * (ee_pos[0] - 1.70)
-            if ee_pos[1] < 0.12:
-                a[1] += k * (0.12 - ee_pos[1])
-            elif ee_pos[1] > 0.30:
-                a[1] -= k * (ee_pos[1] - 0.30)
+    a = apply_barriers(a, cfg, ee_pos)
     return np.clip(a, -c.force_max, c.force_max).astype(np.float32)
 
 
@@ -70,10 +89,13 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
     sums = [obs["tactile_summary"]]
     actions = []
 
-    # mode mix: 30% free / 50% attract / 20% push-withdraw
+    # mode mix: 40% free sweep / 35% attract / 25% push-withdraw.
+    # Free sweeps dominate because the wide-box scene blocks the EE in
+    # contact-heavy modes; without enough clean F = ma data the model
+    # learns an attenuated, biased force response.
     u = rng.random()
-    mode = "free" if u < 0.30 else ("attract" if u < 0.80 else "push")
-    push_cmd = None
+    mode = "free" if u < 0.40 else ("attract" if u < 0.75 else "push")
+    cmd = None
     phase_left = 0
     pushing = True
 
@@ -83,17 +105,25 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         obj_pos_all = obs["obj_states"][1:, :2]
         nearest = obj_pos_all[np.argmin(
             np.linalg.norm(obj_pos_all - ee_pos, axis=1))]
-        if mode == "push":
-            if phase_left <= 0:
+        if phase_left <= 0:
+            # (re-)sample the constant commanded force of the phase
+            if mode == "free":
+                # unbiased sweep: random direction, random magnitude
+                phase_left = int(rng.integers(12, 25))
+                ang = rng.uniform(0.0, 2.0 * np.pi)
+                mag = float(rng.uniform(c.sweep_min, c.sweep_max) * c.force_max)
+                cmd = np.array([np.cos(ang), np.sin(ang)]) * mag
+            elif mode == "push":
                 # switch phase: push toward the object, then withdraw
                 pushing = not pushing
                 phase_left = int(rng.integers(20, 50))
                 d = nearest - ee_pos
                 dist = max(float(np.linalg.norm(d)), 1e-6)
                 mag = float(rng.uniform(0.35, 0.95) * c.force_max)
-                push_cmd = (d / dist) * (mag if pushing else -mag)
+                cmd = (d / dist) * (mag if pushing else -mag)
+        if mode != "attract":
             phase_left -= 1
-        a = sample_action(rng, cfg, a, ee_pos, nearest, mode, push_cmd)
+        a = sample_action(rng, cfg, a, ee_pos, nearest, mode, cmd)
         obs = env.step(a)
         actions.append(a)
         states.append(obs["obj_states"])

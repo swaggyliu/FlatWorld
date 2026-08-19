@@ -19,10 +19,19 @@ class SceneConfig:
     ee_radius: float = 0.1
     ee_mass: float = 1.0
     ee_height: float = 0.15          # EE hover height (roughly at object mid-height)
+    # Admittance control: the commanded force acts against a viscous term
+    # (-c * v) and the speed is hard-clamped. Without damping the EE is an
+    # undamped double integrator -- contact solver impulses launch it
+    # meters across the scene and the force -> motion statistics (and any
+    # model trained on them) are garbage.
+    ee_damping: float = 4.0          # N / (m/s)
+    ee_vel_max: float = 2.0          # m/s hard cap on the EE speed
 
     # Objects
     num_boxes: int = 3
-    box_ext: tuple = (0.12, 0.12)    # box half-extents (half_w, half_h)
+    # FLAT boxes: wide stance + low CoM so they slide instead of tipping
+    # when pushed (a square box tips on spawn jitter and on any push).
+    box_ext: tuple = (0.12, 0.06)    # box half-extents (half_w, half_h)
     box_mass: float = 0.5
     num_balls: int = 2
     ball_radius: float = 0.08
@@ -77,6 +86,20 @@ class CollectConfig:
     ou_theta: float = 0.85           # OU inertia (larger = smoother trajectory)
     ou_sigma: float = 1.5            # OU noise intensity
     attract_gain: float = 6.0        # N/m, attraction toward the nearest object
+    attract_cap: float = 1.5         # N, attraction magnitude cap (an uncapped
+                                     # attraction yanks the EE across the scene
+                                     # and buries the force -> motion signal)
+    # free-mode force sweep magnitude, fraction of force_max
+    sweep_min: float = 0.15
+    sweep_max: float = 1.0
+    # soft workspace barriers shared by all collection modes (N/m gain and
+    # bounds): keep the EE inside the working volume so the contact solver
+    # cannot eject it to y > 1 m (out-of-distribution for the planner)
+    barrier_k: float = 12.0
+    x_lo: float = 0.12
+    x_hi: float = 1.72
+    y_lo: float = 0.105              # just above the ground (ee_radius margin)
+    y_hi: float = 0.42
     out_dir: str = "learning/data/rollouts"
 
 
