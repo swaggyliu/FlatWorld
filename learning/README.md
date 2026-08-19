@@ -124,6 +124,11 @@ planner then reliably fled the target. The balanced mix removes the bias.
   m/s within a 300-frame budget
 - force limit 6 N (covers the domain-randomized friction range)
 
+Current result (v3 model, 120 epochs): **76.7% success** (23/30 episodes),
+mean final distance 0.066 m, mean settle frame 125 — see
+`results/task_success_summary.png`, `results/scene_rollouts.png` and
+`results/training_curves.png`.
+
 ## CEM planner details
 
 The planner rolls out candidate force sequences through the **learned**
