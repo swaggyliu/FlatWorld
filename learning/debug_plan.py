@@ -14,7 +14,7 @@ def main():
                           stride=stride,
                           planner_kwargs=dict(horizon=8, population=96,
                                               iterations=4, seed=7))
-    rng = np.random.default_rng(1007)   # a failing box-push episode
+    rng = np.random.default_rng(1002)   # a failing box-push episode
     obs = task.env.reset(rng)
     task.target_idx = task._pick_target(obs)
     goal = task._sample_goal(np.random.default_rng(7), obs, task.target_idx)
@@ -30,13 +30,15 @@ def main():
         if int(task.env.obj_types[task.target_idx]) == 1:
             contact_y = ee_floor
             slip = 0.06
+            coast = 0.0
             fcap = 2.9
         else:
             contact_y = max(float(goal[1]), ee_floor)
             slip = 0.0
-            fcap = None
+            coast = 0.4
+            fcap = 4.5
         a = task.planner.plan(z0, 0, task.target_idx, goal, standoff, contact_y,
-                              slip, fcap, states_now=cur["obj_states"])
+                              slip, coast, fcap, states_now=cur["obj_states"])
         for _ in range(stride):
             obs = task.env.step(a)
             t += 1

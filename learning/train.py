@@ -77,6 +77,9 @@ def main():
                         help="teacher-forcing window length during training "
                              "(validation always uses 50 for long rollouts)")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4,
+                        help="L2 regularization; diverse-scene datasets are "
+                             "small and overfit without it")
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--stride", type=int, default=5,
                         help="frame-skip / action repeat: one model step "
