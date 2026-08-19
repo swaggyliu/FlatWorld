@@ -58,3 +58,11 @@ tmp/
 temp/
 scratch/
 depracted/
+*.npz
+
+# learning module: generated data / checkpoints / logs / debug dumps
+learning/data/
+learning/checkpoints/
+learning/results/
+*.txt
+!requirements.txt

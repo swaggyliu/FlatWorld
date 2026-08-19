@@ -54,6 +54,14 @@ pytest test2D/test_2Dfem_elastic.py
 
 51 test files under `test2D/` cover FEM, rigid contact, joints, friction, and all ground types.
 
+## Learning world models
+
+[`learning/`](learning/README.md) contains a lightweight **state + tactile
+conditioned latent world model** (StateLeWM) trained inside FlatWorld:
+random-push data collection, latent dynamics training with anti-collapse
+losses, and CEM/MPC planning for a PushToGoal task with success-rate
+evaluation.
+
 ## Gallery
 
 Live-rendered screenshots from `test2D` demos:
