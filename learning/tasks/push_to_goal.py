@@ -91,8 +91,8 @@ class CEMPlanner:
 
     def plan(self, z0: torch.Tensor, ee_idx: int, target_idx: int,
              goal: np.ndarray, standoff: float = 0.2, contact_y: float = 0.105,
-             slip: float = 0.0, force_cap: float = None,
-             states_now: np.ndarray = None):
+             slip: float = 0.0, coast_frac: float = 0.0,
+             force_cap: float = None, states_now: np.ndarray = None):
         """Optimize an action sequence. Returns best first action (2,) in N.
 
         The learned latent dynamics are used to roll out the EE trajectory
@@ -112,6 +112,11 @@ class CEMPlanner:
         EE contact front by this amount (friction lag for sliding boxes;
         0 for rolling balls). Without it the prior is over-optimistic and
         the CEM stops pushing too early.
+        coast_frac: fraction of the push distance that the target keeps
+        ROLLING after contact ends (balls coast, boxes stop almost
+        immediately). The projected final position is
+        pushed + coast_frac * (pushed - start), so the CEM stops pushing
+        early enough that the coast lands the target on the goal.
         force_cap: optional per-call horizontal force bound (N). Boxes are
         capped below their tipping threshold; balls may use the full range.
 
@@ -179,14 +184,20 @@ class CEMPlanner:
                     # right, and only as far as the EE contact front
                     # (minus the slip margin)
                     pushed = torch.maximum(pushed, ee_x + standoff - slip)
-                    d_goal = (pushed - goal_x).abs()
+                    # projected resting position: rolling targets keep
+                    # coasting after release (measured ~40% of push dist)
+                    proj = pushed + torch.clamp(
+                        coast_frac * (pushed - tgt_x0), max=0.15)
+                    d_goal = (proj - goal_x).abs()
                     # flat push: keep the EE level with the target center
                     d_align = (ee_y - tgt_y).abs()
                     cost = cost + d_goal + self.approach_cost * d_app \
                         + self.align_cost * d_align \
                         + self.action_cost * (a[:, t] ** 2).mean(dim=-1)
                 # terminal costs: goal distance + approach carry-over
-                cost = cost + 2.0 * (pushed - goal_x).abs() \
+                proj = pushed + torch.clamp(
+                    coast_frac * (pushed - tgt_x0), max=0.15)
+                cost = cost + 2.0 * (proj - goal_x).abs() \
                     + self.approach_cost * torch.relu(contact_x - ee_x)
 
             idx = torch.argsort(cost)[: self.E]
@@ -309,13 +320,15 @@ class PushToGoalTask:
             if int(self.env.obj_types[self.target_idx]) == 1:      # box
                 contact_y = ee_floor
                 slip = 0.06        # sliding friction lag
+                coast = 0.0        # boxes stop almost immediately
                 fcap = 2.9         # slide-without-tip window
             else:                                                  # ball
                 contact_y = max(float(goal[1]), ee_floor)
                 slip = 0.0         # rolling: stays at the contact front
-                fcap = None        # full actuator range
+                coast = 0.4        # rolls on ~40% of the push distance
+                fcap = 4.5         # gentler push: less momentum to dissipate
             action = self.planner.plan(z0, self.ee_idx, self.target_idx, goal,
-                                       standoff, contact_y, slip, fcap,
+                                       standoff, contact_y, slip, coast, fcap,
                                        states_now=cur["obj_states"])
             # Hold the planned action for `stride` frames (matches the
             # frame-skipped dynamics the world model was trained on)
