@@ -20,19 +20,40 @@ import numpy as np
 class Normalizer:
     """Per-dimension standardization for flat feature groups."""
 
-    KEYS = ("obj_states", "actions", "contact_feat", "tactile_summary")
+    KEYS = ("obj_states", "actions", "contact_feat", "tactile_summary", "obj_geom")
 
     def __init__(self):
         self.stats = {}  # key -> {"mean": (D,), "std": (D,)}
 
     # ---------------- fitting ----------------
     @staticmethod
+    def _default_geom(d) -> np.ndarray:
+        types = d["obj_types"]
+        n = len(types)
+        g = np.zeros((n, 2), dtype=np.float64)
+        g[0] = (0.1, 0.1)
+        for i, t in enumerate(types):
+            if i == 0:
+                continue
+            if int(t) == 1:
+                g[i] = (0.12, 0.06)
+            else:
+                g[i] = (0.08, 0.08)
+        return g
+
+    @staticmethod
     def _collect_flat(files: list, key: str, masked: bool = False):
         chunks = []
         masks = []
         for f in files:
             d = np.load(f)
-            arr = d[key].astype(np.float64)
+            if key not in d.files:
+                if key == "obj_geom":
+                    arr = Normalizer._default_geom(d)
+                else:
+                    continue
+            else:
+                arr = d[key].astype(np.float64)
             chunks.append(arr.reshape(-1, arr.shape[-1]))
             if masked:
                 m = d["contact_mask"].astype(np.float64).reshape(-1, 1)

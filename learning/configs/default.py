@@ -49,14 +49,16 @@ class SceneConfig:
     # Domain randomization (Phase 2): multiplicative mass factor and friction
     # are re-sampled per episode reset so the world model must learn the
     # general dynamics instead of memorizing one parameter setting.
-    # Ranges are sized so the 2.9 N box force cap always slides any box
-    # BELOW its tipping threshold (boxes are 0.24 x 0.12, contact at EE
-    # height 0.102): max slide force mu*m*g = 0.5*0.5*10 = 2.5 N < 2.9 N
-    # cap < min tip force mg*0.12/0.102 = 3.54 N.
     dr_enabled: bool = True
-    dr_mass_range: tuple = (0.6, 1.0)      # factor applied to base masses (objects)
-    dr_ee_mass_range: tuple = (0.8, 1.2)   # milder range for the end-effector
-    dr_friction_range: tuple = (0.3, 0.5)
+    dr_mass_range: tuple = (0.5, 1.4)
+    dr_ee_mass_range: tuple = (0.8, 1.2)
+    dr_friction_range: tuple = (0.2, 0.7)
+    # Per-object size ranges (half-extents). Boxes stay wider than tall
+    # so they slide rather than tip. Sampled in env.reset.
+    dr_size_enabled: bool = True
+    dr_box_hw: tuple = (0.08, 0.18)
+    dr_box_hh: tuple = (0.04, 0.12)
+    dr_ball_r: tuple = (0.05, 0.12)
     restitution: float = 0.05              # near-elastic contact makes light
                                            # boxes bounce forever on the ground
                                            # (PGS corner jitter); keep it low
@@ -99,7 +101,7 @@ class CollectConfig:
     x_lo: float = 0.12
     x_hi: float = 1.72
     y_lo: float = 0.105              # just above the ground (ee_radius margin)
-    y_hi: float = 0.42
+    y_hi: float = 0.55
     out_dir: str = "learning/data/rollouts"
 
 
