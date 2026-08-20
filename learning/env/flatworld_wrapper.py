@@ -108,42 +108,130 @@ class PushSceneEnv:
         self.rigid_ids = [self.ee_idx] + [d.ndOffset for d in self.obj_domains]
         self.obj_types_np = np.asarray(self.obj_types, dtype=np.int64)
         self.n_obj = len(self.rigid_ids)
+        self.obj_geom = np.zeros((self.n_obj, 2), dtype=np.float32)
+        self.obj_geom[0] = (sc.ee_radius, sc.ee_radius)
+        for i, t in enumerate(self.obj_types):
+            if i == 0:
+                continue
+            if t == OBJ_TYPE_BOX:
+                self.obj_geom[i] = sc.box_ext
+            else:
+                self.obj_geom[i] = (sc.ball_radius, sc.ball_radius)
 
         # Base dynamics for domain randomization (Phase 2)
         self.base_mass = [sc.ee_mass] + [r.mass for r in self.obj_rigids]
+        self.obj_mass = np.asarray(self.base_mass, dtype=np.float32)
+        self.obj_mu = np.full(self.n_obj, sc.friction, dtype=np.float32)
         self._noise_rng = np.random.default_rng(0)
 
     # ------------------------------------------------------------------ #
     # Randomization / lifecycle
     # ------------------------------------------------------------------ #
+    def _randomize_sizes(self, rng: np.random.Generator):
+        """Sample per-object half-extents and patch collision geometry.
+
+        ``rm.reset()`` restores pose but not extents/radius, so we write
+        ``rigidParams[idx, 1]`` and ``radius`` after reset.
+        """
+        sc = self.cfg.scene
+        self.obj_geom[0] = (sc.ee_radius, sc.ee_radius)
+        if not sc.dr_size_enabled:
+            for i, t in enumerate(self.obj_types):
+                if i == 0:
+                    continue
+                if t == OBJ_TYPE_BOX:
+                    self.obj_geom[i] = sc.box_ext
+                    self.obj_half_heights[i] = sc.box_ext[1]
+                    self.obj_rigids[i - 1].ext = np.array(
+                        [2.0 * sc.box_ext[0], 2.0 * sc.box_ext[1]], dtype=np.float32)
+                else:
+                    self.obj_geom[i] = (sc.ball_radius, sc.ball_radius)
+                    self.obj_half_heights[i] = sc.ball_radius
+                    self.obj_rigids[i - 1].radius = sc.ball_radius
+            return
+        for i, t in enumerate(self.obj_types):
+            if i == 0:
+                continue
+            rigid = self.obj_rigids[i - 1]
+            if t == OBJ_TYPE_BOX:
+                hw = float(rng.uniform(*sc.dr_box_hw))
+                hh = float(rng.uniform(*sc.dr_box_hh))
+                if hw < hh:
+                    hw, hh = hh, hw
+                rigid.ext = np.array([2.0 * hw, 2.0 * hh], dtype=np.float32)
+                self.obj_geom[i] = (hw, hh)
+                self.obj_half_heights[i] = hh
+            else:
+                r = float(rng.uniform(*sc.dr_ball_r))
+                rigid.radius = r
+                self.obj_geom[i] = (r, r)
+                self.obj_half_heights[i] = r
+
+    def _rest_height(self, i: int) -> float:
+        """Center y so the object's bottom sits on the ground + spawn_drop.
+
+        Boxes: ``BoxRigid.ext`` is the FULL extent; collision uses half of
+        ``rigidParams[idx, 1]``, so rest y = 0.5 * ext_y + drop.
+        Balls: rest y = radius + drop.
+        """
+        drop = float(self.cfg.scene.spawn_drop)
+        if self.obj_types[i] == OBJ_TYPE_BOX:
+            ext_y = float(self.obj_rigids[i - 1].ext[1])
+            return 0.5 * ext_y + drop
+        if self.obj_types[i] == OBJ_TYPE_BALL:
+            return float(self.obj_rigids[i - 1].radius) + drop
+        return float(self.cfg.scene.ee_radius) + drop
+
+    def _apply_geom_to_rm(self):
+        """Write sampled sizes into the live RigidManager arrays."""
+        for i, gid in enumerate(self.rigid_ids):
+            if i == 0:
+                continue
+            t = self.obj_types[i]
+            rigid = self.obj_rigids[i - 1]
+            if t == OBJ_TYPE_BOX:
+                _patch_array(self.rm.rigidParams, (gid, 1), rigid.ext)
+            else:
+                _patch_array(self.rm.radius, gid, float(rigid.radius))
+
+    def _seat_on_ground(self):
+        """Re-seat every object after size patch so bottoms do not go through y=0."""
+        sc = self.cfg.scene
+        self.ee_rigid.origin[1] = np.float32(
+            max(float(self.ee_rigid.origin[1]), sc.ee_radius + sc.spawn_drop))
+        _patch_array(self.rm.rigidParams, (self.ee_idx, 0), self.ee_rigid.origin)
+        for i, gid in enumerate(self.rigid_ids):
+            if i == 0:
+                continue
+            rigid = self.obj_rigids[i - 1]
+            rest_y = self._rest_height(i)
+            rigid.origin[1] = np.float32(rest_y)
+            self.obj_half_heights[i] = rest_y - sc.spawn_drop
+            if self.obj_types[i] == OBJ_TYPE_BOX:
+                self.obj_geom[i, 1] = 0.5 * float(rigid.ext[1])
+            else:
+                r = float(rigid.radius)
+                self.obj_geom[i] = (r, r)
+            _patch_array(self.rm.rigidParams, (gid, 0), rigid.origin)
+
     def _randomize_layout(self, rng: np.random.Generator):
         sc = self.cfg.scene
-        # Shuffle object order, advance an x cursor to guarantee min gaps.
-        # The FIRST object in the order (the leftmost one, which the push
-        # task targets) gets a reserved free run ahead so its goal is
-        # always reachable without shoving the whole pile.
-        half_widths = (
-            [max(sc.box_ext)] * sc.num_boxes + [sc.ball_radius] * sc.num_balls
-        )
         order = rng.permutation(len(self.obj_rigids))
+        half_widths = [float(self.obj_geom[i + 1, 0]) for i in range(len(self.obj_rigids))]
         span = sc.area_x[1] - sc.area_x[0]
         total_half = sum(2 * half_widths[i] for i in order)
-        slack = max(span - total_half - sc.min_gap * (len(order) - 1)
-                    - sc.first_gap, 0.0)
+        slack = max(span - total_half - sc.min_gap * len(order), 0.0)
         x = sc.area_x[0]
         for k, i in enumerate(order):
             x += half_widths[i]
-            hh = self.obj_half_heights[i + 1]  # +1: index 0 is the EE
             self.obj_rigids[i].origin[0] = np.float32(x)
-            self.obj_rigids[i].origin[1] = np.float32(hh + sc.spawn_drop)
-            gap = sc.first_gap if k == 0 else (
-                sc.min_gap + rng.random() * 0.5 * slack / max(len(order), 1))
+            self.obj_rigids[i].origin[1] = np.float32(self._rest_height(i + 1))
+            gap = sc.min_gap + rng.random() * 0.5 * slack / max(len(order), 1)
             x += half_widths[i] + gap
 
-        # EE approaches the object pile from the left (spawn zone stays clear
-        # of the object region so no initial overlap can occur)
         self.ee_rigid.origin[0] = np.float32(rng.uniform(*sc.ee_spawn_x))
-        self.ee_rigid.origin[1] = np.float32(sc.ee_height)
+        self.ee_rigid.origin[1] = np.float32(
+            max(sc.ee_height, sc.ee_radius + sc.spawn_drop))
 
     def _randomize_dynamics(self, rng: np.random.Generator):
         """Phase 2 domain randomization: per-episode mass / inertia / friction.
@@ -159,26 +247,42 @@ class PushSceneEnv:
             else:
                 factor = rng.uniform(*sc.dr_mass_range)
             m = self.base_mass[i] * factor
-            # 2D rotational inertia about z, recomputed for the new mass
             if i == 0:
                 I = 0.5 * m * sc.ee_radius ** 2
             elif self.obj_types[i] == OBJ_TYPE_BOX:
-                w, h = 2 * sc.box_ext[0], 2 * sc.box_ext[1]
+                w, h = 2.0 * self.obj_geom[i, 0], 2.0 * self.obj_geom[i, 1]
                 I = (1.0 / 12.0) * m * (w * w + h * h)
             else:
-                I = 0.5 * m * sc.ball_radius ** 2
+                r = float(self.obj_geom[i, 0])
+                I = 0.5 * m * r * r
             mu = rng.uniform(*sc.dr_friction_range) if i > 0 else sc.friction
             _patch_array(self.rm.mass, gid, float(m))
             _patch_array(self.rm.inertia, gid, float(I))
             _patch_array(self.rm.contactParams, gid, [mu, restitution])
 
+    def _cache_body_params(self):
+        """Snapshot live mass / friction for the planner (index = object slot)."""
+        mass_np = np.asarray(self.rm.mass.numpy())
+        cp_np = np.asarray(self.rm.contactParams.numpy())
+        self.obj_mass = np.array(
+            [float(mass_np[gid]) for gid in self.rigid_ids], dtype=np.float32)
+        self.obj_mu = np.array(
+            [float(cp_np[gid, 0]) for gid in self.rigid_ids], dtype=np.float32)
+
     def reset(self, rng: np.random.Generator = None) -> dict:
         """Randomize the layout and reset. Returns the initial observation."""
         rng = rng or np.random.default_rng()
+        self._randomize_sizes(rng)
         self._randomize_layout(rng)
-        self.looper.reset()  # delegates to rm.reset() (repacks from rigid.origin) + BVH rebuild
+        # Extents must be in RM *before* reset rebuilds bboxes, otherwise a
+        # leftover taller box/ball is tested against the new lower rest pose.
+        self._apply_geom_to_rm()
+        self.looper.reset()  # pose from rigid.origin; extents already patched
+        self._seat_on_ground()
+        self.rm.updateBBox()
         if self.cfg.scene.dr_enabled:
             self._randomize_dynamics(rng)
+        self._cache_body_params()
         self._noise_rng = np.random.default_rng(int(rng.integers(1 << 31)))
         self.set_force((0.0, 0.0))
         return self._observe()
@@ -207,8 +311,12 @@ class PushSceneEnv:
             v = self.rm.V.numpy()[self.ee_idx]
             a = a - sc.ee_damping * v
             # actuator saturation: the net force stays within the same
-            # range the actions were collected in
-            fmax = self.cfg.collect.force_max
+            # range the actions were collected in, unless a caller
+            # (pile-clear) raises the cap for this step.
+            fmax = float(self.cfg.collect.force_max)
+            override = getattr(self, "force_cap_override", None)
+            if override is not None:
+                fmax = max(fmax, float(override))
             a = np.clip(a, -fmax, fmax)
         self.set_force(a)
         self.looper.advanceWithTime(sc.frame_dt)
@@ -252,6 +360,7 @@ class PushSceneEnv:
         return {
             "obj_states": states,
             "obj_types": self.obj_types_np,
+            "obj_geom": self.obj_geom.copy(),
             "contact_feat": cfeat,
             "contact_mask": cmask,
             "tactile_summary": csum,

@@ -17,29 +17,36 @@ import numpy as np
 import torch
 
 from learning.configs.default import Config
-from learning.tasks.push_to_goal import PushToGoalTask, load_model
+from learning.tasks.push_to_goal import PushToGoalTask, load_ensemble
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="learning/checkpoints/best.pt")
+    parser.add_argument("--checkpoint", type=str, default="learning/checkpoints")
     parser.add_argument("--episodes", type=int, default=50)
-    parser.add_argument("--budget", type=int, default=150)
+    parser.add_argument("--budget", type=int, default=300)
     parser.add_argument("--tol", type=float, default=0.08)
     parser.add_argument("--seed", type=int, default=1000)
-    parser.add_argument("--horizon", type=int, default=12)
+    parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--population", type=int, default=96)
     parser.add_argument("--iterations", type=int, default=4)
-    parser.add_argument("--record", type=int, default=6, help="episodes to record trajectories")
+    parser.add_argument("--target-mode", type=str, default="leftmost",
+                        choices=("leftmost", "random"))
+    parser.add_argument("--record", type=int, default=50,
+                        help="episodes to record trajectories")
+    parser.add_argument("--tag", type=str, default="",
+                        help="optional suffix for output files, e.g. random")
     parser.add_argument("--results", type=str, default="learning/results")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = Config()
     cfg.collect.force_max = 6.0
-    model, norm, stride = load_model(args.checkpoint, device)
+    model, norm, stride = load_ensemble(args.checkpoint, device)
+    n_models = len(model) if isinstance(model, list) else 1
     task = PushToGoalTask(cfg, model, norm, device=device, tol=args.tol,
                           budget=args.budget, stride=stride,
+                          target_mode=args.target_mode,
                           planner_kwargs=dict(horizon=args.horizon,
                                               population=args.population,
                                               iterations=args.iterations,
@@ -47,7 +54,7 @@ def main():
 
     records = []
     recorded = {"states": [], "masks": [], "actions": [], "goal": [],
-                "success": [], "target_idx": []}
+                "success": [], "target_idx": [], "geom": []}
     t0 = time.time()
     n_success = 0
     for i in range(args.episodes):
@@ -63,6 +70,7 @@ def main():
             recorded["goal"].append(r["goal"])
             recorded["success"].append(r["success"])
             recorded["target_idx"].append(r["target_idx"])
+            recorded["geom"].append(task._geom().copy())
         records.append({k: v for k, v in r.items() if k != "frames"})
         if (i + 1) % 10 == 0 or i == 0:
             rate = n_success / (i + 1)
@@ -84,21 +92,27 @@ def main():
         "std_final_dist": float(np.std(dists)),
         "mean_settle_frame": float(np.mean(frames)),
         "elapsed_s": elapsed,
+        "n_models": n_models,
+        "target_mode": args.target_mode,
         "planner": {"horizon": args.horizon, "population": args.population,
                     "iterations": args.iterations},
     }
     os.makedirs(args.results, exist_ok=True)
-    with open(os.path.join(args.results, "task_eval.json"), "w", encoding="utf-8") as f:
+    suffix = f"_{args.tag}" if args.tag else ""
+    eval_path = os.path.join(args.results, f"task_eval{suffix}.json")
+    traj_path = os.path.join(args.results, f"task_trajectories{suffix}.npz")
+    with open(eval_path, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "episodes": records}, f, indent=2)
     if recorded["states"]:
         np.savez_compressed(
-            os.path.join(args.results, "task_trajectories.npz"),
+            traj_path,
             states=np.array(recorded["states"], dtype=object),
             masks=np.array(recorded["masks"], dtype=object),
             actions=np.array(recorded["actions"], dtype=object),
             goal=np.asarray(recorded["goal"], dtype=np.float32),
             success=np.asarray(recorded["success"]),
             target_idx=np.asarray(recorded["target_idx"]),
+            geom=np.stack(recorded["geom"]).astype(np.float32),
         )
 
     print("-" * 60)
