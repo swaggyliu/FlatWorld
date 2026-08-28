@@ -86,7 +86,10 @@ class StateTactileEncoder(nn.Module):
         self.node_proj = mlp([64 + 32 + 32, obj_embed_dim], out_norm=True)
 
         if self.rich_edges:
-            edge_in = state_dim + 3 + 2   # +vn, vt (rel already has vel)
+            # rel is the 6-d state delta (xy already includes vx,vy,ω).
+            # Extra collision scalars: dist, gap, contact, vn, vt → 11.
+            # Not the predictor's 10-d pack (xy-rel + rel_v + prev_contact).
+            edge_in = state_dim + 3 + 2
             msg_in = obj_embed_dim * 2 + 64
             self.node_upd = nn.GRUCell(obj_embed_dim + 1, obj_embed_dim)
         else:

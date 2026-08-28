@@ -11,10 +11,12 @@ policy) supplies `(Fx, Fy)` on the end-effector.
 
 ## Overview
 
-Default scene: **1 circular EE + 3 boxes + 2 balls** (`N = 6`). Index 0 is
-always the EE. Weights are **shared across bodies** (like a CNN over
-pixels): one encoder / predictor / decoder, applied to every object. `N`
-is not baked into the parameter shapes.
+Default scene still has **N = 6** bodies: 1 circular EE + 3 boxes + 2 balls
+(counts are not randomized). Tensor index 0 is always the EE; along *x* the
+EE sits at a **random rank** and the five objects are shuffled each reset.
+Weights are **shared across bodies** (like a CNN over pixels): one encoder /
+predictor / decoder, applied to every object. `N` is not baked into the
+parameter shapes.
 
 ```
  per frame

@@ -21,6 +21,28 @@ from .decoder import StateTactileDecoder
 from .predictor import LatentPredictor
 
 
+def rich_edges_from_checkpoint(ckpt) -> bool:
+    """Flag stored on pair14+ best.pt; infer from weight shapes if missing.
+
+    ``*_last.pt`` historically omitted ``rich_edges``. Defaulting to False
+    then builds the pre-pair14 GRU (no degree channel) and ``load_state_dict``
+    fails on pair14+ weights.
+    """
+    if "rich_edges" in ckpt:
+        return bool(ckpt["rich_edges"])
+    sd = ckpt.get("model") or {}
+    w = sd.get("encoder.node_upd.weight_ih")
+    if w is not None:
+        return int(w.shape[-1]) > 64  # 65 = obj embed + contact degree
+    if "predictor.vel_head.weight" in sd:
+        return True
+    w = sd.get("predictor.cell.weight_ih")
+    if w is not None:
+        lat = int(ckpt.get("latent_dim", 128))
+        return int(w.shape[-1]) > 2 * lat + 2
+    return True
+
+
 class StateLeWM(nn.Module):
     def __init__(self, n_obj: int, num_obj_types: int = 3, latent_dim: int = 128,
                  n_mp: int = 2, drop_tactile: bool = False, drop_geom: bool = False,

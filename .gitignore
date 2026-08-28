@@ -59,6 +59,7 @@ scratch/
 depracted/
 *.npz
 *.png
+results/*
 
 # learning module: generated data / checkpoints / logs / debug dumps
 learning/data/

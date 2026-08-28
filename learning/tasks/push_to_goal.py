@@ -17,7 +17,7 @@ import torch
 
 from learning.data.normalizer import Normalizer
 from learning.env.flatworld_wrapper import PushSceneEnv
-from learning.models.lewm import StateLeWM
+from learning.models.lewm import StateLeWM, rich_edges_from_checkpoint
 from learning.planner import CEMPlanner
 
 
@@ -28,7 +28,7 @@ def _load_one(ckpt_path: str, device: str):
         n_mp=int(ckpt.get("n_mp", 2)),
         drop_tactile=bool(ckpt.get("drop_tactile", False)),
         drop_geom=bool(ckpt.get("drop_geom", False)),
-        rich_edges=bool(ckpt.get("rich_edges", False)),
+        rich_edges=rich_edges_from_checkpoint(ckpt),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

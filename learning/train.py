@@ -24,6 +24,25 @@ from learning.data.normalizer import Normalizer
 from learning.models.lewm import StateLeWM
 
 
+def _ckpt_dict(model, n_obj, args, epoch, seed, val=None):
+    payload = {
+        "model": model.state_dict(),
+        "n_obj": n_obj,
+        "latent_dim": args.latent_dim,
+        "n_mp": int(getattr(args, "n_mp", 2)),
+        "drop_tactile": bool(getattr(args, "drop_tactile", False)),
+        "drop_geom": bool(getattr(args, "drop_geom", False)),
+        "rich_edges": bool(getattr(args, "rich_edges", True)),
+        "stride": args.stride,
+        "normalizer": "normalizer.json",
+        "epoch": epoch,
+        "seed": seed,
+    }
+    if val is not None:
+        payload["val"] = {k: float(v) for k, v in val.items()}
+    return payload
+
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     """Validation losses + latent statistics + long-horizon open-loop error."""
@@ -175,39 +194,14 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
                   f"z_std {val['z_std']:.3f}")
             if epoch >= min_epoch and score < best_val:
                 best_val = score
-                torch.save({"model": model.state_dict(),
-                            "n_obj": n_obj,
-                            "latent_dim": args.latent_dim,
-                            "n_mp": int(getattr(args, "n_mp", 2)),
-                            "drop_tactile": bool(getattr(args, "drop_tactile", False)),
-                            "drop_geom": bool(getattr(args, "drop_geom", False)),
-                            "rich_edges": bool(getattr(args, "rich_edges", True)),
-                            "stride": args.stride,
-                            "normalizer": "normalizer.json",
-                            "epoch": epoch,
-                            "seed": seed,
-                            "val": {k: float(v) for k, v in val.items()}},
+                torch.save(_ckpt_dict(model, n_obj, args, epoch, seed, val),
                            best_path)
 
-    torch.save({"model": model.state_dict(), "n_obj": n_obj,
-                "latent_dim": args.latent_dim,
-                "n_mp": int(getattr(args, "n_mp", 2)),
-                "drop_tactile": bool(getattr(args, "drop_tactile", False)),
-                "drop_geom": bool(getattr(args, "drop_geom", False)),
-                "stride": args.stride,
-                "normalizer": "normalizer.json", "epoch": args.epochs,
-                "seed": seed},
+    torch.save(_ckpt_dict(model, n_obj, args, args.epochs, seed),
                os.path.join(args.out, out_name.replace(".pt", "_last.pt")))
     if not os.path.exists(best_path):
         # nothing passed min_epoch filter (short run); keep last as best
-        torch.save({"model": model.state_dict(), "n_obj": n_obj,
-                    "latent_dim": args.latent_dim,
-                    "n_mp": int(getattr(args, "n_mp", 2)),
-                    "drop_tactile": bool(getattr(args, "drop_tactile", False)),
-                    "drop_geom": bool(getattr(args, "drop_geom", False)),
-                    "stride": args.stride,
-                    "normalizer": "normalizer.json", "epoch": args.epochs,
-                    "seed": seed}, best_path)
+        torch.save(_ckpt_dict(model, n_obj, args, args.epochs, seed), best_path)
     print(f"  member done. best val score {best_val:.5f} -> {best_path}")
     return best_path
 
