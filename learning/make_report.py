@@ -3,15 +3,16 @@ rendered task scenes.
 
 Usage (repo root):
     python -m learning.make_report
+    python -m learning.make_report --pair19
+    python -m learning.make_report --tag pair19ens_H32_random
 
 Inputs:  learning/results/train_log.csv
-         learning/results/task_eval.json
-         learning/results/task_trajectories.npz
-Outputs: learning/results/training_curves.png
-         learning/results/task_success_summary.png
-         learning/results/scene_rollouts.png
+         learning/results/task_eval{tag}.json
+         learning/results/task_trajectories{tag}.npz
+Outputs: learning/results/...png  (or learning/results/pair15/ with --pair15)
 """
 
+import argparse
 import csv
 import json
 import os
@@ -20,14 +21,20 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle, Polygon, FancyBboxPatch
+from matplotlib.patches import Circle, Polygon
 
 from learning.configs.default import Config
 
 RESULTS = "learning/results"
 
+PAIR19_TAGS = (
+    "pair19ens_H32_random",
+    "pair19ens_H32_leftmost",
+    "pair19ens_H32_rightmost",
+)
 
-def plot_training_curves(path, out):
+
+def plot_training_curves(path, out, title_suffix=""):
     epochs, tr = [], {k: [] for k in ("total", "dynamics", "recon_states")}
     vd, vr, ol10, ol25, ol50, zs = [], [], [], [], [], []
     with open(path, encoding="utf-8") as f:
@@ -71,13 +78,16 @@ def plot_training_curves(path, out):
     ax.set_title("Long-horizon rollout & latent health")
     ax.legend(loc="center right", fontsize=8)
     ax.grid(alpha=0.3)
-    fig.suptitle("StateLeWM training (GNN + contact head, ensemble member 0)", fontsize=13)
+    title = "StateLeWM training (GNN + contact head, ensemble member 0)"
+    if title_suffix:
+        title = f"{title} — {title_suffix}"
+    fig.suptitle(title, fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
 
 
-def plot_success_summary(eval_json, out):
+def plot_success_summary(eval_json, out, title_extra=""):
     with open(eval_json, encoding="utf-8") as f:
         data = json.load(f)
     s = data["summary"]
@@ -95,7 +105,16 @@ def plot_success_summary(eval_json, out):
                                    [s["n_success"], s["episodes"] - s["n_success"]])):
         ax.text(i, v + 0.5, f"{n}\n({100 * n / s['episodes']:.0f}%)",
                 ha="center", fontsize=11)
-    ax.set_title(f"PushToGoal task result  (tol={s['tol']}, budget={s['budget']}f)")
+    tag = s.get("tag") or title_extra
+    mode = s.get("target_mode", "")
+    cem = s.get("cem") or {}
+    h = cem.get("horizon")
+    extra = f"  [{tag}]" if tag else ""
+    if mode:
+        extra += f"  target={mode}"
+    if h is not None:
+        extra += f"  H={h}"
+    ax.set_title(f"PushToGoal  (tol={s['tol']}, budget={s['budget']}f){extra}")
     ax.set_ylabel("episodes")
 
     ax = axes[1]
@@ -193,26 +212,115 @@ def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5):
     plt.close(fig)
 
 
+def _tag_paths(results_dir, tag):
+    suffix = f"_{tag}" if tag else ""
+    return {
+        "eval": os.path.join(results_dir, f"task_eval{suffix}.json"),
+        "traj": os.path.join(results_dir, f"task_trajectories{suffix}.npz"),
+        "summary": os.path.join(results_dir, f"task_success_summary{suffix}.png"),
+        "scenes": os.path.join(results_dir, f"scene_rollouts{suffix}.png"),
+    }
+
+
+def _maybe_training_curves(results_dir, out_dir, title_suffix="", min_epochs=5):
+    log_path = os.path.join(results_dir, "train_log.csv")
+    out = os.path.join(out_dir, "training_curves.png")
+    if not os.path.exists(log_path):
+        print(f"skip training curves: missing {log_path}")
+        return
+    with open(log_path, encoding="utf-8") as f:
+        n_epochs = sum(1 for _ in csv.DictReader(f))
+    if n_epochs < min_epochs:
+        print(f"skip training curves: {log_path} has only {n_epochs} epoch(s)")
+        return
+    plot_training_curves(log_path, out, title_suffix=title_suffix)
+    print(f"wrote {out}")
+
+
+def generate_report(cfg, results_dir, out_dir, tag="", title_suffix=""):
+    os.makedirs(out_dir, exist_ok=True)
+    paths = _tag_paths(results_dir, tag)
+    out_paths = _tag_paths(out_dir, tag)
+    if os.path.exists(paths["eval"]):
+        plot_success_summary(paths["eval"], out_paths["summary"])
+        print(f"wrote {out_paths['summary']}")
+    else:
+        print(f"skip summary: missing {paths['eval']}")
+    if os.path.exists(paths["traj"]):
+        plot_scenes(paths["traj"], out_paths["scenes"], cfg)
+        print(f"wrote {out_paths['scenes']}")
+    else:
+        print(f"skip scenes: missing {paths['traj']}")
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results", type=str, default=RESULTS)
+    parser.add_argument("--out-dir", type=str, default="",
+                        help="output directory (default: --results or pair19_ens/)")
+    parser.add_argument("--tag", type=str, default="",
+                        help="eval tag suffix, e.g. pair19ens_H32_random")
+    parser.add_argument("--pair19", action="store_true",
+                        help="render pair19_ens eval JSONs into results/pair19_ens/")
+    args = parser.parse_args()
+
     cfg = Config()
-    os.makedirs(RESULTS, exist_ok=True)
-    curves = os.path.join(RESULTS, "training_curves.png")
-    summary = os.path.join(RESULTS, "task_success_summary.png")
-    scenes = os.path.join(RESULTS, "scene_rollouts.png")
-    plot_training_curves(os.path.join(RESULTS, "train_log.csv"), curves)
-    print(f"wrote {curves}")
-    plot_success_summary(os.path.join(RESULTS, "task_eval.json"), summary)
-    print(f"wrote {summary}")
-    traj_random = os.path.join(RESULTS, "task_trajectories_random.npz")
-    traj = traj_random if os.path.exists(traj_random) else os.path.join(
-        RESULTS, "task_trajectories.npz")
-    if os.path.exists(traj):
-        plot_scenes(traj, scenes, cfg)
-        print(f"wrote {scenes} from {os.path.basename(traj)}")
-    eval_r = os.path.join(RESULTS, "task_eval_random.json")
+    results_dir = args.results
+    os.makedirs(results_dir, exist_ok=True)
+
+    if args.pair19:
+        out_dir = args.out_dir or os.path.join(results_dir, "pair19_ens")
+        _maybe_training_curves(results_dir, out_dir, title_suffix="pair19_ens")
+        for tag in PAIR19_TAGS:
+            generate_report(cfg, results_dir, out_dir, tag=tag)
+        main = _tag_paths(out_dir, "pair19ens_H32_random")
+        for src, dst in (
+            (main["summary"], os.path.join(out_dir, "task_success_summary.png")),
+            (main["scenes"], os.path.join(out_dir, "scene_rollouts.png")),
+        ):
+            if os.path.exists(src):
+                import shutil
+                shutil.copy2(src, dst)
+                print(f"copied {dst}")
+        left = _tag_paths(out_dir, "pair19ens_H32_leftmost")
+        if os.path.exists(left["scenes"]):
+            import shutil
+            shutil.copy2(left["scenes"],
+                         os.path.join(out_dir, "scene_rollouts_leftmost.png"))
+            print(f"copied {out_dir}/scene_rollouts_leftmost.png")
+        print(f"pair19_ens report -> {out_dir}")
+        return
+
+    if args.tag:
+        out_dir = args.out_dir or results_dir
+        generate_report(cfg, results_dir, out_dir, tag=args.tag)
+        if not args.out_dir:
+            _maybe_training_curves(results_dir, out_dir)
+        return
+
+    # Legacy default paths (no tag).
+    out_dir = args.out_dir or results_dir
+    _maybe_training_curves(results_dir, out_dir)
+    legacy_eval = os.path.join(results_dir, "task_eval.json")
+    if os.path.exists(legacy_eval):
+        plot_success_summary(legacy_eval, os.path.join(out_dir, "task_success_summary.png"))
+        print(f"wrote {os.path.join(out_dir, 'task_success_summary.png')}")
+    traj_left = os.path.join(results_dir, "task_trajectories.npz")
+    traj_random = os.path.join(results_dir, "task_trajectories_random.npz")
+    if os.path.exists(traj_left):
+        plot_scenes(traj_left, os.path.join(out_dir, "scene_rollouts_leftmost.png"), cfg)
+        print(f"wrote {os.path.join(out_dir, 'scene_rollouts_leftmost.png')}")
+        if not os.path.exists(traj_random):
+            plot_scenes(traj_left, os.path.join(out_dir, "scene_rollouts.png"), cfg)
+            print(f"wrote {os.path.join(out_dir, 'scene_rollouts.png')} from leftmost")
+    if os.path.exists(traj_random):
+        plot_scenes(traj_random, os.path.join(out_dir, "scene_rollouts.png"), cfg)
+        print(f"wrote {os.path.join(out_dir, 'scene_rollouts.png')} from random")
+    eval_r = os.path.join(results_dir, "task_eval_random.json")
     if os.path.exists(eval_r):
-        plot_success_summary(eval_r, os.path.join(RESULTS, "task_success_summary_random.png"))
-        print(f"wrote {os.path.join(RESULTS, 'task_success_summary_random.png')}")
+        plot_success_summary(eval_r,
+                             os.path.join(out_dir, "task_success_summary_random.png"))
+        print(f"wrote {os.path.join(out_dir, 'task_success_summary_random.png')}")
 
 
 if __name__ == "__main__":

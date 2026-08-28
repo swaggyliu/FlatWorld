@@ -10,7 +10,7 @@ from learning.tasks.push_to_goal import load_model
 
 def main():
     device = "cpu"
-    model, norm, stride = load_model("learning/checkpoints/best.pt", device)
+    model, norm, stride = load_model("learning/checkpoints_pair19_ens/ens_0.pt", device)
     cfg = Config()
     env = PushSceneEnv(cfg)
     rng = np.random.default_rng(3)
@@ -46,7 +46,7 @@ def main():
             print(f"\n=== action {name} (raw {a_raw}, normalized {a_n.numpy()}) ===")
             print(f"      t= 0  EE_pred=({obs['obj_states'][0,0]:.3f},{obs['obj_states'][0,1]:.3f})  (true)")
             for t in range(1, 13):
-                z, h = model.predictor.step(z, a_n.unsqueeze(0), h)
+                z, h, _ = model.predictor.step(z, a_n.unsqueeze(0), h)
                 ee = denorm(model.decoder(z)[0])[0, 0, :2].numpy()
                 if t % 3 == 0:
                     print(f"      t={t:2d}  EE_pred=({ee[0]:.3f},{ee[1]:.3f})")

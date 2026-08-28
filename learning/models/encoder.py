@@ -1,10 +1,11 @@
-"""StateTactileEncoder: per-frame (states + tactile set) -> latent z_t.
+"""StateTactileEncoder: per-frame states + EE tactile -> per-object latents.
 
-Objects are a fully-connected relation graph (GNN): node = type + state,
-edge = relative pose/velocity + distance. Two message-passing layers
-capture object-object coupling (chain pushes, blockers) that a mean-pool
-MLP cannot. Tactile contacts stay a Deep Set over the EE contact list.
+Sparse near-contact graph (k-NN + signed-gap). Tactile is injected into
+the EE node only. Output is (B, N, L) — one latent per body, shared
+weights, so N can change without new parameters.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -21,80 +22,137 @@ def mlp(sizes, act=nn.GELU, out_norm=False):
     return nn.Sequential(*layers)
 
 
+def pairwise_gap(xy, obj_geom):
+    """xy (B,N,2), geom (B,N,2) -> rel (B,N,N,2), dist (B,N,N), gap (B,N,N)."""
+    rel = xy.unsqueeze(2) - xy.unsqueeze(1)
+    dist = rel.norm(dim=-1)
+    rad = obj_geom.abs().amax(dim=-1)
+    gap = dist - rad.unsqueeze(2) - rad.unsqueeze(1)
+    return rel, dist, gap
+
+
+def pair_touch(gap, gap_eps: float = 0.015):
+    """Boolean (..., N, N) near-contact from signed gap; diagonal False."""
+    n = gap.shape[-1]
+    eye = torch.eye(n, device=gap.device, dtype=torch.bool)
+    while eye.dim() < gap.dim():
+        eye = eye.unsqueeze(0)
+    return (gap < gap_eps) & ~eye
+
+
+def knn_adjacency(dist, gap, k_nn: int = 2, gap_cut: float = 0.12):
+    """Keep k nearest neighbours and any pair with signed gap below cut.
+
+    ``gap`` and ``gap_cut`` share the units of the xy / geom tensors
+    passed in (standardized during train and CEM). 0.12 matches the
+    current checkpoints; retrain if you change the normalizer or cut.
+    """
+    B, N, _ = dist.shape
+    k = min(int(k_nn), max(N - 1, 1))
+    eye = torch.eye(N, device=dist.device, dtype=torch.bool).unsqueeze(0)
+    dist_nn = dist.masked_fill(eye, 1e6)
+    knn = dist_nn.topk(k, dim=-1, largest=False).indices
+    adj = torch.zeros(B, N, N, dtype=torch.bool, device=dist.device)
+    adj.scatter_(2, knn, True)
+    adj = adj | (gap < gap_cut)
+    return adj & ~eye.expand(B, -1, -1)
+
+
+def _normal_tangent(rel, dist):
+    """rel (...,2), dist (...) -> unit normal / tangent (...,2)."""
+    n = rel / dist.clamp(min=1e-6).unsqueeze(-1)
+    t = torch.stack([-n[..., 1], n[..., 0]], dim=-1)
+    return n, t
+
+
 class StateTactileEncoder(nn.Module):
     def __init__(self, num_obj_types: int = 3, state_dim: int = 6,
                  contact_dim: int = 7, summary_dim: int = 4,
                  latent_dim: int = 128, obj_embed_dim: int = 64,
-                 tactile_embed_dim: int = 64, n_mp: int = 2):
+                 tactile_embed_dim: int = 64, n_mp: int = 2,
+                 k_nn: int = 2, gap_cut: float = 0.12,
+                 rich_edges: bool = True):
         super().__init__()
         self.obj_embed_dim = obj_embed_dim
+        self.latent_dim = latent_dim
         self.n_mp = n_mp
+        self.k_nn = k_nn
+        self.gap_cut = gap_cut
+        self.rich_edges = bool(rich_edges)
 
         self.type_emb = nn.Embedding(num_obj_types, 32)
         self.state_mlp = mlp([state_dim, 64, 64])
         self.geom_mlp = mlp([2, 32, 32])
         self.node_proj = mlp([64 + 32 + 32, obj_embed_dim], out_norm=True)
 
-        # relative state (6) + Euclidean pos distance (1)
-        self.edge_mlp = mlp([state_dim + 1, 64, 64])
-        self.msg_mlp = mlp([obj_embed_dim * 2 + 64, 64, obj_embed_dim])
-        self.node_upd = nn.GRUCell(obj_embed_dim, obj_embed_dim)
+        if self.rich_edges:
+            edge_in = state_dim + 3 + 2   # +vn, vt (rel already has vel)
+            msg_in = obj_embed_dim * 2 + 64
+            self.node_upd = nn.GRUCell(obj_embed_dim + 1, obj_embed_dim)
+        else:
+            edge_in = state_dim + 3
+            msg_in = obj_embed_dim * 2 + 64
+            self.node_upd = nn.GRUCell(obj_embed_dim, obj_embed_dim)
+        self.edge_mlp = mlp([edge_in, 64, 64])
+        self.msg_mlp = mlp([msg_in, 64, obj_embed_dim])
 
         self.contact_mlp = mlp([contact_dim, 64, 64])
         self.tactile_proj = nn.Linear(64, tactile_embed_dim)
         self.summary_mlp = mlp([summary_dim, 32])
+        self.ee_inject = mlp([tactile_embed_dim + 32, obj_embed_dim, obj_embed_dim])
+        self.node_out = mlp([obj_embed_dim, latent_dim], out_norm=True)
 
-        # mean + max pool of nodes
-        self.fusion = mlp(
-            [obj_embed_dim * 2 + tactile_embed_dim + 32, 128, latent_dim],
-            out_norm=True,
-        )
-
-    def _message_pass(self, h, obj_states):
-        """One fully-connected MP step. h, obj_states: (B, N, *)."""
+    def _message_pass(self, h, obj_states, obj_geom):
         B, N, D = h.shape
-        rel = obj_states.unsqueeze(2) - obj_states.unsqueeze(1)   # (B, N, N, 6)
-        dist = rel[..., :2].norm(dim=-1, keepdim=True)            # (B, N, N, 1)
-        e = self.edge_mlp(torch.cat([rel, dist], dim=-1))         # (B, N, N, 64)
-
+        rel = obj_states.unsqueeze(2) - obj_states.unsqueeze(1)
+        _, dist, gap = pairwise_gap(obj_states[..., :2], obj_geom)
+        adj = knn_adjacency(dist, gap, self.k_nn, self.gap_cut)
+        contact_flag = (gap < 0.0).to(h.dtype).unsqueeze(-1)
+        if self.rich_edges:
+            # state layout: (x, y, theta, vx, vy, omega) -> linear vel is [3:5]
+            vel = obj_states[..., 3:5]
+            rel_v = vel.unsqueeze(2) - vel.unsqueeze(1)
+            n, t = _normal_tangent(rel[..., :2], dist)
+            vn = (rel_v * n).sum(-1, keepdim=True)
+            vt = (rel_v * t).sum(-1, keepdim=True)
+            e = self.edge_mlp(torch.cat([rel, dist.unsqueeze(-1),
+                                         gap.unsqueeze(-1), contact_flag,
+                                         vn, vt], dim=-1))
+        else:
+            e = self.edge_mlp(torch.cat([rel, dist.unsqueeze(-1), gap.unsqueeze(-1),
+                                         contact_flag], dim=-1))
         hi = h.unsqueeze(2).expand(B, N, N, D)
         hj = h.unsqueeze(1).expand(B, N, N, D)
-        msg = self.msg_mlp(torch.cat([hi, hj, e], dim=-1))        # (B, N, N, D)
-
-        eye = torch.eye(N, device=h.device, dtype=torch.bool)
-        msg = msg.masked_fill(eye.view(1, N, N, 1), 0.0)
-        agg = msg.sum(dim=2) / float(max(N - 1, 1))               # (B, N, D)
-
-        h_flat = h.reshape(B * N, D)
-        h = self.node_upd(agg.reshape(B * N, D), h_flat).view(B, N, D)
+        msg = self.msg_mlp(torch.cat([hi, hj, e], dim=-1))
+        msg = msg.masked_fill(~adj.unsqueeze(-1), 0.0)
+        if self.rich_edges:
+            agg = msg.sum(dim=2)
+            deg = adj.sum(dim=2, keepdim=True).to(h.dtype)
+            agg = torch.cat([agg, deg / 4.0], dim=-1)
+        else:
+            deg = adj.sum(dim=2, keepdim=True).clamp(min=1).to(h.dtype)
+            agg = msg.sum(dim=2) / deg
+        h = self.node_upd(agg.reshape(B * N, -1), h.reshape(B * N, D)).view(B, N, D)
         return h
 
     def forward(self, obj_types, obj_states, contact_feat, contact_mask,
                 tactile_summary, obj_geom=None):
-        """
-        obj_types:       (B, N) long
-        obj_states:      (B, N, 6) float (normalized)
-        contact_feat:    (B, K, 7) float (normalized, padding rows zero)
-        contact_mask:    (B, K) float, 1 = real contact
-        tactile_summary: (B, 4) float (normalized)
-        obj_geom:        (B, N, 2) half-extents, optional
-        returns z: (B, latent_dim)
-        """
+        """Returns z: (B, N, latent_dim)."""
         B, N, _ = obj_states.shape
-        parts = [self.type_emb(obj_types), self.state_mlp(obj_states)]
         if obj_geom is None:
             obj_geom = obj_states.new_zeros(B, N, 2)
-        parts.append(self.geom_mlp(obj_geom))
-        h = self.node_proj(torch.cat(parts, dim=-1))
-        for _ in range(self.n_mp):
-            h = self._message_pass(h, obj_states)
-
-        obj_mean = h.mean(dim=1)
-        obj_max = h.max(dim=1).values
-        obj_pool = torch.cat([obj_mean, obj_max], dim=-1)
+        h = self.node_proj(torch.cat([
+            self.type_emb(obj_types), self.state_mlp(obj_states),
+            self.geom_mlp(obj_geom),
+        ], dim=-1))
 
         tc = self.contact_mlp(contact_feat)
         tc = (tc * contact_mask.unsqueeze(-1)).sum(dim=1)
         tactile = self.tactile_proj(tc)
-        s = self.summary_mlp(tactile_summary)
-        return self.fusion(torch.cat([obj_pool, tactile, s], dim=-1))
+        summary = self.summary_mlp(tactile_summary)
+        h = h.clone()
+        h[:, 0] = h[:, 0] + self.ee_inject(torch.cat([tactile, summary], dim=-1))
+
+        for _ in range(self.n_mp):
+            h = self._message_pass(h, obj_states, obj_geom)
+        return self.node_out(h)

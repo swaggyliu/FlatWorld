@@ -15,7 +15,7 @@ from learning.tasks.push_to_goal import load_model
 
 def main():
     device = "cpu"
-    model, norm, stride = load_model("learning/checkpoints/best.pt", device)
+    model, norm, stride = load_model("learning/checkpoints_pair19_ens/ens_0.pt", device)
     cfg = Config()
     env = PushSceneEnv(cfg)
     rng = np.random.default_rng(1000)
@@ -51,7 +51,7 @@ def main():
         hb = model.predictor.init_hidden(zb)
         base = []
         for _ in range(H):
-            zb, hb = model.predictor.step(zb, a0, hb)
+            zb, hb, _ = model.predictor.step(zb, a0, hb)
             base.append(dn("obj_states", model.decoder(zb)[0])[0])
         base = torch.stack(base)
 
@@ -72,7 +72,7 @@ def main():
             pushed = float(now[target, 0])
             ee_end = None
             for t in range(H):
-                z, h = model.predictor.step(z, a_n.unsqueeze(0), h)
+                z, h, _ = model.predictor.step(z, a_n.unsqueeze(0), h)
                 s = dn("obj_states", model.decoder(z)[0])[0]
                 eff = s - base[t] + now
                 ee_x, ee_y = float(eff[0, 0]), float(eff[0, 1])

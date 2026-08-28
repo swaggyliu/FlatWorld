@@ -1,3 +1,8 @@
-from .push_to_goal import PushToGoalTask, CEMPlanner, load_model, load_ensemble
+from learning.planner import CEMPlanner
 
-__all__ = ["PushToGoalTask", "CEMPlanner", "load_model", "load_ensemble"]
+from .push_to_goal import PushToGoalCost, PushToGoalTask, load_model, load_ensemble
+
+__all__ = [
+    "PushToGoalTask", "PushToGoalCost", "CEMPlanner",
+    "load_model", "load_ensemble",
+]

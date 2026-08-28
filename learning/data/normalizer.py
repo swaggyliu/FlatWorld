@@ -28,17 +28,20 @@ class Normalizer:
     # ---------------- fitting ----------------
     @staticmethod
     def _default_geom(d) -> np.ndarray:
+        """Fallback sizes from SceneConfig when a rollout has no obj_geom."""
+        from learning.configs.default import SceneConfig
+        sc = SceneConfig()
         types = d["obj_types"]
         n = len(types)
         g = np.zeros((n, 2), dtype=np.float64)
-        g[0] = (0.1, 0.1)
+        g[0] = (sc.ee_radius, sc.ee_radius)
         for i, t in enumerate(types):
             if i == 0:
                 continue
             if int(t) == 1:
-                g[i] = (0.12, 0.06)
+                g[i] = sc.box_ext
             else:
-                g[i] = (0.08, 0.08)
+                g[i] = (sc.ball_radius, sc.ball_radius)
         return g
 
     @staticmethod

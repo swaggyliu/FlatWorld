@@ -40,11 +40,15 @@ class SceneConfig:
     # Object placement region (along x); y determined by object half-height (resting on ground)
     # Wide enough to hold all objects at min_gap PLUS a reserved free run
     # ahead of the leftmost object (task reachability), see the layout code.
-    area_x: tuple = (0.40, 1.95)
-    min_gap: float = 0.06            # minimum gap between objects
-    first_gap: float = 0.24          # reserved free run ahead of the leftmost object
+    # Shared lineup for EE + objects (EE is inserted at a random rank).
+    area_x: tuple = (0.16, 2.10)
+    min_gap: float = 0.06            # minimum gap between bodies
+    first_gap: float = 0.24          # unused leftover (kept for dump compat)
     spawn_drop: float = 0.005        # small drop margin to avoid initial penetration
-    ee_spawn_x: tuple = (0.10, 0.26)  # EE spawn range (left of all objects)
+    ee_spawn_x: tuple = (0.10, 0.26)  # fallback if rank placement is disabled
+    # 1-indexed rank of the EE among (n_obj + 1) slots, inclusive.
+    # With 5 objects this is "1st through 5th from the left".
+    ee_rank_range: tuple = (1, 5)
 
     # Domain randomization (Phase 2): multiplicative mass factor and friction
     # are re-sampled per episode reset so the world model must learn the
@@ -56,6 +60,8 @@ class SceneConfig:
     # Per-object size ranges (half-extents). Boxes stay wider than tall
     # so they slide rather than tip. Sampled in env.reset.
     dr_size_enabled: bool = True
+    # Game scale slider is 0.5–2.0 on the base EE radius.
+    dr_ee_r_scale: tuple = (0.5, 2.0)
     dr_box_hw: tuple = (0.08, 0.18)
     dr_box_hh: tuple = (0.04, 0.12)
     dr_ball_r: tuple = (0.05, 0.12)
@@ -98,11 +104,29 @@ class CollectConfig:
     # bounds): keep the EE inside the working volume so the contact solver
     # cannot eject it to y > 1 m (out-of-distribution for the planner)
     barrier_k: float = 12.0
-    x_lo: float = 0.12
-    x_hi: float = 1.72
+    x_lo: float = 0.08
+    x_hi: float = 2.12
     y_lo: float = 0.105              # just above the ground (ee_radius margin)
     y_hi: float = 0.55
-    out_dir: str = "learning/data/rollouts"
+    out_dir: str = "learning/data/rollouts_lr"
+    # Collection-policy mix (must sum to 1). Demonstration only; the
+    # planner never uses these ratios.
+    mode_free: float = 0.15
+    mode_attract: float = 0.15
+    mode_push: float = 0.15
+    mode_release: float = 0.10
+    mode_pile: float = 0.45
+    contrast: bool = False           # gap / kiss / around / release mix
+
+
+@dataclass
+class TaskConfig:
+    """PushToGoal evaluation protocol (not CEM hyperparameters)."""
+    tol: float = 0.08                # success: |target - goal| < tol
+    vel_tol: float = 0.08            # and |v_xy| < vel_tol (m/s)
+    budget: int = 400                # sim frames
+    goal_min: float = 0.10           # min |goal_x - target_x|; > tol so not already done
+    goal_max: float = 0.30           # max requested push distance
 
 
 @dataclass
@@ -110,6 +134,7 @@ class Config:
     scene: SceneConfig = field(default_factory=SceneConfig)
     tactile: TactileConfig = field(default_factory=TactileConfig)
     collect: CollectConfig = field(default_factory=CollectConfig)
+    task: TaskConfig = field(default_factory=TaskConfig)
 
     def dump(self) -> str:
         import json

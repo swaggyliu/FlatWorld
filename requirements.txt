@@ -6,6 +6,7 @@ meshio>=5.3
 pymeshlab>=2023.12
 usd-core>=24.0
 matplotlib>=3.7
+raylib>=5.0
 
 # --- Testing (see also: pip install -e ".[dev]") ---
 pytest>=7.0

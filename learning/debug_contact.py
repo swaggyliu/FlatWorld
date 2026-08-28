@@ -33,7 +33,7 @@ def drive_to_contact(env, target_idx, fmax=6.0, max_frames=240):
 
 def main():
     device = "cpu"
-    model, norm, stride = load_model("learning/checkpoints/best.pt", device)
+    model, norm, stride = load_model("learning/checkpoints_pair19_ens/ens_0.pt", device)
     cfg = Config()
     env = PushSceneEnv(cfg)
     rng = np.random.default_rng(1000)
@@ -71,7 +71,7 @@ def main():
         hb = model.predictor.init_hidden(zb)
         base = []
         for _ in range(H):
-            zb, hb = model.predictor.step(zb, a0, hb)
+            zb, hb, _ = model.predictor.step(zb, a0, hb)
             base.append(dn("obj_states", model.decoder(zb)[0])[0])
         base = torch.stack(base)
         now = torch.as_tensor(obs["obj_states"], dtype=torch.float32)
@@ -84,7 +84,7 @@ def main():
             z = z0
             h = model.predictor.init_hidden(z)
             for t in range(H):
-                z, h = model.predictor.step(z, a_n.unsqueeze(0), h)
+                z, h, _ = model.predictor.step(z, a_n.unsqueeze(0), h)
             s = dn("obj_states", model.decoder(z)[0])[0]
             eff = s - base[-1] + now
             ee = eff[0, :2].numpy()

@@ -15,10 +15,12 @@ import time
 import numpy as np
 
 from learning.configs.default import Config
+from learning.data.sane import rollout_is_physical
 from learning.env.flatworld_wrapper import PushSceneEnv
 
 
-def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray) -> np.ndarray:
+def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray,
+                   ee_r: float = None) -> np.ndarray:
     """Soft workspace walls shared by ALL collection modes.
 
     With the real (wide) box geometry the EE gets blocked by the pile and
@@ -34,16 +36,28 @@ def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray) -> np.ndarray
         a[0] += k * (c.x_lo - ee_pos[0])
     elif ee_pos[0] > c.x_hi:
         a[0] -= k * (ee_pos[0] - c.x_hi)
-    if ee_pos[1] < c.y_lo:
-        a[1] += k * (c.y_lo - ee_pos[1])
+    y_lo = max(float(c.y_lo), float(ee_r) + 0.005) if ee_r is not None else float(c.y_lo)
+    if ee_pos[1] < y_lo:
+        a[1] += k * (y_lo - ee_pos[1])
     elif ee_pos[1] > c.y_hi:
         a[1] -= k * (ee_pos[1] - c.y_hi)
     return a
 
 
+def scaled_fmax(cfg: Config, ee_r: float = None) -> float:
+    """Larger EE needs less force; tiny EE needs a bit more. Caps stay in-range."""
+    base = float(cfg.collect.force_max)
+    if ee_r is None:
+        return base
+    r0 = float(cfg.scene.ee_radius)
+    s = (r0 / max(float(ee_r), 0.04)) ** 0.5
+    return float(np.clip(base * s, 0.5 * base, 1.2 * base))
+
+
 def sample_action(rng: np.random.Generator, cfg: Config, prev: np.ndarray,
                   ee_pos: np.ndarray, obj_pos: np.ndarray,
-                  mode: str = "attract", cmd: np.ndarray = None) -> np.ndarray:
+                  mode: str = "attract", cmd: np.ndarray = None,
+                  ee_r: float = None) -> np.ndarray:
     """Smooth random force. Three collection modes (see run_rollout):
 
     - "free": unbiased force sweep -- a constant random force held for a
@@ -59,7 +73,7 @@ def sample_action(rng: np.random.Generator, cfg: Config, prev: np.ndarray,
       contact making/breaking and that released objects stop moving.
     """
     c = cfg.collect
-    if mode in ("push", "free") and cmd is not None:
+    if mode in ("push", "free", "release") and cmd is not None:
         a = cmd + 0.2 * c.ou_sigma * rng.standard_normal(2)
     else:
         a = c.ou_theta * prev + c.ou_sigma * rng.standard_normal(2)
@@ -68,27 +82,33 @@ def sample_action(rng: np.random.Generator, cfg: Config, prev: np.ndarray,
             dist = float(np.linalg.norm(d))
             u = d / max(dist, 1e-6)
             mag = np.clip(dist * c.attract_gain, 0.0, c.attract_cap)
-            # vertical deadband: near the ground the attraction is
-            # horizontal-only (the EE must not dig into the ground plane
-            # while approaching an object resting on it)
-            if ee_pos[1] < 0.16:
+            # vertical deadband: near the ground band the attraction is
+            # horizontal-only (do not dig into the floor while approaching)
+            dead_y = max(c.y_lo, float(ee_r if ee_r is not None else cfg.scene.ee_radius) + 0.06)
+            if ee_pos[1] < dead_y:
                 u[1] = 0.0
                 u = u / max(float(np.linalg.norm(u)), 1e-6)
             a = a + u * mag
-    a = apply_barriers(a, cfg, ee_pos)
-    return np.clip(a, -c.force_max, c.force_max).astype(np.float32)
+    a = apply_barriers(a, cfg, ee_pos, ee_r)
+    fmax = scaled_fmax(cfg, ee_r)
+    return np.clip(a, -fmax, fmax).astype(np.float32)
 
 
-def _front_idx(states: np.ndarray, target_idx: int) -> int:
-    """Nearest object on the EE → target x-interval (inclusive)."""
+def _front_idx(states: np.ndarray, target_idx: int, geom: np.ndarray = None) -> int:
+    """Object nearest the EE on the EE → target x-interval (inclusive)."""
     ee_x = float(states[0, 0])
     tx = float(states[target_idx, 0])
-    lo, hi = min(ee_x, tx), max(ee_x, tx)
-    best, best_x = target_idx, tx
+    pad = 0.0
+    if geom is not None:
+        pad = float(geom[0, 0])
+    lo, hi = min(ee_x, tx) - pad, max(ee_x, tx) + pad
+    best, best_d = target_idx, abs(tx - ee_x)
     for j in range(1, len(states)):
         x = float(states[j, 0])
-        if lo - 0.03 <= x <= hi + 0.03 and x < best_x - 1e-4:
-            best, best_x = j, x
+        if lo <= x <= hi:
+            d = abs(x - ee_x)
+            if d < best_d - 1e-4:
+                best, best_d = j, d
     return best
 
 
@@ -104,36 +124,109 @@ def pile_action(env: PushSceneEnv, obs: dict, target_idx: int,
                 rng: np.random.Generator, cfg: Config) -> np.ndarray:
     """Shove the object in front of a (possibly buried) random target.
 
-    Covers the Random-task gap the 3-mode mix almost never visits:
-    chain contact, clearing a corridor, mass-aware +Fx above 6 N.
+    Sign of Fx follows EE → target so left-side and right-side chain
+    contact both appear in the dataset.
     """
     states = obs["obj_states"]
     geom = obs["obj_geom"]
-    front = _front_idx(states, target_idx)
+    front = _front_idx(states, target_idx, geom)
     ee = states[0]
     fr = states[front]
     standoff = float(geom[front, 0]) + float(geom[0, 0])
     contact_y = max(float(fr[1]), float(geom[0, 1]) + 0.005)
     ee_x, tx = float(ee[0]), float(states[target_idx, 0])
-    lo, hi = min(ee_x, tx) - 0.04, max(ee_x, tx) + 0.04
+    pad = float(geom[0, 0])
+    lo, hi = min(ee_x, tx) - pad, max(ee_x, tx) + pad
     g = float(cfg.scene.gravity)
     need = 0.0
     for j in range(1, len(states)):
         if lo <= float(states[j, 0]) <= hi:
             need += float(env.obj_mu[j]) * float(env.obj_mass[j]) * g
-    fcap = float(np.clip(1.2 * need, 4.0, 8.5))
-    env.force_cap_override = fcap
-    fx = fcap if float(ee[0]) >= float(fr[0]) - standoff - 0.05 else min(fcap, 5.0)
-    fy = float(np.clip(12.0 * (contact_y - float(ee[1])), -2.5, 2.2))
+    # Stay inside the action range the world model is trained on.
+    fmax = float(cfg.collect.force_max)
+    fcap = float(np.clip(1.2 * need, 0.25 * fmax, fmax))
+    env.force_cap_override = None
+    sign = 1.0 if tx >= ee_x else -1.0
+    gap = sign * (float(fr[0]) - float(ee[0])) - standoff
+    approach = min(fcap, 0.85 * fmax)
+    fx = sign * (fcap if gap <= 0.25 * standoff else approach)
+    fy = float(np.clip(12.0 * (contact_y - float(ee[1])), -fmax, fmax))
     a = np.array([fx, fy], dtype=np.float64)
     a = a + 0.25 * cfg.collect.ou_sigma * rng.standard_normal(2)
-    a = apply_barriers(a, cfg, ee[:2])
+    a = apply_barriers(a, cfg, ee[:2], float(geom[0, 0]))
     return _clip_action(a, cfg, env)
+
+
+def _neighbor_pair(states: np.ndarray, geom: np.ndarray):
+    """Closest neighbouring object pair along x (indices, signed gap)."""
+    order = 1 + np.argsort(states[1:, 0])
+    best = (1, min(2, len(states) - 1), 1.0)
+    best_gap = 1e9
+    for a, b in zip(order, order[1:]):
+        gap = float(states[b, 0] - states[a, 0]
+                    - geom[a, 0] - geom[b, 0])
+        if gap < best_gap:
+            best_gap = gap
+            best = (int(a), int(b), gap)
+    return best
+
+
+def contrast_action(obs: dict, rng: np.random.Generator, cfg: Config,
+                    mode: str, mem: dict) -> np.ndarray:
+    """Demonstration for gap / kiss / around (not used at plan time).
+
+    gap:    push an isolated face so the neighbour should stay put
+    kiss:   push into a touching (or nearly touching) pair
+    around: approach the far face, then push back
+    """
+    fmax = float(cfg.collect.force_max)
+    states, geom = obs["obj_states"], obs["obj_geom"]
+    ee = states[0]
+    if "i" not in mem:
+        i, j, gap = _neighbor_pair(states, geom)
+        mem["i"], mem["j"] = i, j
+        mem["phase"] = "approach"
+        xi, xj = float(states[i, 0]), float(states[j, 0])
+        toward = 1.0 if xj >= xi else -1.0
+        if mode == "kiss":
+            mem["sign"] = toward
+        elif mode == "gap":
+            mem["sign"] = -toward
+        else:
+            mem["sign"] = 1.0 if rng.random() < 0.5 else -1.0
+    i, sign = int(mem["i"]), float(mem["sign"])
+    standoff = float(geom[i, 0] + geom[0, 0])
+    cx = float(states[i, 0]) - sign * standoff
+    cy = max(float(states[i, 1]), float(geom[0, 1]) + 0.005)
+    if mem["phase"] == "approach":
+        if mode == "around" and float(ee[1]) < cy + 0.10 and abs(float(ee[0]) - cx) > 0.07:
+            a = np.array([0.15 * np.sign(cx - ee[0]) * fmax, 0.9 * fmax])
+        else:
+            dx, dy = cx - float(ee[0]), cy - float(ee[1])
+            nrm = max(float(np.hypot(dx, dy)), 1e-6)
+            a = np.array([dx / nrm, dy / nrm]) * 0.75 * fmax
+        if abs(float(ee[0]) - cx) < 0.05 and abs(float(ee[1]) - cy) < 0.07:
+            mem["phase"] = "push"
+            mem["left"] = int(rng.integers(22, 45))
+    else:
+        mem["left"] = int(mem.get("left", 0)) - 1
+        if mem["left"] <= 0:
+            a = np.zeros(2, dtype=np.float64)
+        else:
+            fy = float(np.clip(10.0 * (cy - float(ee[1])), -0.4 * fmax, 0.4 * fmax))
+            a = np.array([sign * 0.8 * fmax, fy], dtype=np.float64)
+    a = a + 0.2 * cfg.collect.ou_sigma * rng.standard_normal(2)
+    a = apply_barriers(a, cfg, ee[:2], float(geom[0, 0]))
+    return np.clip(a, -fmax, fmax).astype(np.float32)
 
 
 def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dict:
     c = cfg.collect
     obs = env.reset(rng)
+    for _ in range(7):
+        if env.min_separating_gap() >= -0.002:
+            break
+        obs = env.reset(rng)
 
     states = [obs["obj_states"]]
     feats = [obs["contact_feat"]]
@@ -143,20 +236,37 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
     attract_idx = 1 + int(rng.integers(0, obs["obj_states"].shape[0] - 1))
     pile_target = 1 + int(rng.integers(0, obs["obj_states"].shape[0] - 1))
 
-    # mode mix: 30% free / 25% attract / 15% push / 30% pile-through.
-    # pile-through is the Random-task gap (buried target, chain contact).
     u = rng.random()
-    if u < 0.30:
-        mode = "free"
-    elif u < 0.55:
-        mode = "attract"
-    elif u < 0.70:
-        mode = "push"
+    if getattr(c, "contrast", False):
+        if u < 0.25:
+            mode = "around"
+        elif u < 0.50:
+            mode = "kiss"
+        elif u < 0.70:
+            mode = "gap"
+        elif u < 0.90:
+            mode = "release"
+        else:
+            mode = "push"
     else:
-        mode = "pile"
+        t_free = c.mode_free
+        t_attr = t_free + c.mode_attract
+        t_push = t_attr + c.mode_push
+        t_rel = t_push + getattr(c, "mode_release", 0.0)
+        if u < t_free:
+            mode = "free"
+        elif u < t_attr:
+            mode = "attract"
+        elif u < t_push:
+            mode = "push"
+        elif u < t_rel:
+            mode = "release"
+        else:
+            mode = "pile"
     cmd = None
     phase_left = 0
     pushing = True
+    contrast_mem = {}
 
     a = np.zeros(2, dtype=np.float32)
     for _ in range(c.episode_len):
@@ -168,10 +278,10 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         attract_pos = obs["obj_states"][attract_idx, :2]
         nearest = obj_pos_all[np.argmin(
             np.linalg.norm(obj_pos_all - ee_pos, axis=1))]
-        # push toward a random object (not always the nearest) so the EE
-        # learns to drive into a blocked corridor.
-        focus = attract_pos if mode in ("attract", "push") else nearest
-        if mode == "pile":
+        focus = attract_pos if mode in ("attract", "push", "release") else nearest
+        if mode in ("gap", "kiss", "around"):
+            a = contrast_action(obs, rng, cfg, mode, contrast_mem)
+        elif mode == "pile":
             a = pile_action(env, obs, pile_target, rng, cfg)
         else:
             if phase_left <= 0:
@@ -187,9 +297,20 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
                     dist = max(float(np.linalg.norm(d)), 1e-6)
                     mag = float(rng.uniform(0.35, 0.95) * c.force_max)
                     cmd = (d / dist) * (mag if pushing else -mag)
+                elif mode == "release":
+                    pushing = not pushing
+                    phase_left = int(rng.integers(16, 32))
+                    if pushing:
+                        d = focus - ee_pos
+                        dist = max(float(np.linalg.norm(d)), 1e-6)
+                        mag = float(rng.uniform(0.4, 0.95) * c.force_max)
+                        cmd = (d / dist) * mag
+                    else:
+                        cmd = np.zeros(2, dtype=np.float64)
             if mode != "attract":
                 phase_left -= 1
-            a = sample_action(rng, cfg, a, ee_pos, focus, mode, cmd)
+            a = sample_action(rng, cfg, a, ee_pos, focus, mode, cmd,
+                              ee_r=float(obs["obj_geom"][0, 0]))
         obs = env.step(a)
         actions.append(a)
         states.append(obs["obj_states"])
@@ -217,9 +338,13 @@ def main():
     parser.add_argument("--out", type=str, default=None, help="output directory")
     parser.add_argument("--start-index", type=int, default=0,
                         help="first rollout index (resume after interruption)")
+    parser.add_argument("--contrast", action="store_true",
+                        help="collect gap/kiss/around/release contrast mix")
     args = parser.parse_args()
 
     cfg = Config()
+    if args.contrast:
+        cfg.collect.contrast = True
     if args.num_rollouts is not None:
         cfg.collect.num_rollouts = args.num_rollouts
     if args.episode_len is not None:
@@ -239,6 +364,10 @@ def main():
     tot_contact_frames = 0
     for i in range(args.start_index, cfg.collect.num_rollouts):
         data = run_rollout(env, rng, cfg)
+        for _ in range(5):
+            if rollout_is_physical(data["obj_states"], data["obj_geom"]):
+                break
+            data = run_rollout(env, rng, cfg)
         path = os.path.join(out_dir, f"rollout_{i:04d}.npz")
         np.savez_compressed(
             path,

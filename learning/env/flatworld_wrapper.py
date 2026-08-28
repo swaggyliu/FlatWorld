@@ -134,7 +134,23 @@ class PushSceneEnv:
         ``rigidParams[idx, 1]`` and ``radius`` after reset.
         """
         sc = self.cfg.scene
-        self.obj_geom[0] = (sc.ee_radius, sc.ee_radius)
+        lo, hi = getattr(sc, "dr_ee_r_scale", (1.0, 1.0))
+        if sc.dr_size_enabled and hi > lo:
+            u = float(rng.random())
+            span = hi - lo
+            # U-shaped: extra mass at the game slider ends (0.5 and 2.0).
+            if u < 0.35:
+                scale = float(rng.uniform(lo, lo + 0.25 * span))
+            elif u < 0.70:
+                scale = float(rng.uniform(hi - 0.25 * span, hi))
+            else:
+                scale = float(rng.uniform(lo, hi))
+            r = float(sc.ee_radius) * scale
+        else:
+            r = float(sc.ee_radius)
+        self.ee_rigid.radius = r
+        self.obj_geom[0] = (r, r)
+        self.obj_half_heights[0] = r
         if not sc.dr_size_enabled:
             for i, t in enumerate(self.obj_types):
                 if i == 0:
@@ -180,12 +196,14 @@ class PushSceneEnv:
             return 0.5 * ext_y + drop
         if self.obj_types[i] == OBJ_TYPE_BALL:
             return float(self.obj_rigids[i - 1].radius) + drop
-        return float(self.cfg.scene.ee_radius) + drop
+        r = float(self.obj_geom[0, 0]) if self.obj_geom is not None else float(self.cfg.scene.ee_radius)
+        return max(float(self.cfg.scene.ee_height), r + drop)
 
     def _apply_geom_to_rm(self):
         """Write sampled sizes into the live RigidManager arrays."""
         for i, gid in enumerate(self.rigid_ids):
             if i == 0:
+                _patch_array(self.rm.radius, gid, float(self.obj_geom[0, 0]))
                 continue
             t = self.obj_types[i]
             rigid = self.obj_rigids[i - 1]
@@ -197,8 +215,9 @@ class PushSceneEnv:
     def _seat_on_ground(self):
         """Re-seat every object after size patch so bottoms do not go through y=0."""
         sc = self.cfg.scene
+        ee_r = float(self.obj_geom[0, 0])
         self.ee_rigid.origin[1] = np.float32(
-            max(float(self.ee_rigid.origin[1]), sc.ee_radius + sc.spawn_drop))
+            max(float(self.ee_rigid.origin[1]), ee_r + sc.spawn_drop))
         _patch_array(self.rm.rigidParams, (self.ee_idx, 0), self.ee_rigid.origin)
         for i, gid in enumerate(self.rigid_ids):
             if i == 0:
@@ -215,23 +234,59 @@ class PushSceneEnv:
             _patch_array(self.rm.rigidParams, (gid, 0), rigid.origin)
 
     def _randomize_layout(self, rng: np.random.Generator):
-        sc = self.cfg.scene
-        order = rng.permutation(len(self.obj_rigids))
-        half_widths = [float(self.obj_geom[i + 1, 0]) for i in range(len(self.obj_rigids))]
-        span = sc.area_x[1] - sc.area_x[0]
-        total_half = sum(2 * half_widths[i] for i in order)
-        slack = max(span - total_half - sc.min_gap * len(order), 0.0)
-        x = sc.area_x[0]
-        for k, i in enumerate(order):
-            x += half_widths[i]
-            self.obj_rigids[i].origin[0] = np.float32(x)
-            self.obj_rigids[i].origin[1] = np.float32(self._rest_height(i + 1))
-            gap = sc.min_gap + rng.random() * 0.5 * slack / max(len(order), 1)
-            x += half_widths[i] + gap
+        """Place EE + objects in one left-to-right lineup.
 
-        self.ee_rigid.origin[0] = np.float32(rng.uniform(*sc.ee_spawn_x))
-        self.ee_rigid.origin[1] = np.float32(
-            max(sc.ee_height, sc.ee_radius + sc.spawn_drop))
+        The EE occupies a random rank in ``ee_rank_range`` (1-indexed,
+        typically 1..5) so it is not glued to the far left. Objects fill
+        the remaining slots in random order.
+        """
+        sc = self.cfg.scene
+        n_obj = len(self.obj_rigids)
+        n_slots = n_obj + 1
+        lo, hi = int(sc.ee_rank_range[0]), int(sc.ee_rank_range[1])
+        ee_rank = int(rng.integers(lo, hi + 1)) - 1
+        ee_rank = int(np.clip(ee_rank, 0, n_slots - 1))
+
+        obj_order = list(rng.permutation(n_obj))
+        seq = []
+        oi = 0
+        for slot in range(n_slots):
+            if slot == ee_rank:
+                seq.append(("ee", 0))
+            else:
+                seq.append(("obj", int(obj_order[oi])))
+                oi += 1
+
+        half_ws = []
+        for kind, i in seq:
+            if kind == "ee":
+                half_ws.append(float(self.obj_geom[0, 0]))
+            else:
+                half_ws.append(float(self.obj_geom[i + 1, 0]))
+        span = sc.area_x[1] - sc.area_x[0]
+        total = sum(2.0 * w for w in half_ws)
+        n_gap = max(len(seq) - 1, 1)
+        # Never go negative: fat DR bodies may overflow area_x, but they
+        # must not start inside each other (that is what launches PGS).
+        base_gap = float(sc.min_gap)
+        if total + base_gap * n_gap > span:
+            base_gap = max(0.01, (span - total) / n_gap)
+        slack = max(span - total - base_gap * n_gap, 0.0)
+        x = float(sc.area_x[0])
+        for k, (kind, i) in enumerate(seq):
+            hw = half_ws[k]
+            x += hw
+            if kind == "ee":
+                self.ee_rigid.origin[0] = np.float32(x)
+                self.ee_rigid.origin[1] = np.float32(
+                    max(sc.ee_height, float(self.obj_geom[0, 0]) + sc.spawn_drop))
+            else:
+                self.obj_rigids[i].origin[0] = np.float32(x)
+                self.obj_rigids[i].origin[1] = np.float32(self._rest_height(i + 1))
+            if k < len(seq) - 1:
+                x += hw + base_gap + rng.random() * slack / n_gap
+            else:
+                x += hw
 
     def _randomize_dynamics(self, rng: np.random.Generator):
         """Phase 2 domain randomization: per-episode mass / inertia / friction.
@@ -248,7 +303,7 @@ class PushSceneEnv:
                 factor = rng.uniform(*sc.dr_mass_range)
             m = self.base_mass[i] * factor
             if i == 0:
-                I = 0.5 * m * sc.ee_radius ** 2
+                I = 0.5 * m * float(self.obj_geom[0, 0]) ** 2
             elif self.obj_types[i] == OBJ_TYPE_BOX:
                 w, h = 2.0 * self.obj_geom[i, 0], 2.0 * self.obj_geom[i, 1]
                 I = (1.0 / 12.0) * m * (w * w + h * h)
@@ -259,6 +314,25 @@ class PushSceneEnv:
             _patch_array(self.rm.mass, gid, float(m))
             _patch_array(self.rm.inertia, gid, float(I))
             _patch_array(self.rm.contactParams, gid, [mu, restitution])
+
+    def _apply_base_dynamics(self):
+        """Restore default mass / inertia / friction (no domain randomization)."""
+        sc = self.cfg.scene
+        restitution = float(sc.restitution)
+        for i, gid in enumerate(self.rigid_ids):
+            m = float(self.base_mass[i])
+            if i == 0:
+                r = float(self.obj_geom[0, 0])
+                I = 0.5 * m * r * r
+            elif self.obj_types[i] == OBJ_TYPE_BOX:
+                w, h = 2.0 * self.obj_geom[i, 0], 2.0 * self.obj_geom[i, 1]
+                I = (1.0 / 12.0) * m * (w * w + h * h)
+            else:
+                r = float(self.obj_geom[i, 0])
+                I = 0.5 * m * r * r
+            _patch_array(self.rm.mass, gid, m)
+            _patch_array(self.rm.inertia, gid, float(I))
+            _patch_array(self.rm.contactParams, gid, [float(sc.friction), restitution])
 
     def _cache_body_params(self):
         """Snapshot live mass / friction for the planner (index = object slot)."""
@@ -272,6 +346,13 @@ class PushSceneEnv:
     def reset(self, rng: np.random.Generator = None) -> dict:
         """Randomize the layout and reset. Returns the initial observation."""
         rng = rng or np.random.default_rng()
+        for _ in range(8):
+            self._reset_once(rng)
+            if self.min_separating_gap() >= -0.002:
+                return self._observe()
+        return self._observe()
+
+    def _reset_once(self, rng: np.random.Generator):
         self._randomize_sizes(rng)
         self._randomize_layout(rng)
         # Extents must be in RM *before* reset rebuilds bboxes, otherwise a
@@ -282,10 +363,11 @@ class PushSceneEnv:
         self.rm.updateBBox()
         if self.cfg.scene.dr_enabled:
             self._randomize_dynamics(rng)
+        else:
+            self._apply_base_dynamics()
         self._cache_body_params()
         self._noise_rng = np.random.default_rng(int(rng.integers(1 << 31)))
         self.set_force((0.0, 0.0))
-        return self._observe()
 
     # ------------------------------------------------------------------ #
     # Control
@@ -294,6 +376,143 @@ class PushSceneEnv:
         """Set the force (Fx, Fy) applied to the EE, in Newtons. Call once per frame."""
         _patch_array(self.rm.bcTValues, self.ee_idx,
                      wp.vec2(float(f[0]), float(f[1])))
+
+    def set_ee_contact(self, friction: float, restitution: float):
+        """Patch the spirit's Coulomb mu and restitution (live contactParams)."""
+        mu = float(np.clip(friction, 0.0, 1.0))
+        e = float(np.clip(restitution, 0.0, 1.0))
+        _patch_array(self.rm.contactParams, self.ee_idx, [mu, e])
+        if getattr(self, "obj_mu", None) is not None and len(self.obj_mu) > 0:
+            self.obj_mu[0] = mu
+
+    def set_ee_radius(self, radius: float):
+        """Patch the spirit's collision radius, geom, and disk inertia."""
+        r = float(max(1e-4, radius))
+        self.ee_rigid.radius = r
+        _patch_array(self.rm.radius, self.ee_idx, r)
+        self.obj_geom[0] = (r, r)
+        self.obj_half_heights[0] = r
+        mass_np = np.asarray(self.rm.mass.numpy())
+        m = float(mass_np[self.ee_idx])
+        _patch_array(self.rm.inertia, self.ee_idx, 0.5 * m * r * r)
+        pos = np.asarray(self.rm.rigidParams.numpy())[self.ee_idx, 0]
+        min_y = r + float(self.cfg.scene.spawn_drop)
+        if float(pos[1]) < min_y:
+            _patch_array(self.rm.rigidParams, (self.ee_idx, 0),
+                         [float(pos[0]), min_y])
+            self.ee_rigid.origin[1] = np.float32(min_y)
+        self.rm.updateBBox()
+
+    def set_body_pose(self, i: int, x: float, y: float = None, theta: float = 0.0):
+        """Teleport body ``i`` (0 = EE) and zero its velocity."""
+        gid = self.rigid_ids[i]
+        if y is None:
+            y = self._rest_height(i)
+        x, y = float(x), float(y)
+        if i == 0:
+            self.ee_rigid.origin[0] = np.float32(x)
+            self.ee_rigid.origin[1] = np.float32(y)
+        else:
+            self.obj_rigids[i - 1].origin[0] = np.float32(x)
+            self.obj_rigids[i - 1].origin[1] = np.float32(y)
+        _patch_array(self.rm.rigidParams, (gid, 0), [x, y])
+        _patch_array(self.rm.quat, gid, float(theta))
+        _patch_array(self.rm.V, gid, wp.vec2(0.0, 0.0))
+        _patch_array(self.rm.RotV, gid, 0.0)
+
+    def place_lineup(self, xs):
+        """Set every body x, rest-height y, then refresh AABBs."""
+        for i, x in enumerate(xs):
+            self.set_body_pose(i, float(x))
+        self.rm.updateBBox()
+
+    def raw_states(self) -> np.ndarray:
+        """Kinematic state from the solver, without sensor noise."""
+        rm = self.rm
+        ids = np.asarray(self.rigid_ids)
+        params = rm.rigidParams.numpy()
+        quat = rm.quat.numpy()
+        V = rm.V.numpy()
+        RotV = rm.RotV.numpy()
+        pos = params[ids, 0, :].astype(np.float64)
+        theta = np.arctan2(np.sin(quat[ids]), np.cos(quat[ids]))
+        vel = V[ids]
+        om = RotV[ids]
+        return np.stack(
+            [pos[:, 0], pos[:, 1], theta, vel[:, 0], vel[:, 1], om], axis=1
+        ).astype(np.float32)
+
+    def min_separating_gap(self) -> float:
+        """Most-overlapping pair, AABB separating-axis gap (meters).
+
+        Negative means the two AABBs interpenetrate. Touching or kissing
+        (gap ≈ 0) is allowed; deep illegal overlap is not.
+        """
+        s = self.raw_states()
+        g = self.obj_geom
+        worst = 1.0e9
+        n = len(s)
+        for i in range(n):
+            for j in range(i + 1, n):
+                gx = abs(float(s[i, 0] - s[j, 0])) - float(g[i, 0] + g[j, 0])
+                gy = abs(float(s[i, 1] - s[j, 1])) - float(g[i, 1] + g[j, 1])
+                worst = min(worst, max(gx, gy))
+        return float(worst)
+
+    def snapshot(self) -> dict:
+        """Copy kinematic + dynamic state so a planner can roll and rewind."""
+        ids = np.asarray(self.rigid_ids)
+        rp = np.asarray(self.rm.rigidParams.numpy())
+        return {
+            "pos": rp[ids, 0].copy(),
+            "ext": rp[ids, 1].copy(),
+            "theta": np.asarray(self.rm.quat.numpy())[ids].copy(),
+            "vel": np.asarray(self.rm.V.numpy())[ids].copy(),
+            "om": np.asarray(self.rm.RotV.numpy())[ids].copy(),
+            "mass": np.asarray(self.rm.mass.numpy())[ids].copy(),
+            "inertia": np.asarray(self.rm.inertia.numpy())[ids].copy(),
+            "contact": np.asarray(self.rm.contactParams.numpy())[ids].copy(),
+            "radius": np.asarray(self.rm.radius.numpy())[ids].copy(),
+            "obj_geom": np.asarray(self.obj_geom).copy(),
+            "obj_half_heights": list(self.obj_half_heights),
+            "obj_mass": np.asarray(self.obj_mass).copy(),
+            "obj_mu": np.asarray(self.obj_mu).copy(),
+            "ee_radius": float(self.ee_rigid.radius),
+            "force_cap_override": getattr(self, "force_cap_override", None),
+        }
+
+    def restore(self, snap: dict):
+        """Write ``snapshot()`` back onto the live RigidManager."""
+        for i, gid in enumerate(self.rigid_ids):
+            x, y = float(snap["pos"][i, 0]), float(snap["pos"][i, 1])
+            if i == 0:
+                self.ee_rigid.origin[0] = np.float32(x)
+                self.ee_rigid.origin[1] = np.float32(y)
+                self.ee_rigid.radius = float(snap["ee_radius"])
+            else:
+                self.obj_rigids[i - 1].origin[0] = np.float32(x)
+                self.obj_rigids[i - 1].origin[1] = np.float32(y)
+                if int(self.obj_types[i]) == OBJ_TYPE_BOX:
+                    self.obj_rigids[i - 1].ext = np.asarray(
+                        snap["ext"][i], dtype=np.float32)
+                else:
+                    self.obj_rigids[i - 1].radius = float(snap["radius"][i])
+            _patch_array(self.rm.rigidParams, (gid, 0), [x, y])
+            _patch_array(self.rm.rigidParams, (gid, 1), snap["ext"][i])
+            _patch_array(self.rm.quat, gid, float(snap["theta"][i]))
+            vx, vy = float(snap["vel"][i, 0]), float(snap["vel"][i, 1])
+            _patch_array(self.rm.V, gid, wp.vec2(vx, vy))
+            _patch_array(self.rm.RotV, gid, float(snap["om"][i]))
+            _patch_array(self.rm.mass, gid, float(snap["mass"][i]))
+            _patch_array(self.rm.inertia, gid, float(snap["inertia"][i]))
+            _patch_array(self.rm.contactParams, gid, snap["contact"][i])
+            _patch_array(self.rm.radius, gid, float(snap["radius"][i]))
+        self.obj_geom = np.asarray(snap["obj_geom"], dtype=np.float32).copy()
+        self.obj_half_heights = list(snap["obj_half_heights"])
+        self.obj_mass = np.asarray(snap["obj_mass"], dtype=np.float32).copy()
+        self.obj_mu = np.asarray(snap["obj_mu"], dtype=np.float32).copy()
+        self.force_cap_override = snap.get("force_cap_override")
+        self.rm.updateBBox()
 
     def step(self, action: np.ndarray) -> dict:
         """Apply action=(Fx,Fy), advance one visual frame, return the new observation.
