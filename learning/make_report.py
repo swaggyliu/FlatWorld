@@ -3,13 +3,13 @@ rendered task scenes.
 
 Usage (repo root):
     python -m learning.make_report
-    python -m learning.make_report --pair19
-    python -m learning.make_report --tag pair19ens_H32_random
+    python -m learning.make_report --current-best
+    python -m learning.make_report --tag current_best_H32_random
 
 Inputs:  learning/results/train_log.csv
          learning/results/task_eval{tag}.json
          learning/results/task_trajectories{tag}.npz
-Outputs: learning/results/...png  (or learning/results/pair15/ with --pair15)
+Outputs: learning/results/...png  (or learning/results/current_best/ with --current-best)
 """
 
 import argparse
@@ -27,10 +27,10 @@ from learning.configs.default import Config
 
 RESULTS = "learning/results"
 
-PAIR19_TAGS = (
-    "pair19ens_H32_random",
-    "pair19ens_H32_leftmost",
-    "pair19ens_H32_rightmost",
+CURRENT_BEST_TAGS = (
+    "current_best_H32_random",
+    "current_best_H32_leftmost",
+    "current_best_H32_rightmost",
 )
 
 
@@ -257,23 +257,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", type=str, default=RESULTS)
     parser.add_argument("--out-dir", type=str, default="",
-                        help="output directory (default: --results or pair19_ens/)")
+                        help="output directory (default: --results or current_best/)")
     parser.add_argument("--tag", type=str, default="",
-                        help="eval tag suffix, e.g. pair19ens_H32_random")
-    parser.add_argument("--pair19", action="store_true",
-                        help="render pair19_ens eval JSONs into results/pair19_ens/")
+                        help="eval tag suffix, e.g. current_best_H32_random")
+    parser.add_argument("--current-best", action="store_true",
+                        help="render current-best eval JSONs into results/current_best/")
     args = parser.parse_args()
 
     cfg = Config()
     results_dir = args.results
     os.makedirs(results_dir, exist_ok=True)
 
-    if args.pair19:
-        out_dir = args.out_dir or os.path.join(results_dir, "pair19_ens")
-        _maybe_training_curves(results_dir, out_dir, title_suffix="pair19_ens")
-        for tag in PAIR19_TAGS:
+    if args.current_best:
+        out_dir = args.out_dir or os.path.join(results_dir, "current_best")
+        os.makedirs(out_dir, exist_ok=True)
+        _maybe_training_curves(results_dir, out_dir, title_suffix="current_best")
+        for tag in CURRENT_BEST_TAGS:
             generate_report(cfg, results_dir, out_dir, tag=tag)
-        main = _tag_paths(out_dir, "pair19ens_H32_random")
+        main = _tag_paths(out_dir, "current_best_H32_random")
         for src, dst in (
             (main["summary"], os.path.join(out_dir, "task_success_summary.png")),
             (main["scenes"], os.path.join(out_dir, "scene_rollouts.png")),
@@ -282,13 +283,13 @@ def main():
                 import shutil
                 shutil.copy2(src, dst)
                 print(f"copied {dst}")
-        left = _tag_paths(out_dir, "pair19ens_H32_leftmost")
+        left = _tag_paths(out_dir, "current_best_H32_leftmost")
         if os.path.exists(left["scenes"]):
             import shutil
             shutil.copy2(left["scenes"],
                          os.path.join(out_dir, "scene_rollouts_leftmost.png"))
             print(f"copied {out_dir}/scene_rollouts_leftmost.png")
-        print(f"pair19_ens report -> {out_dir}")
+        print(f"current_best report -> {out_dir}")
         return
 
     if args.tag:

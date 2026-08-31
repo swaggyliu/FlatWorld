@@ -8,7 +8,7 @@ from learning.tasks.push_to_goal import PushToGoalTask, load_model
 
 def main(seed: int = 1002):
     cfg = Config()
-    model, norm, stride = load_model("learning/checkpoints_pair19_ens/ens_0.pt", "cpu")
+    model, norm, stride = load_model("learning/checkpoints/ens_0.pt", "cpu")
     task = PushToGoalTask(cfg, model, norm, device="cpu",
                           stride=stride,
                           planner_kwargs=dict(horizon=8, population=96,

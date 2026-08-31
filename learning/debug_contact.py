@@ -33,7 +33,7 @@ def drive_to_contact(env, target_idx, fmax=6.0, max_frames=240):
 
 def main():
     device = "cpu"
-    model, norm, stride = load_model("learning/checkpoints_pair19_ens/ens_0.pt", device)
+    model, norm, stride = load_model("learning/checkpoints/ens_0.pt", device)
     cfg = Config()
     env = PushSceneEnv(cfg)
     rng = np.random.default_rng(1000)

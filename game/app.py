@@ -2,7 +2,7 @@
 
 Usage (repo root):
     python -m game
-    python -m game --checkpoint learning/checkpoints_pair19_ens
+    python -m game --checkpoint learning/checkpoints
 
 Start screen: pick a world-model checkpoint, then Start.
 Drop your own .pt into learning/world_models to see it in the list.
@@ -39,7 +39,7 @@ W, H = 1280, 720
 def main():
     parser = argparse.ArgumentParser(description="FlatWorld spirit push")
     parser.add_argument("--checkpoint", type=str,
-                        default="learning/checkpoints_pair19_ens")
+                        default="learning/checkpoints")
     parser.add_argument("--full", action="store_true",
                         help="prefer the full ensemble when a folder is selected")
     parser.add_argument("--width", type=int, default=W)

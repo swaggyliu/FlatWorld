@@ -49,7 +49,7 @@ def evaluate(model, loader, device):
     model.eval()
     agg = {"dynamics": 0.0, "recon_states": 0.0, "recon_summary": 0.0,
            "pred_recon_states": 0.0, "sigreg": 0.0, "contact": 0.0,
-           "pair": 0.0, "ground": 0.0, "drift": 0.0}
+           "pair": 0.0, "ground": 0.0, "drift": 0.0, "chain": 0.0}
     z_std_sum, z_batches = 0.0, 0
     k_err = {10: [], 25: [], 50: []}
     n_win = 0
@@ -69,10 +69,10 @@ def evaluate(model, loader, device):
         z = z0
         geom = batch.get("obj_geom")
         T = batch["actions"].shape[1]
-        prev_c = None
+        prev_c = model.pair_prob(z)
         for t in range(T):
-            z, h, prev_c = model.predictor.step(
-                z, batch["actions"][:, t], h, geom=geom, prev_contact=prev_c)
+            z, h, prev_c = model.roll_step(
+                z, batch["actions"][:, t], h, geom, prev_c)
             if (t + 1) in k_err:
                 err = torch.nn.functional.mse_loss(z, out["z_target"][:, t]).item()
                 k_err[t + 1].append(err)
@@ -132,7 +132,7 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
         model.train()
         ep = {"total": 0.0, "dynamics": 0.0, "recon_states": 0.0,
               "pred_recon_states": 0.0, "sigreg": 0.0, "contact": 0.0,
-              "pair": 0.0, "drift": 0.0}
+              "pair": 0.0, "drift": 0.0, "chain": 0.0}
         n = 0
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -142,7 +142,8 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
                 w_pair=float(getattr(args, "w_pair", 1.5)),
                 w_drift=float(getattr(args, "w_drift", 0.3)),
                 w_xy=float(getattr(args, "w_xy", 0.5)),
-                w_vel=float(getattr(args, "w_vel", 0.5)))
+                w_vel=float(getattr(args, "w_vel", 0.5)),
+                w_chain=float(getattr(args, "w_chain", 2.0)))
             opt.zero_grad()
             losses["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -186,7 +187,7 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
                   f"dyn {ep['dynamics']:.4f} recS {ep['recon_states']:.4f} "
                   f"predRecS {ep['pred_recon_states']:.4f} "
                   f"ctc {ep['contact']:.4f} pair {ep.get('pair', 0):.4f} "
-                  f"drft {ep.get('drift', 0):.4f} | "
+                  f"drft {ep.get('drift', 0):.4f} chn {ep.get('chain', 0):.4f} | "
                   f"val dyn {val['dynamics']:.4f} "
                   f"ol {val.get('openloop_10', float('nan')):.3f}/"
                   f"{val.get('openloop_25', float('nan')):.3f}/"
@@ -217,7 +218,7 @@ def main():
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--stride", type=int, default=5)
     parser.add_argument("--windows-per-rollout", type=int, default=16)
-    parser.add_argument("--out", type=str, default="learning/checkpoints_pair8")
+    parser.add_argument("--out", type=str, default="learning/checkpoints")
     parser.add_argument("--results", type=str, default="learning/results")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ensemble", type=int, default=5,
@@ -249,6 +250,8 @@ def main():
                         help="xy-head regression weight (CEM consumes xy)")
     parser.add_argument("--w-vel", type=float, default=0.5,
                         help="velocity readout loss weight (rich edges)")
+    parser.add_argument("--w-chain", type=float, default=2.0,
+                        help="solver-contact chain displacement loss weight")
     parser.add_argument("--no-rich-edges", dest="rich_edges",
                         action="store_false", default=True,
                         help="reproduce the pre-pair14 contact representation")

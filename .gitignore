@@ -63,7 +63,9 @@ results/*
 
 # learning module: generated data / checkpoints / logs / debug dumps
 learning/data/
-learning/checkpoints/
+learning/checkpoints/*
+!learning/checkpoints/best.pt
+!learning/checkpoints/normalizer.json
 learning/results/*
 !learning/results/*.png
 !learning/results/*.json

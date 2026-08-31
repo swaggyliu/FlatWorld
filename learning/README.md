@@ -169,8 +169,9 @@ python -m learning.train --data learning/data/rollouts_lr --epochs 60 --ensemble
 - Checkpoints also store `n_obj`, `latent_dim`, `stride`, `n_mp`,
   `rich_edges`, and point at `normalizer.json`.
 
-Shipped weights: `learning/checkpoints_pair19_ens` (2 members, `n_mp=3`,
-`rich_edges=True`, stride 5).
+Shipped weights: `learning/checkpoints/best.pt` (pair19 member 0, `n_mp=3`,
+`rich_edges=True`, stride 5). Extra `ens_*.pt` files are local-only; if
+they are present, game and eval load the ensemble.
 
 ## PushToGoal + CEM
 
@@ -196,8 +197,8 @@ Protocol (`eval_task.py`):
 Cost on decoded `xy` (unchanged by the planner split):
 
 1. `|target − goal|` each step, plus `2 ×` that distance at the horizon.
-2. Reach: EE toward the contact face behind the target along the push
-   sign, faded as the target nears the goal.
+2. Reach: EE toward the contact face of the target, faded as it nears
+   the goal.
 3. Coast: near-goal penalty if EE stays closer than standoff + 1 cm.
 4. Brake: near-goal penalty on target speed (linear + quadratic).
 5. Action L2. Ensemble: mean cost + `uncert_cost ×` std (default 0.1).
@@ -209,7 +210,7 @@ model. Geometric terms shape the cost; they do not emit the force.
 
 ## Current results
 
-`learning/checkpoints_pair19_ens` (2 members, CEM H=32, 50 episodes):
+`learning/checkpoints` (pair19, 2 members, CEM H=32, 50 episodes):
 
 | protocol  | success | mean final dist | mean settle |
 |-----------|---------|-----------------|-------------|
@@ -217,7 +218,10 @@ model. Geometric terms shape the cost; they do not emit the force.
 | rightmost | 43/50 = **86%** | 0.133 m | 199 |
 | random    | 39/50 = **78%** | 0.231 m | 178 |
 
-Figures: `results/pair19_ens/`.
+Figures: `results/current_best/`.
+
+Later contact-label and chain-Δv fine-tunes (pair20 / pair21) did **not**
+beat this baseline. pair19 stays shipped.
 
 ## Pipeline
 
@@ -230,18 +234,18 @@ python -m learning.data.collect --num-rollouts 100 --episode-len 200 \
 python -m learning.train --data learning/data/rollouts_lr --epochs 60 --ensemble 5
 
 # 3. evaluate
-python -m learning.eval_task --checkpoint learning/checkpoints_pair19_ens \
+python -m learning.eval_task --checkpoint learning/checkpoints \
     --episodes 50 --target-mode leftmost
-python -m learning.eval_task --checkpoint learning/checkpoints_pair19_ens \
+python -m learning.eval_task --checkpoint learning/checkpoints \
     --episodes 50 --target-mode rightmost --tag rightmost
-python -m learning.eval_task --checkpoint learning/checkpoints_pair19_ens \
+python -m learning.eval_task --checkpoint learning/checkpoints \
     --episodes 50 --target-mode random --tag random
 
 # 4. report figures
-python -m learning.make_report --pair19
+python -m learning.make_report --current-best
 
 # 5. playable prototype
-python -m game --checkpoint learning/checkpoints_pair19_ens
+python -m game --checkpoint learning/checkpoints
 ```
 
 Outputs land in `learning/checkpoints/` (or `--out`) and
@@ -271,6 +275,5 @@ Outputs land in `learning/checkpoints/` (or `--out`) and
 
 Tracked in [`improvement.md`](improvement.md). Short version: the
 per-object GNN + `rich_edges` + ensemble **training path** are in place;
-the remaining leverage is **object–object contact as a training signal**
-(so CEM can plan through piles from the world model alone) and a learned
-cost head if the geometric PushToGoal terms can be retired.
+the remaining leverage is **variable-N / new geometry for levels**, not
+more contact-label or chain-Δv training on this PushToGoal split.

@@ -54,9 +54,11 @@ def _catch_event_frames(states: np.ndarray, obj_types: np.ndarray,
 
 
 def _pair_labels(xy: np.ndarray, geom: np.ndarray, gap_eps: float = 0.015):
-    """Privileged pair / ground contact from raw states (not written to obs).
+    """Fallback pair / ground flags from signed gap (old npz without solver).
 
-    xy (T, N, 2), geom (N, 2) -> touch (T, N, N), ground (T, N).
+    Prefer ``pair_contact`` / ``ground_contact`` written by the collector
+    from the PGS contact cache. This circle-gap approx is only for files
+    that have not been relabeled yet.
     """
     rel = xy[:, :, None, :] - xy[:, None, :, :]
     dist = np.linalg.norm(rel, axis=-1)
@@ -105,7 +107,16 @@ class PushWindowDataset(Dataset):
                 skipped += 1
                 continue
 
-            pair_c, ground_c = _pair_labels(states[..., :2], geom)
+            pair_c = d["pair_contact"].astype(np.float32) if "pair_contact" in d.files \
+                else None
+            ground_c = d["ground_contact"].astype(np.float32) if "ground_contact" in d.files \
+                else None
+            if pair_c is None or ground_c is None:
+                g_pair, g_ground = _pair_labels(states[..., :2], geom)
+                if pair_c is None:
+                    pair_c = g_pair
+                if ground_c is None:
+                    ground_c = g_ground
 
             # Catch-event frames (raw physical units, before normalization):
             # a ball decelerates from >0.15 m/s to <0.06 m/s within a few

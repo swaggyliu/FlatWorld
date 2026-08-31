@@ -39,7 +39,7 @@ from flatworld import (
 # NOTE: flatworld uses top-level import style internally (its __init__.py
 # puts the package dir on sys.path). We follow the same style to avoid
 # loading rigidmanager twice under two module names.
-from rigidmanager import _patch_array
+from rigidmanager import _assign_scalar, _patch_array
 from wp_init import init_warp
 
 from learning.configs.default import Config
@@ -368,6 +368,99 @@ class PushSceneEnv:
         self._cache_body_params()
         self._noise_rng = np.random.default_rng(int(rng.integers(1 << 31)))
         self.set_force((0.0, 0.0))
+
+    def solver_contacts(self):
+        """Object–object and ground contact flags from the live PGS cache.
+
+        Pair entries are 1 iff the solver generated a rigid-rigid contact
+        between those two bodies on the last detect (not a geometric gap).
+        Ground is 1 iff that body had an analytical-plane contact.
+        """
+        n = self.n_obj
+        pair = np.zeros((n, n), dtype=np.float32)
+        ground = np.zeros(n, dtype=np.float32)
+        id_to_i = {int(gid): i for i, gid in enumerate(self.rigid_ids)}
+        rm = self.rm
+        nc = int(rm.num_contacts.numpy()[0])
+        if nc > 0:
+            nc = min(nc, rm.MAX_CONTACTS)
+            ca = rm.contact_rigid_a.numpy()[:nc]
+            cb = rm.contact_rigid_b.numpy()[:nc]
+            for a, b in zip(ca, cb):
+                ia, ib = id_to_i.get(int(a)), id_to_i.get(int(b))
+                if ia is None or ib is None or ia == ib:
+                    continue
+                pair[ia, ib] = pair[ib, ia] = 1.0
+        ng = int(rm.num_ground_contacts.numpy()[0])
+        if ng > 0:
+            ng = min(ng, rm.MAX_GROUND_CONTACTS)
+            for rid in rm.ground_contact_rigid.numpy()[:ng]:
+                i = id_to_i.get(int(rid))
+                if i is not None:
+                    ground[i] = 1.0
+        return pair, ground
+
+    def _fill_all_rigid_pairs(self):
+        """Put every rigid-rigid pair into the primitive detect buffer."""
+        rm = self.rm
+        ids = self.rigid_ids
+        n = len(ids)
+        buf = np.asarray(rm.primitive_pairs_buffer.numpy())
+        k = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                buf[k] = (int(ids[i]), int(ids[j]))
+                k += 1
+        rm.primitive_pairs_buffer.assign(buf)
+        _assign_scalar(rm.num_primitive_pairs, k)
+
+    def apply_saved_geom(self, geom: np.ndarray):
+        """Write npz ``obj_geom`` (half-extents) into the live solver."""
+        geom = np.asarray(geom, dtype=np.float32)
+        self.obj_geom = geom.copy()
+        for i, gid in enumerate(self.rigid_ids):
+            hw, hh = float(geom[i, 0]), float(geom[i, 1])
+            if i == 0 or int(self.obj_types[i]) == OBJ_TYPE_BALL:
+                r = hw
+                if i == 0:
+                    self.ee_rigid.radius = r
+                else:
+                    self.obj_rigids[i - 1].radius = r
+                _patch_array(self.rm.radius, gid, r)
+            else:
+                ext = np.array([2.0 * hw, 2.0 * hh], dtype=np.float32)
+                self.obj_rigids[i - 1].ext = ext
+                _patch_array(self.rm.rigidParams, (gid, 1), ext)
+        self._apply_geom_to_rm()
+
+    def set_states(self, states: np.ndarray):
+        """Teleport every body to ``states`` (N, 6) = x y θ vx vy ω."""
+        states = np.asarray(states, dtype=np.float32)
+        for i, gid in enumerate(self.rigid_ids):
+            x, y, th = float(states[i, 0]), float(states[i, 1]), float(states[i, 2])
+            vx, vy, om = float(states[i, 3]), float(states[i, 4]), float(states[i, 5])
+            if i == 0:
+                self.ee_rigid.origin[0] = np.float32(x)
+                self.ee_rigid.origin[1] = np.float32(y)
+            else:
+                self.obj_rigids[i - 1].origin[0] = np.float32(x)
+                self.obj_rigids[i - 1].origin[1] = np.float32(y)
+            _patch_array(self.rm.rigidParams, (gid, 0), [x, y])
+            _patch_array(self.rm.quat, gid, th)
+            _patch_array(self.rm.V, gid, wp.vec2(vx, vy))
+            _patch_array(self.rm.RotV, gid, om)
+
+    def refresh_solver_contacts(self):
+        """Detect contacts at the current pose (no time integration)."""
+        rm = self.rm
+        rm.precompute_rigid_transforms()
+        rm.updateBBox()
+        rm.reset_contact_caches_kernel()
+        rm._generate_ground_pairs_direct_kernel()
+        self._fill_all_rigid_pairs()
+        rm.detect_all_contacts()
+        rm.detectRigidGroundContact()
+        return self.solver_contacts()
 
     # ------------------------------------------------------------------ #
     # Control

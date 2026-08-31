@@ -69,7 +69,7 @@ class LatentPredictor(nn.Module):
         _, _, gap = pairwise_gap(xy, geom)
         return (gap < 0.0).to(xy.dtype)
 
-    def _aggregate(self, z, geom, xy=None, prev_contact=None):
+    def _aggregate(self, z, geom, xy=None, prev_contact=None, pair_contact=None):
         B, N, L = z.shape
         if xy is None:
             xy = self.xy_head(z)
@@ -80,6 +80,13 @@ class LatentPredictor(nn.Module):
         rel, dist, gap = pairwise_gap(xy, geom)
         adj = knn_adjacency(dist, gap, self.k_nn, self.gap_cut)
         contact_flag = (gap < 0.0).to(z.dtype).unsqueeze(-1)
+        if pair_contact is not None:
+            pc_now = pair_contact.to(z.dtype)
+            if pc_now.dim() == 2:
+                pc_now = pc_now.unsqueeze(0)
+            if pc_now.dim() == 3:
+                pc_now = pc_now.unsqueeze(-1)
+            contact_flag = pc_now
         if self.rich_edges:
             vel = self.vel_head(z)                          # (B,N,2)
             rel_v = vel.unsqueeze(2) - vel.unsqueeze(1)     # (B,N,N,2)
@@ -112,7 +119,8 @@ class LatentPredictor(nn.Module):
         deg = adj.sum(dim=2, keepdim=True).clamp(min=1).to(z.dtype)
         return msg.sum(dim=2) / deg
 
-    def step(self, z, a, h, geom=None, xy=None, prev_contact=None):
+    def step(self, z, a, h, geom=None, xy=None, prev_contact=None,
+             pair_contact=None):
         """z (B,N,L), a (B,A), h (B,N,H) -> z', h', contact_now (B,N,N).
 
         ``contact_now`` is the contact flag of the INPUT xy (time t); pass
@@ -135,7 +143,8 @@ class LatentPredictor(nn.Module):
             xy_now = xy_now.unsqueeze(0).expand(B, -1, -1)
         elif xy_now.shape[0] == 1 and B > 1:
             xy_now = xy_now.expand(B, -1, -1)
-        agg = self._aggregate(z, geom, xy=xy_now, prev_contact=prev_contact)
+        agg = self._aggregate(z, geom, xy=xy_now, prev_contact=prev_contact,
+                              pair_contact=pair_contact)
         contact_now = self._contact(xy_now, geom)
         a_full = z.new_zeros(B, N, self.action_dim)
         a_full[:, 0] = a

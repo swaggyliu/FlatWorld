@@ -23,7 +23,7 @@ def _is_last(path: str) -> bool:
 def discover_models(*extra_paths: str) -> list[ModelOption]:
     """Find .pt checkpoints the player can drive the spirit with."""
     roots = [
-        "learning/checkpoints_pair19_ens",
+        "learning/checkpoints",
         "learning/world_models",
     ]
     for p in extra_paths:

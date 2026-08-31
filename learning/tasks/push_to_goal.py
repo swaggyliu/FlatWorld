@@ -78,7 +78,11 @@ _COST_KEYS = (
 
 
 class PushToGoalCost:
-    """Decoded-xy cost for PushToGoal. Same terms as the old CEMPlanner."""
+    """Decoded-xy cost for PushToGoal.
+
+    Geometric terms only (CEM still emits the force): distance to goal,
+    reach the target contact face, coast, and brake.
+    """
 
     def __init__(self, action_cost: float = 0.0005, reach_cost: float = 0.35,
                  brake_radius: float = 0.15, brake_w: float = 4.0,
@@ -101,12 +105,15 @@ class PushToGoalCost:
         self.push_sign = 1.0
         self.standoff = 0.0
 
-    def bind(self, goal, states_now, geom, ee_idx: int, target_idx: int):
+    def bind(self, goal, states_now, geom, ee_idx: int, target_idx: int,
+             min_gap: float = 0.02):
         self.ee_idx = ee_idx
         self.target_idx = target_idx
         self.goal_t = torch.as_tensor(goal[:2], device=self.device, dtype=torch.float32)
         self.push_sign = 1.0 if float(goal[0]) >= float(states_now[target_idx, 0]) else -1.0
-        self.standoff = float(geom[target_idx, 0] + geom[ee_idx, 0])
+        g = torch.as_tensor(geom, device=self.device, dtype=torch.float32)
+        hw = g[:, 0].clamp(min=1e-4)
+        self.standoff = float(hw[target_idx] + hw[ee_idx])
 
     def step(self, xy, a_t, prev):
         d_goal = (xy[:, self.target_idx] - self.goal_t).norm(dim=-1)
@@ -129,8 +136,7 @@ class PushToGoalCost:
         return cost
 
     def terminal(self, xy):
-        d_goal = (xy[:, self.target_idx] - self.goal_t).norm(dim=-1)
-        return 2.0 * d_goal
+        return 2.0 * (xy[:, self.target_idx] - self.goal_t).norm(dim=-1)
 
 
 class PushToGoalTask:
@@ -297,7 +303,9 @@ class PushToGoalTask:
             return np.zeros(2, dtype=np.float32)
         z0 = self.planner.encode_obs(cur)
         geom = self._geom()
-        self.cost.bind(goal, cur["obj_states"], geom, self.ee_idx, self.target_idx)
+        self.cost.bind(
+            goal, cur["obj_states"], geom, self.ee_idx, self.target_idx,
+            min_gap=float(self.cfg.scene.min_gap))
         return self.planner.plan(
             z0, geom=geom, states_now=cur["obj_states"], cost=self.cost)
 

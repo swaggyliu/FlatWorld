@@ -10,7 +10,7 @@ from learning.tasks.push_to_goal import load_model
 
 def main():
     device = "cpu"
-    model, norm, stride = load_model("learning/checkpoints_pair19_ens/ens_0.pt", device)
+    model, norm, stride = load_model("learning/checkpoints/ens_0.pt", device)
     cfg = Config()
     env = PushSceneEnv(cfg)
     rng = np.random.default_rng(3)

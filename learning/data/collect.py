@@ -232,6 +232,9 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
     feats = [obs["contact_feat"]]
     masks = [obs["contact_mask"]]
     sums = [obs["tactile_summary"]]
+    pair0, ground0 = env.refresh_solver_contacts()
+    pairs = [pair0]
+    grounds = [ground0]
     actions = []
     attract_idx = 1 + int(rng.integers(0, obs["obj_states"].shape[0] - 1))
     pile_target = 1 + int(rng.integers(0, obs["obj_states"].shape[0] - 1))
@@ -317,6 +320,9 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         feats.append(obs["contact_feat"])
         masks.append(obs["contact_mask"])
         sums.append(obs["tactile_summary"])
+        p, g = env.solver_contacts()
+        pairs.append(p)
+        grounds.append(g)
 
     return {
         "obj_types": obs["obj_types"],                    # (N,)
@@ -326,6 +332,8 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         "contact_feat": np.stack(feats),                  # (T+1, K, 7)
         "contact_mask": np.stack(masks),                  # (T+1, K)
         "tactile_summary": np.stack(sums),                # (T+1, 4)
+        "pair_contact": np.stack(pairs),                  # (T+1, N, N) solver
+        "ground_contact": np.stack(grounds),              # (T+1, N) solver
     }
 
 

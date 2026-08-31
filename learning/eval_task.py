@@ -1,7 +1,7 @@
 """Evaluate PushToGoal with the shipped CEM controller.
 
 Usage (repo root):
-    python -m learning.eval_task --checkpoint learning/checkpoints_pair19_ens \\
+    python -m learning.eval_task --checkpoint learning/checkpoints \\
         --episodes 50 --target-mode random
 """
 
@@ -20,7 +20,7 @@ from learning.tasks.push_to_goal import PushToGoalTask, load_ensemble
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str,
-                        default="learning/checkpoints_pair19_ens")
+                        default="learning/checkpoints")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--budget", type=int, default=None,
                         help="sim frames (default: Config.task.budget = 400)")
@@ -41,6 +41,9 @@ def build_parser():
     parser.add_argument("--results", type=str, default="learning/results")
     parser.add_argument("--uncert-cost", type=float, default=None,
                         help="override ensemble disagreement cost (default 0.1)")
+    parser.add_argument("--only", type=str, default="",
+                        help="comma-separated episode indices (seed+i); "
+                             "skip all other episodes")
     return parser
 
 
@@ -64,11 +67,19 @@ def run_eval(args):
                 "success": [], "target_idx": [], "geom": []}
     t0 = time.time()
     n_success = 0
-    for i in range(args.episodes):
+    only = getattr(args, "only", "") or ""
+    if only.strip():
+        indices = [int(x) for x in only.split(",") if x.strip()]
+    else:
+        indices = list(range(args.episodes))
+    n_run = len(indices)
+    for k, i in enumerate(indices):
         rng = np.random.default_rng(args.seed + i)
-        rec = i < args.record
+        rec = k < args.record
         r = task.run_episode(rng, record=rec)
         n_success += r["success"]
+        r = dict(r)
+        r["episode_idx"] = i
         if rec:
             states, masks, actions = r["frames"]
             recorded["states"].append(states)
@@ -78,20 +89,20 @@ def run_eval(args):
             recorded["success"].append(r["success"])
             recorded["target_idx"].append(r["target_idx"])
             recorded["geom"].append(task._geom().copy())
-        records.append({k: v for k, v in r.items() if k != "frames"})
-        if (i + 1) % 10 == 0 or i == 0:
-            rate = n_success / (i + 1)
-            print(f"[{i + 1}/{args.episodes}] success so far {n_success}/{i + 1} "
+        records.append({key: v for key, v in r.items() if key != "frames"})
+        if only.strip() or (k + 1) % 10 == 0 or k == 0:
+            rate = n_success / (k + 1)
+            print(f"[ep {i} {k + 1}/{n_run}] success so far {n_success}/{k + 1} "
                   f"({100 * rate:.1f}%), last final_dist {r['final_dist']:.3f}")
 
-    rate = n_success / args.episodes
+    rate = n_success / n_run
     elapsed = time.time() - t0
     dists = [r["final_dist"] for r in records]
     frames = [r["settle_frame"] for r in records]
     summary = {
         "checkpoint": args.checkpoint,
         "tag": args.tag,
-        "episodes": args.episodes,
+        "episodes": n_run,
         "budget": task.budget,
         "tol": task.tol,
         "vel_tol": task.vel_tol,
@@ -106,7 +117,8 @@ def run_eval(args):
         "ee_scale": args.ee_scale,
         "cem": {"horizon": args.horizon, "population": args.population,
                 "iterations": args.iterations,
-                "uncert_cost": args.uncert_cost},
+                "uncert_cost": args.uncert_cost,
+                "only": getattr(args, "only", "") or None},
     }
     os.makedirs(args.results, exist_ok=True)
     suffix = f"_{args.tag}" if args.tag else ""
@@ -127,12 +139,12 @@ def run_eval(args):
         )
 
     print("-" * 60)
-    print(f"SUCCESS RATE: {n_success}/{args.episodes} = {100 * rate:.1f}%")
+    print(f"SUCCESS RATE: {n_success}/{n_run} = {100 * rate:.1f}%")
     print(f"target={args.target_mode}")
     print(f"Mean final distance: {summary['mean_final_dist']:.3f} "
           f"(tol {task.tol}, vel {task.vel_tol}), "
           f"mean settle frame {summary['mean_settle_frame']:.0f}")
-    print(f"Elapsed {elapsed:.1f}s ({elapsed / args.episodes:.2f}s/episode)")
+    print(f"Elapsed {elapsed:.1f}s ({elapsed / n_run:.2f}s/episode)")
     print(f"Wrote {eval_path}")
     return summary
 

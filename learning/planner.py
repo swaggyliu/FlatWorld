@@ -86,11 +86,12 @@ class CEMPlanner:
         """Zero-action imagined xy (H, N, 2) in raw units."""
         a0 = self._normalize("actions", torch.zeros(1, 2, device=self.device))
         z, h = z0[:1], model.predictor.init_hidden(z0[:1])
-        prev_c = None
+        prev_c = model.pair_prob(z)
         frames = []
         for _ in range(self.H):
-            z, h, prev_c = model.predictor.step(z, a0, h, geom=geom_n,
-                                                prev_contact=prev_c)
+            z, h, _ = model.predictor.step(z, a0, h, geom=geom_n,
+                                           prev_contact=prev_c)
+            prev_c = model.pair_prob(z)
             frames.append(self._denorm_xy(model.predictor.xy_head(z))[0])
         return torch.stack(frames)
 
@@ -100,12 +101,13 @@ class CEMPlanner:
         h = model.predictor.init_hidden(z)
         total = a.new_zeros(self.P)
         prev = None
-        prev_c = None
+        prev_c = model.pair_prob(z)
         xy = None
         for t in range(self.H):
-            z, h, prev_c = model.predictor.step(
+            z, h, _ = model.predictor.step(
                 z, self._normalize("actions", a[:, t]), h, geom=geom_n,
                 prev_contact=prev_c)
+            prev_c = model.pair_prob(z)
             xy = self._denorm_xy(model.predictor.xy_head(z))
             xy = xy - base[t] + now_xy
             total = total + cost.step(xy, a[:, t], prev)
