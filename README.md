@@ -52,15 +52,53 @@ HEADLESS=1 pytest test2D -q
 pytest test2D/test_2Dfem_elastic.py
 ```
 
-51 test files under `test2D/` cover FEM, rigid contact, joints, friction, and all ground types.
+50 pytest modules under `test2D/` cover FEM, rigid contact, joints, friction, and all ground types.
 
 ## Learning world models
 
-[`learning/`](learning/README.md) contains a lightweight **state + tactile
+Full write-up, architecture, losses, and eval numbers:
+**[learning/README.md](learning/README.md)**.
+
+[`learning/`](learning/README.md) is a lightweight **state + tactile
 conditioned latent world model** (StateLeWM) trained inside FlatWorld:
-random-push data collection, latent dynamics training with anti-collapse
-losses, and CEM/MPC planning for a PushToGoal task with success-rate
-evaluation.
+random-push data collection, latent dynamics training, and CEM planning
+for PushToGoal. Current numbers (50 episodes, CEM H=32): leftmost /
+rightmost **86%**, random **78%**. Shipped weights:
+`learning/checkpoints/best.pt`.
+
+## Spirit Push
+
+A raylib prototype that uses the world model as a **spirit**: you click
+what to push and where; CEM plans the force. Five short stages stay
+inside the trained scene (1 circular EE + 3 boxes + 2 balls).
+
+```bash
+python -m game
+# or: python -m game --checkpoint learning/checkpoints
+```
+
+Gold is the target, red is a one-hit hazard, the star is the goal.
+Sliders set bounce / grip / size. `Shift` is a careful (weaker) push.
+
+<p align="center">
+  <img src="docs/game/menu.png" width="720" alt="Spirit Push start menu" />
+</p>
+
+<p align="center">
+  <img src="docs/game/push.png" width="280" alt="Level 1 Push" />
+  <img src="docs/game/bank.png" width="280" alt="Level 3 Bank" />
+  <img src="docs/game/gauntlet.png" width="280" alt="Level 5 Gauntlet" />
+</p>
+
+| shot | stage |
+|------|--------|
+| menu | pick `best.pt` (or drop your own `.pt` into `learning/world_models`) |
+| Push | shove the gold box onto the star |
+| Bank | high bounce, knock the gold ball |
+| Gauntlet | red sits in the lane — don't touch it |
+
+How the planner talks to the engine: [learning/README.md](learning/README.md).
+Regenerate shots: `python scripts/capture_game.py`.
 
 ## Gallery
 
@@ -81,6 +119,7 @@ Regenerate locally: `python scripts/capture_gallery.py`
 
 ## Documentation
 
+- [Learning world models](learning/README.md)
 - [Theory & implementation (中文)](docs/THEORY_AND_IMPLEMENTATION.md)
 - [Contributing](CONTRIBUTING.md)
 
@@ -93,6 +132,8 @@ FlatWorld/
 │   ├── mixedcontact.py # Batched FEM/rigid/ground contact
 │   ├── femspringmanager.py
 │   └── rigidmanager.py
+├── learning/           # StateLeWM world model + PushToGoal CEM
+├── game/               # raylib prototype (python -m game)
 ├── test2D/             # 2D examples & pytest suite
 └── docs/
 ```
@@ -158,9 +199,38 @@ pytest test2D -q
 
 完整列表：[docs/gallery/README.md](docs/gallery/README.md) · 重新生成：`python scripts/capture_gallery.py`
 
+## 学习世界模型
+
+完整说明（架构、损失、评测）：**[learning/README.md](learning/README.md)**。
+
+[`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。当前成功率（50 局，CEM H=32）：最左 / 最右 **86%**，随机 **78%**。默认权重：`learning/checkpoints/best.pt`。
+
+## Spirit Push 游戏
+
+用世界模型当「精灵」的 raylib 原型：点要推的物体和落点，CEM 规划力。五关都落在训练场景里（1 个圆形末端执行器 + 3 箱 + 2 球）。
+
+```bash
+python -m game
+```
+
+金色是目标，红色碰一次就重来，星星是终点。右侧滑条改弹性 / 摩擦力 / 尺寸。`Shift` 为小心推（更小的力）。
+
+<p align="center">
+  <img src="docs/game/menu.png" width="720" alt="Spirit Push 开始菜单" />
+</p>
+
+<p align="center">
+  <img src="docs/game/push.png" width="280" alt="第 1 关 Push" />
+  <img src="docs/game/bank.png" width="280" alt="第 3 关 Bank" />
+  <img src="docs/game/gauntlet.png" width="280" alt="第 5 关 Gauntlet" />
+</p>
+
+截图再生成：`python scripts/capture_game.py`。
+
 ## 文档
 
-详见 [docs/THEORY_AND_IMPLEMENTATION.md](docs/THEORY_AND_IMPLEMENTATION.md)。
+- [学习世界模型](learning/README.md)
+- [理论与实现](docs/THEORY_AND_IMPLEMENTATION.md)
 
 ## 开源协议
 

@@ -98,8 +98,8 @@ contact forces. The EE is inserted into the lineup at a random rank
    projected to 64-d `h_i`.
 2. Tactile: each of `K` contacts through an MLP, mask-sum (Deep Sets),
    concatenated with the 4-d summary, **added only to the EE node**.
-3. `n_mp` rounds of sparse message passing (default 2; shipped pair19
-   uses 3). An edge is kept if it is among the `k=2` nearest neighbours
+3. `n_mp` rounds of sparse message passing (train / shipped default **3**).
+   An edge is kept if it is among the `k=2` nearest neighbours
    **or** the signed gap `dist − r_i − r_j` is below `0.12`. With
    `rich_edges=True` (pair14+ default) edges also carry relative velocity
    (normal / tangent) and a contact flag; messages **sum**. Nodes update
@@ -118,8 +118,10 @@ The 2-d action is concatenated **only on the EE node**. A per-node
 adds a `vel_head` so imagined rollouts can rebuild velocity-aware
 edges, including the previous-step contact flag (persistence).
 
-**Contact head** (on `StateLeWM`): `z_EE →` logit for "EE in contact this
-frame", trained with BCE on both encoded `z` and predicted `z`.
+**Contact heads** (on `StateLeWM`): `z_EE →` logit for "EE in contact this
+frame", plus privileged pair / ground heads. All use **focal BCE** with
+label smoothing, on both encoded `z` and predicted `z`. Imagined CEM
+rollouts feed `pair_prob(z)` back as `prev_contact`.
 
 ## Losses
 
@@ -128,7 +130,13 @@ Total = MSE(z_pred, sg(z_{t+1}))                         # latent dynamics (JEPA
       + w_rec      * Recon(z_enc)                        # states + tactile summary
       + w_pred_rec * Recon(z_pred)
       + w_var      * SIGReg                              # hinge: max(0, 1 − std(z_d))
-      + w_c        * [BCE(contact | z) + BCE(contact | z_pred)]
+      + w_c        * focal BCE(EE contact | z, z_pred)
+      + w_xy       * xy_head vs true xy
+      + w_pair     * focal BCE(solver pair contact)
+      + w_ground   * focal BCE(solver ground contact)
+      + w_drift    * predicted object motion at near-zero EE force
+      + w_vel      * vel_head vs true (vx, vy)  (rich_edges)
+      + w_chain    * Δxy of solver-contacted bodies
 ```
 
 `z_target` is stop-grad so the predictor cannot collapse the encoder.
@@ -139,14 +147,18 @@ distance). SIGReg is a variance floor, not a maximize-variance term.
 ## Data collection
 
 Default output: `learning/data/rollouts_lr` (`num_rollouts=100`,
-`episode_len=200`). Four interleaved modes:
+`episode_len=200`). Five interleaved modes (`CollectConfig` shares):
 
 | mode      | share | behaviour |
 |-----------|-------|-----------|
-| `free`    | 30%   | hold a random-direction force for a stretch + light OU. Teaches force → EE motion with no +x bias, and "objects stay still without contact". |
-| `attract` | 25%   | OU force + capped attraction to a random object (horizontal-only near the ground). Contact / tactile. |
+| `free`    | 15%   | hold a random-direction force for a stretch + light OU. Teaches force → EE motion with no +x bias, and "objects stay still without contact". |
+| `attract` | 15%   | OU force + capped attraction to a random object (horizontal-only near the ground). Contact / tactile. |
 | `push`    | 15%   | timed push / withdraw toward a random object. Contact making and breaking. |
-| `pile`    | 30%   | shove the body in front of a random (possibly buried) target. Chain-contact / Random-task coverage. |
+| `release` | 10%   | after a shove, zero/small force so objects come to rest. |
+| `pile`    | 45%   | shove the body in front of a random (possibly buried) target. Chain-contact / Random-task coverage. |
+
+Optional `--contrast` adds gap / kiss / around pairs. These ratios are
+**collection only**; the shipped planner never uses them.
 
 OU (Ornstein–Uhlenbeck) is temporally correlated force noise,
 `a_t ≈ 0.85 a_{t−1} + 1.5 ε_t`, so trajectories are smooth rather than
@@ -156,7 +168,7 @@ barrier force is stored as part of the action.
 ## Training
 
 ```bash
-python -m learning.train --data learning/data/rollouts_lr --epochs 60 --ensemble 5
+python -m learning.train --data learning/data/rollouts_lr --epochs 80 --ensemble 5
 ```
 
 - Window of 24 model steps; **stride 5**: one model step covers five sim
@@ -164,8 +176,10 @@ python -m learning.train --data learning/data/rollouts_lr --epochs 60 --ensemble
   the force → motion signal large enough that dynamics cannot ignore it).
 - `--ensemble K` trains `K` independently seeded copies of the **same**
   architecture (not one checkpoint per object). Used at plan time as
-  mean cost + disagreement penalty. Default `--ensemble 1` writes
-  `best.pt`; `K>1` writes `ens_0.pt` … `ens_{K-1}.pt`.
+  mean cost + disagreement penalty. Default `--ensemble 5` writes
+  `ens_0.pt` … `ens_4.pt` plus a copy of member 0 as `best.pt`; `K=1`
+  writes only `best.pt`.
+- Train default `--n-mp 3`, `--epochs 80`, `--stride 5`.
 - Checkpoints also store `n_obj`, `latent_dim`, `stride`, `n_mp`,
   `rich_edges`, and point at `normalizer.json`.
 
@@ -210,7 +224,10 @@ model. Geometric terms shape the cost; they do not emit the force.
 
 ## Current results
 
-`learning/checkpoints` (pair19, 2 members, CEM H=32, 50 episodes):
+Published PushToGoal numbers below used a **2-member** CEM ensemble
+(H=32, 50 episodes, seed 1000). Git tracks `learning/checkpoints/best.pt`
+(member 0) and `normalizer.json`; extra `ens_*.pt` files are local-only.
+With only `best.pt` present, game and eval load a single model.
 
 | protocol  | success | mean final dist | mean settle |
 |-----------|---------|-----------------|-------------|
@@ -218,7 +235,8 @@ model. Geometric terms shape the cost; they do not emit the force.
 | rightmost | 43/50 = **86%** | 0.133 m | 199 |
 | random    | 39/50 = **78%** | 0.231 m | 178 |
 
-Figures: `results/current_best/`.
+JSON: `learning/results/task_eval_current_best_H32_{leftmost,rightmost,random}.json`.
+Figures: `learning/results/current_best/`.
 
 Later contact-label and chain-Δv fine-tunes (pair20 / pair21) did **not**
 beat this baseline. pair19 stays shipped.
@@ -231,15 +249,15 @@ python -m learning.data.collect --num-rollouts 100 --episode-len 200 \
     --out learning/data/rollouts_lr
 
 # 2. train (optional ensemble)
-python -m learning.train --data learning/data/rollouts_lr --epochs 60 --ensemble 5
+python -m learning.train --data learning/data/rollouts_lr --epochs 80 --ensemble 5
 
 # 3. evaluate
 python -m learning.eval_task --checkpoint learning/checkpoints \
-    --episodes 50 --target-mode leftmost
+    --episodes 50 --target-mode leftmost --tag current_best_H32_leftmost
 python -m learning.eval_task --checkpoint learning/checkpoints \
-    --episodes 50 --target-mode rightmost --tag rightmost
+    --episodes 50 --target-mode rightmost --tag current_best_H32_rightmost
 python -m learning.eval_task --checkpoint learning/checkpoints \
-    --episodes 50 --target-mode random --tag random
+    --episodes 50 --target-mode random --tag current_best_H32_random
 
 # 4. report figures
 python -m learning.make_report --current-best
@@ -249,7 +267,8 @@ python -m game --checkpoint learning/checkpoints
 ```
 
 Outputs land in `learning/checkpoints/` (or `--out`) and
-`learning/results/` (`train_log.csv`, `task_eval.json`, `*.png`).
+`learning/results/` (`train_log.csv`, `task_eval_<tag>.json`, figures
+under `current_best/` after `--current-best`).
 
 ## Diagnostics
 
@@ -273,7 +292,7 @@ Outputs land in `learning/checkpoints/` (or `--out`) and
 
 ## Further work
 
-Tracked in [`improvement.md`](improvement.md). Short version: the
-per-object GNN + `rich_edges` + ensemble **training path** are in place;
-the remaining leverage is **variable-N / new geometry for levels**, not
-more contact-label or chain-Δv training on this PushToGoal split.
+The per-object GNN + `rich_edges` + ensemble **training path** are in
+place; the remaining leverage is **variable-N / new geometry for
+levels**, not more contact-label or chain-Δv training on this PushToGoal
+split.

@@ -59,7 +59,13 @@ scratch/
 depracted/
 *.npz
 *.png
+!docs/gallery/*.png
+!docs/game/*.png
 results/*
+
+# Local research notes — keep on disk, never commit
+learning/improvement.md
+learning/qa.md
 
 # learning module: generated data / checkpoints / logs / debug dumps
 learning/data/
