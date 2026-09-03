@@ -25,8 +25,8 @@ def main():
     def nrm(key, x):
         return (x - st[key][0]) / st[key][1]
 
-    def dn(key, x):
-        return x * st[key][1] + st[key][0]
+    def dn_xy(xy):
+        return xy * st["obj_states"][1][..., :2] + st["obj_states"][0][..., :2]
 
     target = 4  # leftmost object in this layout (a ball)
     standoff = cfg.scene.ball_radius + cfg.scene.ee_radius
@@ -52,7 +52,7 @@ def main():
         base = []
         for _ in range(H):
             zb, hb, _ = model.predictor.step(zb, a0, hb)
-            base.append(dn("obj_states", model.decoder(zb)[0])[0])
+            base.append(dn_xy(model.predictor.xy_head(zb)[0]))
         base = torch.stack(base)
 
         now = torch.as_tensor(obs["obj_states"], dtype=torch.float32)
@@ -60,7 +60,7 @@ def main():
               f"tgt {obs['obj_states'][target, :2].round(decimals=3)} "
               f"goal_x {goal_x:.3f} contact_x {contact_x:.3f} tgt_y_eff {tgt_y:.3f}")
         print(f"baseline EE drift over {H} steps: "
-              f"{(base[-1][0, :2] - now[0, :2]).numpy().round(decimals=3)}")
+              f"{(base[-1][0] - now[0, :2]).numpy().round(decimals=3)}")
 
         for name, a_raw in [("right+6", (6.0, 0.0)), ("right+3", (3.0, 0.0)),
                             ("right+6 dn", (6.0, -0.5)), ("zero", (0.0, 0.0)),
@@ -73,8 +73,8 @@ def main():
             ee_end = None
             for t in range(H):
                 z, h, _ = model.predictor.step(z, a_n.unsqueeze(0), h)
-                s = dn("obj_states", model.decoder(z)[0])[0]
-                eff = s - base[t] + now
+                xy = dn_xy(model.predictor.xy_head(z)[0])
+                eff = xy - base[t] + now[:, :2]
                 ee_x, ee_y = float(eff[0, 0]), float(eff[0, 1])
                 ee_end = (ee_x, ee_y)
                 d_app = max(contact_x - ee_x, 0.0)

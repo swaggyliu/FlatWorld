@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 
 import numpy as np
 import pyray as rl
@@ -11,6 +12,7 @@ import pyray as rl
 from learning.env.flatworld_wrapper import OBJ_TYPE_BOX
 
 from .camera import Camera
+from .levels import CAMPAIGN_LEN
 
 BG = rl.Color(22, 32, 48, 255)
 GROUND = rl.Color(38, 62, 56, 255)
@@ -40,10 +42,10 @@ BTN_HOT = rl.Color(64, 190, 172, 255)
 CARD = rl.Color(20, 30, 46, 230)
 SPRING = rl.Color(214, 168, 86, 255)
 SPRING_DK = rl.Color(122, 82, 36, 255)
-ICE = rl.Color(186, 214, 224, 255)
-ICE_DK = rl.Color(120, 156, 168, 255)
-RUBBER = rl.Color(196, 92, 58, 255)
-RUBBER_DK = rl.Color(92, 42, 28, 255)
+ICE = rl.Color(210, 236, 244, 255)
+ICE_DK = rl.Color(70, 130, 150, 255)
+RUBBER = rl.Color(232, 118, 64, 255)
+RUBBER_DK = rl.Color(110, 42, 22, 255)
 SLIDER_BG = rl.Color(40, 48, 60, 255)
 KNOB = rl.Color(240, 236, 228, 255)
 SIZE = rl.Color(120, 196, 230, 255)
@@ -54,29 +56,56 @@ FONT = None
 _FONT_SPACING = 0.6
 
 
+def _font_candidates():
+    """Bundled Roboto first so Windows and macOS look the same."""
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "assets", "Roboto-Bold.ttf")
+    paths = [bundled]
+    if sys.platform == "darwin":
+        paths += [
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+    elif sys.platform.startswith("win"):
+        fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        paths += [
+            os.path.join(fonts, "arialbd.ttf"),
+            os.path.join(fonts, "segoeuib.ttf"),
+        ]
+    else:
+        paths += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+    return paths
+
+
+def _load_ttf(path: str, size: int = 64):
+    """Load ASCII + Latin-1 so HUD punctuation (·, —) rasterizes."""
+    cps = list(range(32, 256))
+    try:
+        arr = rl.ffi.new("int[]", cps)
+        ptr = rl.ffi.cast("int *", arr)
+        return rl.load_font_ex(path, size, ptr, len(cps))
+    except (TypeError, AttributeError):
+        try:
+            return rl.load_font_ex(path, size, None, 0)
+        except TypeError:
+            return rl.load_font(path)
+
+
 def load_ui_font():
-    """Segoe UI Bold (then Arial / Calibri / SimHei) — much clearer than raylib default."""
+    """Roboto Bold (bundled). Same TTF on Windows and macOS."""
     global FONT
-    candidates = [
-        r"C:\Windows\Fonts\segoeuib.ttf",
-        r"C:\Windows\Fonts\calibrib.ttf",
-        r"C:\Windows\Fonts\arialbd.ttf",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\tahomabd.ttf",
-    ]
-    for path in candidates:
+    for path in _font_candidates():
         if not os.path.isfile(path):
             continue
         try:
-            font = rl.load_font_ex(path, 64, None, 0)
-        except TypeError:
-            try:
-                font = rl.load_font_ex(path, 64)
-            except TypeError:
-                font = rl.load_font(path)
+            font = _load_ttf(path)
         except Exception:
             continue
-        if font is None:
+        if font is None or int(getattr(font, "glyphCount", 0) or 0) <= 0:
             continue
         try:
             rl.set_texture_filter(font.texture, rl.TEXTURE_FILTER_BILINEAR)
@@ -180,33 +209,16 @@ def draw_spring_icon(cx: float, cy: float, w: float, h: float, coils: int = 5):
 
 
 def _grip_color(mu: float):
+    """Ice → rubber. Same map for the spirit rim and the grip slider."""
     t = max(0.0, min(1.0, float(mu)))
     return rl.color_lerp(ICE, RUBBER, t), rl.color_lerp(ICE_DK, RUBBER_DK, t)
 
 
-def draw_tread_icon(cx: float, cy: float, mu: float, w: float = 30.0, h: float = 16.0):
-    """Boot sole: smooth ice at 0, chunky rubber treads at 1."""
-    mu = max(0.0, min(1.0, float(mu)))
-    fill, dk = _grip_color(mu)
-    rec = rl.Rectangle(cx - w * 0.5, cy - h * 0.35, w, h * 0.72)
-    rl.draw_rectangle_rounded(rec, 0.4, 6, dk)
-    inner = rl.Rectangle(rec.x + 2, rec.y + 2, rec.width - 4, rec.height - 4)
-    rl.draw_rectangle_rounded(inner, 0.4, 6, fill)
-    n = 2 + int(round(mu * 5))
-    tooth_h = 3.0 + 8.0 * mu
-    thick = 1.6 + 2.2 * mu
-    for i in range(n):
-        t = (i + 0.5) / n
-        x = rec.x + t * rec.width
-        top = cy + h * 0.18
-        tip = cy + h * 0.18 + tooth_h
-        half = 2.2 + 1.8 * mu
-        rl.draw_triangle(
-            rl.Vector2(x - half, top),
-            rl.Vector2(x + half, top),
-            rl.Vector2(x, tip),
-            dk)
-        rl.draw_line_ex(rl.Vector2(x, rec.y + 3), rl.Vector2(x, top), thick, dk)
+def draw_grip_icon(cx: float, cy: float, mu: float, r: float = 11.0):
+    """Mini body + ice/rubber rim, matching the spirit."""
+    rim, _ = _grip_color(mu)
+    rl.draw_circle(int(cx), int(cy), int(r + 3.5), rim)
+    rl.draw_circle(int(cx), int(cy), int(r), rl.Color(72, 214, 196, 255))
 
 
 def _draw_slider(track: rl.Rectangle, value: float, fill):
@@ -263,19 +275,20 @@ def draw_equipment_panel(width: int, restitution: float, friction: float,
     sx, sy = lay["icon_spring"]
     draw_spring_icon(sx, sy, 30, 16, coils=5)
     gx, gy = lay["icon_grip"]
-    draw_tread_icon(gx, gy, friction)
+    draw_grip_icon(gx, gy, friction)
     zx, zy = lay["icon_size"]
     draw_size_icon(zx, zy, scale)
+    grip_col = _grip_color(friction)[0]
     text("bounce", lay["spring"].x, lay["spring"].y - 16, 13, SPRING)
-    text("grip", lay["grip"].x, lay["grip"].y - 16, 13, RUBBER)
+    text("grip", lay["grip"].x, lay["grip"].y - 16, 13, grip_col)
     text("size", lay["size"].x, lay["size"].y - 16, 13, SIZE)
     _draw_slider(lay["spring"], restitution, SPRING)
-    _draw_slider(lay["grip"], friction, RUBBER)
+    _draw_slider(lay["grip"], friction, grip_col)
     _draw_slider(lay["size"], scale_to_t(scale), SIZE)
     text(f"{restitution:.2f}", lay["spring"].x + lay["spring"].width - 40,
          lay["spring"].y + 22, 14, SPRING)
     text(f"{friction:.2f}", lay["grip"].x + lay["grip"].width - 40,
-         lay["grip"].y + 22, 14, RUBBER)
+         lay["grip"].y + 22, 14, grip_col)
     text(f"{scale:.2f}x", lay["size"].x + lay["size"].width - 48,
          lay["size"].y + 22, 14, SIZE)
     return lay
@@ -296,34 +309,9 @@ def _draw_body_spring(cam: Camera, x, y, r, dx, dy, rest: float):
                       SPRING, 2.2 + rest)
 
 
-def _spirit_gear(cam: Camera, x, y, r, lx, ly, restitution, friction):
-    """Cardinal springs (restitution) plus a rubber sole (friction)."""
+def _spirit_gear(cam: Camera, x, y, r, restitution):
+    """Cardinal springs (restitution). Friction is the body rim color."""
     rest = max(0.0, min(1.0, float(restitution)))
-    mu = max(0.0, min(1.0, float(friction)))
-
-    fill, dk = _grip_color(mu)
-    sole_y = y - r * 0.62
-    sole_hw = r * (0.52 + 0.22 * mu)
-    sole_hh = r * (0.10 + 0.20 * mu)
-    c = cam.to_screen(x, sole_y)
-    rx, ry = cam.px(sole_hw), cam.px(sole_hh)
-    rl.draw_ellipse(int(c.x), int(c.y), int(rx + 2), int(ry + 2), dk)
-    rl.draw_ellipse(int(c.x), int(c.y), int(rx), int(ry), fill)
-    n = 2 + int(round(mu * 6))
-    thick = 1.6 + 2.8 * mu
-    for i in range(n):
-        t = (i + 0.5) / n - 0.5
-        px = x + t * 2.0 * sole_hw * 0.82
-        top = cam.to_screen(px, sole_y + sole_hh * 0.35)
-        bot = cam.to_screen(px, sole_y - sole_hh * (0.55 + 0.85 * mu))
-        rl.draw_line_ex(top, bot, thick, dk)
-        half = cam.px(r * (0.04 + 0.05 * mu))
-        tip = cam.to_screen(px, sole_y - sole_hh * (0.85 + 1.05 * mu))
-        rl.draw_triangle(
-            rl.Vector2(bot.x - half, bot.y),
-            rl.Vector2(bot.x + half, bot.y),
-            tip, dk)
-
     for dx, dy in ((-1.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, -1.0)):
         _draw_body_spring(cam, x, y, r, dx, dy, rest)
 
@@ -347,16 +335,16 @@ def draw_spirit(cam: Camera, x, y, r, look_x=1.0, look_y=0.0,
     body = rl.Color(72, 214, 196, 255)
     if hurt > 0:
         body = rl.color_lerp(body, HAZARD, min(1.0, hurt))
-    outline = rl.Color(26, 78, 82, 255)
-    rl.draw_circle_v(body_c, pr + 3.5, outline)
+    rim, _ = _grip_color(friction)
+    rl.draw_circle_v(body_c, pr + 5.0, rim)
     rl.draw_circle_v(body_c, pr, body)
 
     # dumpling ears
     ear_r = pr * 0.28
     ear_l = cam.to_screen(x - r * 0.55, y + r * 0.72)
     ear_rgt = cam.to_screen(x + r * 0.55, y + r * 0.72)
-    rl.draw_circle_v(ear_l, ear_r + 2.0, outline)
-    rl.draw_circle_v(ear_rgt, ear_r + 2.0, outline)
+    rl.draw_circle_v(ear_l, ear_r + 2.5, rim)
+    rl.draw_circle_v(ear_rgt, ear_r + 2.5, rim)
     rl.draw_circle_v(ear_l, ear_r, body)
     rl.draw_circle_v(ear_rgt, ear_r, body)
 
@@ -372,7 +360,7 @@ def draw_spirit(cam: Camera, x, y, r, look_x=1.0, look_y=0.0,
     rl.draw_circle_v(cam.to_screen(x - r * 0.48, y - r * 0.06), pr * 0.16, blush)
     rl.draw_circle_v(cam.to_screen(x + r * 0.48, y - r * 0.06), pr * 0.16, blush)
 
-    _spirit_gear(cam, x, y, r, lx, ly, restitution, friction)
+    _spirit_gear(cam, x, y, r, restitution)
 
     eye_y = y + r * 0.10
     eye_dx = r * 0.30
@@ -560,7 +548,10 @@ def draw_hud(status: str, lines: list[str],
              best: float | None = None, stars: int = 0, hint: str = ""):
     panel = rl.Rectangle(16, 12, 500, 168)
     rl.draw_rectangle_rounded(panel, 0.12, 6, PANEL)
-    title = f"Spirit Push   ·   {level}/5  {name}"
+    if level <= CAMPAIGN_LEN:
+        title = f"Spirit Push   ·   {level}/{CAMPAIGN_LEN}  {name}"
+    else:
+        title = f"Spirit Push   ·   {level}  {name}"
     text(title, 28, 20, 18, TEXT)
     text(f"TIME  {elapsed:5.1f}s", 28, 48, 16, TEXT)
     text(f"PAR {par:.0f}s", 188, 48, 16, MUTED)

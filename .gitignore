@@ -58,6 +58,7 @@ temp/
 scratch/
 depracted/
 *.npz
+!learning/data/rollouts_500/*.npz
 *.png
 !docs/gallery/*.png
 !docs/game/*.png
@@ -68,7 +69,7 @@ learning/improvement.md
 learning/qa.md
 
 # learning module: generated data / checkpoints / logs / debug dumps
-learning/data/
+learning/data/*.npz
 learning/checkpoints/*
 !learning/checkpoints/best.pt
 !learning/checkpoints/normalizer.json

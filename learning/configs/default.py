@@ -87,7 +87,7 @@ class TactileConfig:
 @dataclass
 class CollectConfig:
     """Random collection parameters (OU noise + attraction toward objects)."""
-    num_rollouts: int = 100
+    num_rollouts: int = 500
     episode_len: int = 200           # number of action frames (states stored: T+1)
     seed: int = 0
     force_max: float = 6.0           # force magnitude clamp (N)
@@ -108,15 +108,18 @@ class CollectConfig:
     x_hi: float = 2.12
     y_lo: float = 0.105              # just above the ground (ee_radius margin)
     y_hi: float = 0.55
-    out_dir: str = "learning/data/rollouts_lr"
+    # Hop may fly higher than the default band, then dive into contact.
+    hop_y: float = 0.38
+    hop_y_hi: float = 0.80
+    out_dir: str = "learning/data/rollouts_500"
     # Collection-policy mix (must sum to 1). Demonstration only; the
     # planner never uses these ratios.
     mode_free: float = 0.15
     mode_attract: float = 0.15
     mode_push: float = 0.15
     mode_release: float = 0.10
-    mode_pile: float = 0.45
-    contrast: bool = False           # gap / kiss / around / release mix
+    mode_hop: float = 0.10
+    mode_pile: float = 0.35
 
 
 @dataclass

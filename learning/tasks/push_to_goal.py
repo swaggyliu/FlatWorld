@@ -6,7 +6,8 @@ tolerance of a goal position. Execution and success measurement happen
 in the FlatWorld simulator (the world model never sees future states).
 
 The CEM loop lives in ``learning.planner``. Geometric helpers (contact
-face, coast, brake) shape the *cost*; they do not emit the executed force.
+face) shape the *cost*; they do not emit the executed force.
+Cost is scored on residual-corrected ``xy_head`` coordinates.
 """
 
 import glob
@@ -17,7 +18,7 @@ import torch
 
 from learning.data.normalizer import Normalizer
 from learning.env.flatworld_wrapper import PushSceneEnv
-from learning.models.lewm import StateLeWM, rich_edges_from_checkpoint
+from learning.models.lewm import StateLeWM
 from learning.planner import CEMPlanner
 
 
@@ -25,12 +26,11 @@ def _load_one(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = StateLeWM(
         n_obj=ckpt["n_obj"], latent_dim=ckpt["latent_dim"],
-        n_mp=int(ckpt.get("n_mp", 2)),
-        drop_tactile=bool(ckpt.get("drop_tactile", False)),
-        drop_geom=bool(ckpt.get("drop_geom", False)),
-        rich_edges=rich_edges_from_checkpoint(ckpt),
+        n_mp=int(ckpt.get("n_mp", 3)),
+        tactile_drop_prob=0.0,
     ).to(device)
     model.load_state_dict(ckpt["model"])
+    model.tactile_residual = bool(ckpt.get("tactile_residual", True))
     model.eval()
     norm_name = ckpt.get("normalizer", "normalizer.json")
     ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path)) or "."
@@ -44,95 +44,111 @@ def load_model(ckpt_path: str, device: str = "cpu"):
     return _load_one(ckpt_path, device)
 
 
-def load_ensemble(ckpt_path: str, device: str = "cpu"):
+def load_ensemble(ckpt_path, device: str = "cpu"):
     """Load an ensemble.
 
-    ``ckpt_path`` may be a file (single model) or a directory containing
-    ``ens_*.pt`` members (excluding ``*_last.pt``).
+    ``ckpt_path`` may be a file, a directory containing ``ens_*.pt``
+    (excluding ``*_last.pt``), or a list of files/directories. Each
+    member keeps the normalizer from its own checkpoint directory so
+    models trained on different datasets can be mixed.
     """
-    if os.path.isdir(ckpt_path):
-        files = sorted(
-            f for f in glob.glob(os.path.join(ckpt_path, "ens_*.pt"))
-            if not f.endswith("_last.pt")
-        )
-        if not files:
-            fallback = os.path.join(ckpt_path, "last.pt")
-            if not os.path.exists(fallback):
-                fallback = os.path.join(ckpt_path, "best.pt")
-            files = [fallback]
-    else:
-        files = [ckpt_path]
+    paths = list(ckpt_path) if isinstance(ckpt_path, (list, tuple)) else [ckpt_path]
+    files = []
+    for p in paths:
+        if os.path.isdir(p):
+            found = sorted(
+                f for f in glob.glob(os.path.join(p, "ens_*.pt"))
+                if not f.endswith("_last.pt")
+            )
+            if not found:
+                fallback = os.path.join(p, "last.pt")
+                if not os.path.exists(fallback):
+                    fallback = os.path.join(p, "best.pt")
+                found = [fallback]
+            files.extend(found)
+        else:
+            files.append(p)
     models, norm, stride = [], None, 1
     for f in files:
         m, n, s = _load_one(f, device)
+        m.norm = n
         models.append(m)
-        norm, stride = n, s
+        if norm is None:
+            norm, stride = n, s
     print(f"loaded {len(models)} world model(s) from {ckpt_path}")
     return models, norm, stride
 
 
-_COST_KEYS = (
-    "action_cost", "reach_cost", "brake_radius", "brake_w", "brake_sq",
-    "coast_start", "coast_full", "coast_w", "reach_fade",
-)
+_COST_KEYS = ("action_cost", "reach_cost", "settle_w")
 
 
 class PushToGoalCost:
     """Decoded-xy cost for PushToGoal.
 
-    Geometric terms only (CEM still emits the force): distance to goal,
-    reach the target contact face, coast, and brake.
+    Distance to goal plus a contact-face / catch-bumper term.
+    Push face is the original behind-the-target side (sign frozen at
+    episode start). After the target overshoots or is rolling toward
+    the goal, the face switches to a world-fixed bumper at the goal
+    instead of the far side of the ball (that side is usually jammed
+    against the pile).
     """
 
     def __init__(self, action_cost: float = 0.0005, reach_cost: float = 0.35,
-                 brake_radius: float = 0.15, brake_w: float = 4.0,
-                 brake_sq: float = 60.0, coast_start: float = 0.12,
-                 coast_full: float = 0.0, coast_w: float = 6.0,
-                 reach_fade: float = 0.8, device: str = "cpu"):
+                 settle_w: float = 0.0, device: str = "cpu"):
         self.action_cost = action_cost
         self.reach_cost = reach_cost
-        self.brake_radius = brake_radius
-        self.brake_w = brake_w
-        self.brake_sq = brake_sq
-        self.coast_start = coast_start
-        self.coast_full = coast_full
-        self.coast_w = coast_w
-        self.reach_fade = reach_fade
+        self.settle_w = settle_w
         self.device = device
         self.ee_idx = 0
         self.target_idx = 1
         self.goal_t = None
+        self.face_t = None
         self.push_sign = 1.0
         self.standoff = 0.0
+        self.tol = 0.08
+        self.catch = False
 
     def bind(self, goal, states_now, geom, ee_idx: int, target_idx: int,
-             min_gap: float = 0.02):
+             min_gap: float = 0.02, push_sign: float = None, catch: bool = False):
         self.ee_idx = ee_idx
         self.target_idx = target_idx
-        self.goal_t = torch.as_tensor(goal[:2], device=self.device, dtype=torch.float32)
-        self.push_sign = 1.0 if float(goal[0]) >= float(states_now[target_idx, 0]) else -1.0
+        self.catch = bool(catch)
         g = torch.as_tensor(geom, device=self.device, dtype=torch.float32)
         hw = g[:, 0].clamp(min=1e-4)
         self.standoff = float(hw[target_idx] + hw[ee_idx])
+        self.goal_t = torch.as_tensor(goal[:2], device=self.device, dtype=torch.float32)
+        if push_sign is None:
+            self.push_sign = 1.0 if float(goal[0]) >= float(states_now[target_idx, 0]) else -1.0
+        else:
+            self.push_sign = float(push_sign)
+        st = np.asarray(states_now, dtype=np.float64)
+        gm = np.asarray(geom, dtype=np.float64)
+        gx, gy = float(goal[0]), float(goal[1])
+        tx, ty = float(st[target_idx, 0]), float(st[target_idx, 1])
+        r_ee = float(gm[ee_idx, 0])
+        if self.catch:
+            fx = gx + self.push_sign * (r_ee + 0.01)
+            fy = max(float(gm[ee_idx, 1]) + 0.01, ty)
+            for j in range(len(st)):
+                if j == ee_idx:
+                    continue
+                gap_x = abs(float(st[j, 0]) - fx) - (float(gm[j, 0]) + r_ee)
+                if gap_x < float(min_gap):
+                    fy = max(fy, float(st[j, 1]) + float(gm[j, 1]) + r_ee + 0.02)
+        else:
+            fx = tx - self.push_sign * self.standoff
+            fy = max(ty, float(gm[ee_idx, 1]) + 0.005)
+        self.face_t = torch.tensor([fx, fy], device=self.device, dtype=torch.float32)
 
-    def step(self, xy, a_t, prev):
+    def step(self, xy, a_t, prev=None):
         d_goal = (xy[:, self.target_idx] - self.goal_t).norm(dim=-1)
-        face = xy[:, self.target_idx].clone()
-        face[:, 0] = face[:, 0] - self.push_sign * self.standoff
-        d_face = (xy[:, self.ee_idx] - face).norm(dim=-1)
-        coast = ((self.coast_start - d_goal)
-                 / max(self.coast_start - self.coast_full, 1e-6)).clamp(0.0, 1.0)
-        cost = d_goal \
-            + (1.0 - self.reach_fade * coast) * self.reach_cost * d_face \
+        d_face = (xy[:, self.ee_idx] - self.face_t).norm(dim=-1)
+        cost = d_goal + self.reach_cost * d_face \
             + self.action_cost * (a_t ** 2).mean(dim=-1)
-        sep = (xy[:, self.ee_idx] - xy[:, self.target_idx]).norm(dim=-1)
-        too_close = (self.standoff + 0.01 - sep).clamp(min=0.0)
-        cost = cost + self.coast_w * coast * too_close
-        if prev is not None:
+        if prev is not None and self.settle_w > 0:
             speed = (xy[:, self.target_idx] - prev[:, self.target_idx]).norm(dim=-1)
-            near = (self.brake_radius - d_goal).clamp(min=0.0)
-            cost = cost + self.brake_w * near * speed \
-                + self.brake_sq * near * speed * speed
+            in_tol = (self.tol - d_goal).clamp(min=0.0) / max(self.tol, 1e-6)
+            cost = cost + self.settle_w * in_tol * speed
         return cost
 
     def terminal(self, xy):
@@ -161,11 +177,16 @@ class PushToGoalTask:
         self.ee_scale = float(ee_scale)
         pk = dict(planner_kwargs or {})
         cost_kw = {k: pk.pop(k) for k in _COST_KEYS if k in pk}
+        if "tactile_residual" not in pk:
+            pk["tactile_residual"] = bool(
+                getattr(self.models[0], "tactile_residual", False))
         self.cost = PushToGoalCost(device=device, **cost_kw)
+        self.cost.tol = self.tol
         self.planner = CEMPlanner(self.models, norm, device=device,
                                   force_max=cfg.collect.force_max, **pk)
         self.target_idx = None
         self.ee_idx = 0
+        self.push_sign = 1.0
 
     def _geom(self) -> np.ndarray:
         if getattr(self.env, "obj_geom", None) is not None:
@@ -275,12 +296,12 @@ class PushToGoalTask:
         for _ in range(self.stride):
             obs = self.env.step(action)
             t += 1
+            if frames is not None:
+                frames["obj_states"].append(obs["obj_states"])
+                frames["contact_mask"].append(obs["contact_mask"])
+                frames["actions"].append(np.asarray(action, dtype=np.float32))
             if t >= self.budget:
                 break
-        if frames is not None:
-            frames["obj_states"].append(obs["obj_states"])
-            frames["contact_mask"].append(obs["contact_mask"])
-            frames["actions"].append(np.asarray(action, dtype=np.float32))
         return obs, t
 
     def _observe(self):
@@ -295,24 +316,33 @@ class PushToGoalTask:
         if "obj_geom" not in cur:
             cur = dict(cur)
             cur["obj_geom"] = self._geom()
-        if self._succeeded(cur["obj_states"], goal):
+        st = cur["obj_states"]
+        if self._succeeded(st, goal):
             return np.zeros(2, dtype=np.float32)
-        tgt_s = cur["obj_states"][self.target_idx]
-        d_pos = float(np.linalg.norm(tgt_s[:2] - goal[:2]))
+        tgt = st[self.target_idx]
+        d_pos = float(np.linalg.norm(tgt[:2] - goal[:2]))
+        speed = float(np.linalg.norm(tgt[3:5]))
+        along = float(tgt[3]) * float(self.push_sign)
+        past = (float(tgt[0]) - float(goal[0])) * float(self.push_sign) > 0.0
+        catch = past or (along > 0.12 and d_pos < 0.22)
         if d_pos < self.tol:
             return np.zeros(2, dtype=np.float32)
         z0 = self.planner.encode_obs(cur)
         geom = self._geom()
+        old_settle = self.cost.settle_w
+        if catch and self.cost.settle_w <= 0:
+            self.cost.settle_w = 3.0
         self.cost.bind(
-            goal, cur["obj_states"], geom, self.ee_idx, self.target_idx,
-            min_gap=float(self.cfg.scene.min_gap))
-        return self.planner.plan(
-            z0, geom=geom, states_now=cur["obj_states"], cost=self.cost)
+            goal, st, geom, self.ee_idx, self.target_idx,
+            min_gap=float(self.cfg.scene.min_gap),
+            push_sign=self.push_sign, catch=catch)
+        action = self.planner.plan(
+            z0, geom=geom, states_now=st, cost=self.cost)
+        self.cost.settle_w = old_settle
+        self.planner.remember_first_step(z0, action, geom)
+        return action
 
     def _plan_action(self, cur, goal):
-        return self.plan_action(cur, goal)
-
-    def _select_action(self, cur, goal):
         return self.plan_action(cur, goal)
 
     def run_episode(self, rng: np.random.Generator, record: bool = False):
@@ -322,6 +352,7 @@ class PushToGoalTask:
         self.target_idx = self._pick_target(obs, rng)
         goal = self._sample_goal(rng, obs, self.target_idx)
         target_pos = obs["obj_states"][self.target_idx, :2]
+        self.push_sign = 1.0 if float(goal[0]) >= float(target_pos[0]) else -1.0
         self.planner.reset()
         init_dist = float(np.linalg.norm(target_pos - goal))
 

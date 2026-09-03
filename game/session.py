@@ -10,7 +10,7 @@ import numpy as np
 from learning.configs.default import Config
 from learning.tasks.push_to_goal import PushToGoalTask, load_ensemble
 
-from .levels import spec_for
+from .levels import ensure_x_clearance, min_x_gap, spec_for
 
 
 def _hit_object(states, types, geom, wx, wy) -> int | None:
@@ -79,8 +79,8 @@ class GameSession:
         return int(self.level_seed_base + self.level * 1_000_003)
 
     def _boot_level(self, apply_loadout: bool = True):
-        """Rebuild the current authored layout. Retry keeps the current loadout."""
-        spec = spec_for(self.level)
+        """Rebuild the current layout. Retry keeps the current loadout."""
+        spec = spec_for(self.level, seed=self._level_seed())
         self.spec = spec
         rng = np.random.default_rng(self._level_seed())
         self.obs = self.task.env.reset(rng)
@@ -89,7 +89,10 @@ class GameSession:
             self.friction = float(spec.grip)
             self.scale = float(spec.scale)
         self.apply_equipment()
-        self.task.env.place_lineup(spec.xs)
+        xs = spec.xs
+        if min_x_gap(xs, self.scale) < 0.0:
+            xs = ensure_x_clearance(xs, self.scale)
+        self.task.env.place_lineup(xs)
         self.obs = self.task.env._observe()
         self.level_target_idx = int(spec.target)
         self.hazard_idx = int(spec.hazard)
@@ -146,7 +149,7 @@ class GameSession:
         self._boot_level(apply_loadout=False)
 
     def next_level(self):
-        """Advance to the next authored stage. Applies that stage's suggested loadout."""
+        """Advance to the next stage (campaign, then seeded mix). Applies loadout."""
         if self.status.startswith("WIN"):
             self.total_score += int(self.level_score)
         self.level += 1

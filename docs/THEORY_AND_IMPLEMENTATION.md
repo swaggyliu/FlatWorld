@@ -525,6 +525,7 @@ pytest test2D
 | `test_2Drigidanalytic_contact.py` | 刚体 ↔ 解析地面 |
 | `test_2Dbox_collision_response.py` | 盒-盒碰撞冲量响应 |
 | `test_2Dbox_friction.py` | Coulomb 摩擦（静/动摩擦） |
+| `test_2Dball_rolling_friction.py` | 圆盘滚动阻力（地面接触耗散） |
 | `test_2Dmeshrigid.py` | 网格刚体接触 |
 | `test_2Dcapsule_bbox.py` | 胶囊 AABB 正确性 |
 | `test_2Ddomino.py` | 多米诺骨牌连锁 |

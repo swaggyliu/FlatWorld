@@ -22,8 +22,8 @@ def main():
     def norm_state(x):
         return (x - m) / s
 
-    def denorm(x):
-        return x * s + m
+    def denorm_xy(x):
+        return x * s[:2] + m[:2]
 
     def norm_action(a):
         return (a - am) / as_
@@ -47,7 +47,8 @@ def main():
             print(f"      t= 0  EE_pred=({obs['obj_states'][0,0]:.3f},{obs['obj_states'][0,1]:.3f})  (true)")
             for t in range(1, 13):
                 z, h, _ = model.predictor.step(z, a_n.unsqueeze(0), h)
-                ee = denorm(model.decoder(z)[0])[0, 0, :2].numpy()
+                xy = model.predictor.xy_head(z)[0]
+                ee = denorm_xy(xy[0]).numpy()
                 if t % 3 == 0:
                     print(f"      t={t:2d}  EE_pred=({ee[0]:.3f},{ee[1]:.3f})")
 

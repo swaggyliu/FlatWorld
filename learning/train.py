@@ -1,11 +1,11 @@
 """Train the StateLeWM world model on collected rollouts.
 
 Usage (repo root):
-    python -m learning.train --data learning/data/rollouts_lr --epochs 60 --ensemble 5
+    python -m learning.train --data learning/data/rollouts_500 --epochs 80 --ensemble 1
 
 Outputs:
     learning/checkpoints/ens_{i}.pt   best val checkpoint per ensemble member
-    learning/checkpoints/last.pt      last epoch of member 0 (compat)
+    learning/checkpoints/last.pt      last epoch of member 0
     learning/results/train_log.csv    member-0 metrics
 """
 
@@ -29,10 +29,8 @@ def _ckpt_dict(model, n_obj, args, epoch, seed, val=None):
         "model": model.state_dict(),
         "n_obj": n_obj,
         "latent_dim": args.latent_dim,
-        "n_mp": int(getattr(args, "n_mp", 2)),
-        "drop_tactile": bool(getattr(args, "drop_tactile", False)),
-        "drop_geom": bool(getattr(args, "drop_geom", False)),
-        "rich_edges": bool(getattr(args, "rich_edges", True)),
+        "n_mp": int(getattr(args, "n_mp", 3)),
+        "tactile_residual": float(getattr(args, "tactile_drop_prob", 0.5)) > 0,
         "stride": args.stride,
         "normalizer": "normalizer.json",
         "epoch": epoch,
@@ -47,9 +45,8 @@ def _ckpt_dict(model, n_obj, args, epoch, seed, val=None):
 def evaluate(model, loader, device):
     """Validation losses + latent statistics + long-horizon open-loop error."""
     model.eval()
-    agg = {"dynamics": 0.0, "recon_states": 0.0, "recon_summary": 0.0,
-           "pred_recon_states": 0.0, "sigreg": 0.0, "contact": 0.0,
-           "pair": 0.0, "ground": 0.0, "drift": 0.0, "chain": 0.0}
+    agg = {"dynamics": 0.0, "sigreg": 0.0,
+           "pair": 0.0, "ground": 0.0, "drift": 0.0}
     z_std_sum, z_batches = 0.0, 0
     k_err = {10: [], 25: [], 50: []}
     n_win = 0
@@ -94,10 +91,8 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
     np.random.seed(seed)
     model = StateLeWM(
         n_obj=n_obj, latent_dim=args.latent_dim,
-        n_mp=int(getattr(args, "n_mp", 2)),
-        drop_tactile=bool(getattr(args, "drop_tactile", False)),
-        drop_geom=bool(getattr(args, "drop_geom", False)),
-        rich_edges=bool(getattr(args, "rich_edges", True)),
+        n_mp=int(getattr(args, "n_mp", 3)),
+        tactile_drop_prob=float(getattr(args, "tactile_drop_prob", 0.5)),
     ).to(device)
     init_dir = getattr(args, "init_dir", None)
     if init_dir:
@@ -106,15 +101,15 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
             init_path = os.path.join(init_dir, "best.pt")
         if os.path.exists(init_path):
             ckpt = torch.load(init_path, map_location=device, weights_only=False)
-            model.load_state_dict(ckpt["model"], strict=False)
+            model.load_state_dict(ckpt["model"])
             print(f"  init from {init_path}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  seed={seed} params={n_params / 1e3:.1f}K -> {out_name}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
-    warmup_epochs = 5
+    warmup_epochs = 0 if init_dir else 5
     def lr_lambda(epoch):
-        if epoch < warmup_epochs:
+        if warmup_epochs and epoch < warmup_epochs:
             return (epoch + 1) / warmup_epochs
         progress = (epoch - warmup_epochs) / max(1, args.epochs - warmup_epochs)
         return 0.5 * (1 + np.cos(np.pi * progress))
@@ -124,26 +119,30 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
     if log_file is not None:
         logger = csv.writer(log_file)
 
-    best_val = float("inf")
     best_path = os.path.join(args.out, out_name)
-    min_epoch = max(10, args.epochs // 5)
+    min_epoch = 1 if init_dir else max(10, args.epochs // 5)
+    best_val = float("inf")
+    if init_dir:
+        val0 = evaluate(model, val_loader, device)
+        best_val = val0["dynamics"] + 0.5 * val0.get("openloop_10", 0.0)
+        torch.save(_ckpt_dict(model, n_obj, args, 0, seed, val0), best_path)
+        print(f"  init val score {best_val:.5f} (seeded {out_name})")
     t0 = time.time()
     for epoch in range(1, args.epochs + 1):
         model.train()
-        ep = {"total": 0.0, "dynamics": 0.0, "recon_states": 0.0,
-              "pred_recon_states": 0.0, "sigreg": 0.0, "contact": 0.0,
-              "pair": 0.0, "drift": 0.0, "chain": 0.0}
+        ep = {"total": 0.0, "dynamics": 0.0, "sigreg": 0.0,
+              "pair": 0.0, "drift": 0.0}
         n = 0
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             out = model(batch)
             losses = model.compute_loss(
-                out, w_contact=float(getattr(args, "w_contact", 1.0)),
+                out,
                 w_pair=float(getattr(args, "w_pair", 1.5)),
+                w_ground=float(getattr(args, "w_ground", 0.5)),
                 w_drift=float(getattr(args, "w_drift", 0.3)),
                 w_xy=float(getattr(args, "w_xy", 0.5)),
-                w_vel=float(getattr(args, "w_vel", 0.5)),
-                w_chain=float(getattr(args, "w_chain", 2.0)))
+                w_vel=float(getattr(args, "w_vel", 0.5)))
             opt.zero_grad()
             losses["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -162,19 +161,15 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
 
         if epoch % 5 == 0 or epoch == 1 or epoch == args.epochs:
             val = evaluate(model, val_loader, device)
-            # Prefer next-state reconstruction + short open-loop; skip the
-            # first epochs so an underfit encoder cannot win on a tiny dyn loss.
-            score = val["pred_recon_states"] + 0.5 * val.get("openloop_10", 0.0)
+            score = val["dynamics"] + 0.5 * val.get("openloop_10", 0.0)
             if logger is not None:
                 logger.writerow([
                     epoch, f"{ep['total']:.5f}", f"{ep['dynamics']:.5f}",
-                    f"{ep['recon_states']:.5f}", f"{ep['pred_recon_states']:.5f}",
                     f"{ep['sigreg']:.5f}",
-                    f"{ep.get('contact', 0):.5f}", f"{ep.get('pair', 0):.5f}",
+                    f"{ep.get('pair', 0):.5f}",
                     f"{ep.get('drift', 0):.5f}",
-                    f"{val['dynamics']:.5f}", f"{val['recon_states']:.5f}",
-                    f"{val['pred_recon_states']:.5f}",
-                    f"{val.get('contact', 0):.5f}", f"{val.get('pair', 0):.5f}",
+                    f"{val['dynamics']:.5f}",
+                    f"{val.get('pair', 0):.5f}",
                     f"{val.get('drift', 0):.5f}",
                     f"{val.get('openloop_10', float('nan')):.5f}",
                     f"{val.get('openloop_25', float('nan')):.5f}",
@@ -184,10 +179,9 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
                 ])
                 log_file.flush()
             print(f"  [{epoch:3d}/{args.epochs}] total {ep['total']:.4f} "
-                  f"dyn {ep['dynamics']:.4f} recS {ep['recon_states']:.4f} "
-                  f"predRecS {ep['pred_recon_states']:.4f} "
-                  f"ctc {ep['contact']:.4f} pair {ep.get('pair', 0):.4f} "
-                  f"drft {ep.get('drift', 0):.4f} chn {ep.get('chain', 0):.4f} | "
+                  f"dyn {ep['dynamics']:.4f} "
+                  f"pair {ep.get('pair', 0):.4f} "
+                  f"drft {ep.get('drift', 0):.4f} | "
                   f"val dyn {val['dynamics']:.4f} "
                   f"ol {val.get('openloop_10', float('nan')):.3f}/"
                   f"{val.get('openloop_25', float('nan')):.3f}/"
@@ -209,7 +203,7 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default="learning/data/rollouts_lr")
+    parser.add_argument("--data", nargs="+", default=["learning/data/rollouts_500"])
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--train-window", type=int, default=24)
@@ -236,25 +230,19 @@ def main():
                              "earlier members loaded from the same dir)")
     parser.add_argument("--n-mp", type=int, default=3,
                         help="encoder message-passing rounds (0 = no graph MP)")
-    parser.add_argument("--drop-tactile", action="store_true",
-                        help="ablation: zero tactile channels")
-    parser.add_argument("--drop-geom", action="store_true",
-                        help="ablation: zero obj_geom")
-    parser.add_argument("--w-contact", type=float, default=1.0,
-                        help="contact focal loss weight")
     parser.add_argument("--w-pair", type=float, default=1.5,
                         help="pair focal loss weight")
+    parser.add_argument("--w-ground", type=float, default=0.5,
+                        help="ground-contact focal loss weight")
     parser.add_argument("--w-drift", type=float, default=0.3,
                         help="zero-force drift penalty weight")
     parser.add_argument("--w-xy", type=float, default=0.5,
                         help="xy-head regression weight (CEM consumes xy)")
     parser.add_argument("--w-vel", type=float, default=0.5,
-                        help="velocity readout loss weight (rich edges)")
-    parser.add_argument("--w-chain", type=float, default=2.0,
-                        help="solver-contact chain displacement loss weight")
-    parser.add_argument("--no-rich-edges", dest="rich_edges",
-                        action="store_false", default=True,
-                        help="reproduce the pre-pair14 contact representation")
+                        help="velocity readout loss weight")
+    parser.add_argument("--tactile-drop-prob", type=float, default=0.5,
+                        help="train-time probability of a state-only encode "
+                             "(tactile residual off); 0 = always inject tactile")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -268,10 +256,16 @@ def main():
         print(f"Reusing normalizer from {init_norm}")
     else:
         norm = Normalizer.fit_from_dir(args.data)
-    n_steps = len(np.load(sorted(glob.glob(
-        os.path.join(args.data, "*.npz")))[0])["actions"]) // args.stride
-    full = PushWindowDataset(args.data, window=n_steps, normalizer=norm,
-                             stride=args.stride)
+    data_dirs = args.data if isinstance(args.data, list) else [args.data]
+    files = []
+    for d in data_dirs:
+        files.extend(sorted(glob.glob(os.path.join(d, "*.npz"))))
+    if not files:
+        raise FileNotFoundError(f"no npz under {data_dirs}")
+    print(f"data: {len(files)} npz from {data_dirs}")
+    n_steps = len(np.load(files[0])["actions"]) // args.stride
+    full = PushWindowDataset(data_dirs[0], window=n_steps, normalizer=norm,
+                             files=files, stride=args.stride)
     n_obj = full[0]["obj_types"].shape[0]
     train_ds, val_ds = train_val_split(full)
     train_ds.window = min(args.train_window, n_steps)
@@ -310,11 +304,9 @@ def main():
     if start == 0:
         log_file = open(log_path, "w", newline="", encoding="utf-8")
         csv.writer(log_file).writerow(
-            ["epoch", "train_total", "train_dynamics", "train_recon_states",
-             "train_pred_recon_states", "train_sigreg", "train_contact",
+            ["epoch", "train_total", "train_dynamics", "train_sigreg",
              "train_pair", "train_drift",
-             "val_dynamics", "val_recon_states", "val_pred_recon_states",
-             "val_contact", "val_pair", "val_drift",
+             "val_dynamics", "val_pair", "val_drift",
              "val_openloop_10", "val_openloop_25",
              "val_openloop_50", "z_std", "lr", "elapsed_s"])
 

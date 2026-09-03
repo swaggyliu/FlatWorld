@@ -63,14 +63,15 @@ Full write-up, architecture, losses, and eval numbers:
 conditioned latent world model** (StateLeWM) trained inside FlatWorld:
 random-push data collection, latent dynamics training, and CEM planning
 for PushToGoal. Current numbers (50 episodes, CEM H=32): leftmost /
-rightmost **86%**, random **78%**. Shipped weights:
+rightmost **92%**, random **82%**. Shipped weights:
 `learning/checkpoints/best.pt`.
 
 ## Spirit Push
 
 A raylib prototype that uses the world model as a **spirit**: you click
-what to push and where; CEM plans the force. Five short stages stay
-inside the trained scene (1 circular EE + 3 boxes + 2 balls).
+what to push and where; CEM plans the force. Five campaign stages stay
+inside the trained scene (1 circular EE + 3 boxes + 2 balls). After
+Gauntlet, layouts **randomize** (seeded — retry is the same mix).
 
 ```bash
 python -m game
@@ -203,11 +204,11 @@ pytest test2D -q
 
 完整说明（架构、损失、评测）：**[learning/README.md](learning/README.md)**。
 
-[`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。当前成功率（50 局，CEM H=32）：最左 / 最右 **86%**，随机 **78%**。默认权重：`learning/checkpoints/best.pt`。
+[`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。当前成功率（50 局，CEM H=32）：最左 / 最右 **92%**，随机 **82%**。默认权重：`learning/checkpoints/best.pt`。
 
 ## Spirit Push 游戏
 
-用世界模型当「精灵」的 raylib 原型：点要推的物体和落点，CEM 规划力。五关都落在训练场景里（1 个圆形末端执行器 + 3 箱 + 2 球）。
+用世界模型当「精灵」的 raylib 原型：点要推的物体和落点，CEM 规划力。前五关是固定战役（1 个圆形末端执行器 + 3 箱 + 2 球）；第 6 关起按种子**随机出关**（重试同一关不变，跳过/过关是新布局）。
 
 ```bash
 python -m game

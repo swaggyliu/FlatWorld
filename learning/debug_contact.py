@@ -45,8 +45,8 @@ def main():
     def nrm(key, x):
         return (x - st[key][0]) / st[key][1]
 
-    def dn(key, x):
-        return x * st[key][1] + st[key][0]
+    def dn_xy(xy):
+        return xy * st["obj_states"][1][..., :2] + st["obj_states"][0][..., :2]
 
     n_contacts = int(obs["contact_mask"].sum())
     print(f"target {target} type {obs['obj_types'][target]} "
@@ -72,7 +72,7 @@ def main():
         base = []
         for _ in range(H):
             zb, hb, _ = model.predictor.step(zb, a0, hb)
-            base.append(dn("obj_states", model.decoder(zb)[0])[0])
+            base.append(dn_xy(model.predictor.xy_head(zb)[0]))
         base = torch.stack(base)
         now = torch.as_tensor(obs["obj_states"], dtype=torch.float32)
         print("imagined (baseline-corrected) target dx after "
@@ -85,10 +85,10 @@ def main():
             h = model.predictor.init_hidden(z)
             for t in range(H):
                 z, h, _ = model.predictor.step(z, a_n.unsqueeze(0), h)
-            s = dn("obj_states", model.decoder(z)[0])[0]
-            eff = s - base[-1] + now
-            ee = eff[0, :2].numpy()
-            tg = eff[target, :2].numpy()
+            xy = dn_xy(model.predictor.xy_head(z)[0])
+            eff = xy - base[-1] + now[:, :2]
+            ee = eff[0].numpy()
+            tg = eff[target].numpy()
             print(f"  {name:8s} EE=({ee[0]:+.3f},{ee[1]:+.3f}) "
                   f"tgt=({tg[0]:+.3f},{tg[1]:+.3f})")
 

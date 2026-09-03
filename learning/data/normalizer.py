@@ -1,13 +1,13 @@
-"""Input normalization statistics for states, actions and tactile signals.
+"""Z-score statistics for continuous world-model inputs.
 
-Scales differ strongly across quantities (positions ~1.0, forces ~10 N,
-penetration ~1e-3), so per-dimension standardization is required before
-feeding the world model. Statistics are fitted over all rollouts in a
-directory and can be saved to / loaded from a JSON file.
+Fitted over a rollout directory and stored as ``normalizer.json`` next
+to checkpoints. Continuous keys (state, action, tactile, geom) are
+standardized per last dimension. Binary / categorical fields are **not**
+in ``KEYS`` and must stay raw: ``obj_types``, ``contact_mask``,
+``pair_contact``, ``ground_contact``.
 
-Angles are already wrapped to [-pi, pi] at collection time; they are
-standardized like any other dimension (std of wrapped angles is
-well-defined for this scene since rotations stay small).
+Angles are wrapped to [-pi, pi] at collection; they are then z-scored
+like the other state channels.
 """
 
 import glob
@@ -27,36 +27,14 @@ class Normalizer:
 
     # ---------------- fitting ----------------
     @staticmethod
-    def _default_geom(d) -> np.ndarray:
-        """Fallback sizes from SceneConfig when a rollout has no obj_geom."""
-        from learning.configs.default import SceneConfig
-        sc = SceneConfig()
-        types = d["obj_types"]
-        n = len(types)
-        g = np.zeros((n, 2), dtype=np.float64)
-        g[0] = (sc.ee_radius, sc.ee_radius)
-        for i, t in enumerate(types):
-            if i == 0:
-                continue
-            if int(t) == 1:
-                g[i] = sc.box_ext
-            else:
-                g[i] = (sc.ball_radius, sc.ball_radius)
-        return g
-
-    @staticmethod
     def _collect_flat(files: list, key: str, masked: bool = False):
         chunks = []
         masks = []
         for f in files:
             d = np.load(f)
             if key not in d.files:
-                if key == "obj_geom":
-                    arr = Normalizer._default_geom(d)
-                else:
-                    continue
-            else:
-                arr = d[key].astype(np.float64)
+                continue
+            arr = d[key].astype(np.float64)
             chunks.append(arr.reshape(-1, arr.shape[-1]))
             if masked:
                 m = d["contact_mask"].astype(np.float64).reshape(-1, 1)
@@ -74,8 +52,11 @@ class Normalizer:
         return mean, np.sqrt(var)
 
     @classmethod
-    def fit_from_dir(cls, rollouts_dir: str) -> "Normalizer":
-        files = sorted(glob.glob(os.path.join(rollouts_dir, "*.npz")))
+    def fit_from_dir(cls, rollouts_dir) -> "Normalizer":
+        dirs = rollouts_dir if isinstance(rollouts_dir, (list, tuple)) else [rollouts_dir]
+        files = []
+        for d in dirs:
+            files.extend(sorted(glob.glob(os.path.join(d, "*.npz"))))
         if not files:
             raise FileNotFoundError(f"no rollout npz files under {rollouts_dir}")
         norm = cls()

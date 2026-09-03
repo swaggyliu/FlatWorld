@@ -1,8 +1,8 @@
-"""StateTactileEncoder: per-frame states + EE tactile -> per-object latents.
+"""StateTactileEncoder: per-frame states; EE tactile is an EE-node residual.
 
-Sparse near-contact graph (k-NN + signed-gap). Tactile is injected into
-the EE node only. Output is (B, N, L) — one latent per body, shared
-weights, so N can change without new parameters.
+Sparse near-contact graph (k-NN + signed-gap). Tactile is added only to
+the EE node and is zeroed for a state-only encode (CEM default, or
+train-time dropout). Output is (B, N, L) — one latent per body.
 """
 
 from __future__ import annotations
@@ -31,15 +31,6 @@ def pairwise_gap(xy, obj_geom):
     return rel, dist, gap
 
 
-def pair_touch(gap, gap_eps: float = 0.015):
-    """Boolean (..., N, N) near-contact from signed gap; diagonal False."""
-    n = gap.shape[-1]
-    eye = torch.eye(n, device=gap.device, dtype=torch.bool)
-    while eye.dim() < gap.dim():
-        eye = eye.unsqueeze(0)
-    return (gap < gap_eps) & ~eye
-
-
 def knn_adjacency(dist, gap, k_nn: int = 2, gap_cut: float = 0.12):
     """Keep k nearest neighbours and any pair with signed gap below cut.
 
@@ -58,46 +49,31 @@ def knn_adjacency(dist, gap, k_nn: int = 2, gap_cut: float = 0.12):
     return adj & ~eye.expand(B, -1, -1)
 
 
-def _normal_tangent(rel, dist):
-    """rel (...,2), dist (...) -> unit normal / tangent (...,2)."""
-    n = rel / dist.clamp(min=1e-6).unsqueeze(-1)
-    t = torch.stack([-n[..., 1], n[..., 0]], dim=-1)
-    return n, t
-
-
 class StateTactileEncoder(nn.Module):
     def __init__(self, num_obj_types: int = 3, state_dim: int = 6,
                  contact_dim: int = 7, summary_dim: int = 4,
                  latent_dim: int = 128, obj_embed_dim: int = 64,
-                 tactile_embed_dim: int = 64, n_mp: int = 2,
-                 k_nn: int = 2, gap_cut: float = 0.12,
-                 rich_edges: bool = True):
+                 tactile_embed_dim: int = 64, n_mp: int = 3,
+                 k_nn: int = 2, gap_cut: float = 0.12):
         super().__init__()
         self.obj_embed_dim = obj_embed_dim
         self.latent_dim = latent_dim
         self.n_mp = n_mp
         self.k_nn = k_nn
         self.gap_cut = gap_cut
-        self.rich_edges = bool(rich_edges)
 
         self.type_emb = nn.Embedding(num_obj_types, 32)
         self.state_mlp = mlp([state_dim, 64, 64])
         self.geom_mlp = mlp([2, 32, 32])
         self.node_proj = mlp([64 + 32 + 32, obj_embed_dim], out_norm=True)
 
-        if self.rich_edges:
-            # rel is the 6-d state delta (xy already includes vx,vy,ω).
-            # Extra collision scalars: dist, gap, contact, vn, vt → 11.
-            # Not the predictor's 10-d pack (xy-rel + rel_v + prev_contact).
-            edge_in = state_dim + 3 + 2
-            msg_in = obj_embed_dim * 2 + 64
-            self.node_upd = nn.GRUCell(obj_embed_dim + 1, obj_embed_dim)
-        else:
-            edge_in = state_dim + 3
-            msg_in = obj_embed_dim * 2 + 64
-            self.node_upd = nn.GRUCell(obj_embed_dim, obj_embed_dim)
+        # rel is 6-d state delta (includes Δvx, Δvy, Δω) plus dist, gap,
+        # contact, and explicit rel_v (Δvx, Δvy). Messages sum; degree
+        # is concatenated into the node GRU.
+        edge_in = state_dim + 3 + 2
+        self.node_upd = nn.GRUCell(obj_embed_dim + 1, obj_embed_dim)
         self.edge_mlp = mlp([edge_in, 64, 64])
-        self.msg_mlp = mlp([msg_in, 64, obj_embed_dim])
+        self.msg_mlp = mlp([obj_embed_dim * 2 + 64, 64, obj_embed_dim])
 
         self.contact_mlp = mlp([contact_dim, 64, 64])
         self.tactile_proj = nn.Linear(64, tactile_embed_dim)
@@ -111,30 +87,18 @@ class StateTactileEncoder(nn.Module):
         _, dist, gap = pairwise_gap(obj_states[..., :2], obj_geom)
         adj = knn_adjacency(dist, gap, self.k_nn, self.gap_cut)
         contact_flag = (gap < 0.0).to(h.dtype).unsqueeze(-1)
-        if self.rich_edges:
-            # state layout: (x, y, theta, vx, vy, omega) -> linear vel is [3:5]
-            vel = obj_states[..., 3:5]
-            rel_v = vel.unsqueeze(2) - vel.unsqueeze(1)
-            n, t = _normal_tangent(rel[..., :2], dist)
-            vn = (rel_v * n).sum(-1, keepdim=True)
-            vt = (rel_v * t).sum(-1, keepdim=True)
-            e = self.edge_mlp(torch.cat([rel, dist.unsqueeze(-1),
-                                         gap.unsqueeze(-1), contact_flag,
-                                         vn, vt], dim=-1))
-        else:
-            e = self.edge_mlp(torch.cat([rel, dist.unsqueeze(-1), gap.unsqueeze(-1),
-                                         contact_flag], dim=-1))
+        vel = obj_states[..., 3:5]
+        rel_v = vel.unsqueeze(2) - vel.unsqueeze(1)
+        e = self.edge_mlp(torch.cat([rel, dist.unsqueeze(-1),
+                                     gap.unsqueeze(-1), contact_flag,
+                                     rel_v], dim=-1))
         hi = h.unsqueeze(2).expand(B, N, N, D)
         hj = h.unsqueeze(1).expand(B, N, N, D)
         msg = self.msg_mlp(torch.cat([hi, hj, e], dim=-1))
         msg = msg.masked_fill(~adj.unsqueeze(-1), 0.0)
-        if self.rich_edges:
-            agg = msg.sum(dim=2)
-            deg = adj.sum(dim=2, keepdim=True).to(h.dtype)
-            agg = torch.cat([agg, deg / 4.0], dim=-1)
-        else:
-            deg = adj.sum(dim=2, keepdim=True).clamp(min=1).to(h.dtype)
-            agg = msg.sum(dim=2) / deg
+        agg = msg.sum(dim=2)
+        deg = adj.sum(dim=2, keepdim=True).to(h.dtype)
+        agg = torch.cat([agg, deg / 4.0], dim=-1)
         h = self.node_upd(agg.reshape(B * N, -1), h.reshape(B * N, D)).view(B, N, D)
         return h
 
@@ -149,6 +113,9 @@ class StateTactileEncoder(nn.Module):
             self.geom_mlp(obj_geom),
         ], dim=-1))
 
+        # Tactile is an EE residual on top of the state embedding, not a
+        # second backbone. Zero feat/mask/summary (no contact, or CEM
+        # state-only encode) → residual ≈ 0 and z is state-driven.
         tc = self.contact_mlp(contact_feat)
         tc = (tc * contact_mask.unsqueeze(-1)).sum(dim=1)
         tactile = self.tactile_proj(tc)

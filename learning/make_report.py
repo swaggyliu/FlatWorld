@@ -35,16 +35,16 @@ CURRENT_BEST_TAGS = (
 
 
 def plot_training_curves(path, out, title_suffix=""):
-    epochs, tr = [], {k: [] for k in ("total", "dynamics", "recon_states")}
-    vd, vr, ol10, ol25, ol50, zs = [], [], [], [], [], []
+    epochs, tr = [], {k: [] for k in ("total", "dynamics", "contact")}
+    vd, vc, ol10, ol25, ol50, zs = [], [], [], [], [], []
     with open(path, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             epochs.append(int(row["epoch"]))
             tr["total"].append(float(row["train_total"]))
             tr["dynamics"].append(float(row["train_dynamics"]))
-            tr["recon_states"].append(float(row["train_recon_states"]))
+            tr["contact"].append(float(row.get("train_contact", "nan")))
             vd.append(float(row["val_dynamics"]))
-            vr.append(float(row["val_recon_states"]))
+            vc.append(float(row.get("val_contact", "nan")))
             ol10.append(float(row.get("val_openloop_10", "nan")))
             ol25.append(float(row.get("val_openloop_25", "nan")))
             ol50.append(float(row.get("val_openloop_50", "nan")))
@@ -60,11 +60,11 @@ def plot_training_curves(path, out, title_suffix=""):
     ax.set_title("World model losses"); ax.legend(); ax.grid(alpha=0.3)
 
     ax = axes[1]
-    ax.plot(epochs, tr["recon_states"], label="train recon (states)")
-    ax.plot(epochs, vr, "--", label="val recon (states)")
+    ax.plot(epochs, tr["contact"], label="train contact")
+    ax.plot(epochs, vc, "--", label="val contact")
     ax.set_yscale("log")
     ax.set_xlabel("epoch"); ax.set_ylabel("loss (log)")
-    ax.set_title("Reconstruction (anti-collapse)"); ax.legend(); ax.grid(alpha=0.3)
+    ax.set_title("EE contact"); ax.legend(); ax.grid(alpha=0.3)
 
     ax = axes[2]
     ax.plot(epochs, ol10, color="tab:red", label="10-step open-loop MSE")
@@ -78,7 +78,7 @@ def plot_training_curves(path, out, title_suffix=""):
     ax.set_title("Long-horizon rollout & latent health")
     ax.legend(loc="center right", fontsize=8)
     ax.grid(alpha=0.3)
-    title = "StateLeWM training (GNN + contact head, ensemble member 0)"
+    title = "StateLeWM training (GNN + pair/ground, ensemble member 0)"
     if title_suffix:
         title = f"{title} — {title_suffix}"
     fig.suptitle(title, fontsize=13)

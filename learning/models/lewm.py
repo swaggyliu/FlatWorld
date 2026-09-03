@@ -1,15 +1,12 @@
 """StateLeWM: assembled state + tactile latent world model.
 
-    encoder:   sparse graph + EE-only tactile -> z_t  (B, N, L)
-    predictor: Interaction Network + per-node GRU
-    decoder:   z_i -> state_i; EE node -> tactile summary
-    contact:   z_EE -> P(EE in contact)
+    encoder:   sparse graph on states; EE tactile is a residual on the EE node
+    predictor: Interaction Net + per-node GRU; edges carry rel_v from vel_head
+    xy_head:   z_i -> (x, y)   (CEM scores this)
+    pair/ground heads: privileged contacts, fed back during imagination
 
-Loss:
-    Total = Latent_Pred_Loss
-          + w_rec  * Recon(z_enc) + Recon(z_pred)
-          + w_var  * SIGReg
-          + w_c    * BCE(contact now) + BCE(contact next | z_pred)
+Loss (defaults):
+    Total = Latent_Pred_Loss + SIGReg + xy + pair + ground + drift + vel
 """
 
 import torch
@@ -17,66 +14,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoder import StateTactileEncoder, mlp
-from .decoder import StateTactileDecoder
 from .predictor import LatentPredictor
-
-
-def rich_edges_from_checkpoint(ckpt) -> bool:
-    """Flag stored on pair14+ best.pt; infer from weight shapes if missing.
-
-    ``*_last.pt`` historically omitted ``rich_edges``. Defaulting to False
-    then builds the pre-pair14 GRU (no degree channel) and ``load_state_dict``
-    fails on pair14+ weights.
-    """
-    if "rich_edges" in ckpt:
-        return bool(ckpt["rich_edges"])
-    sd = ckpt.get("model") or {}
-    w = sd.get("encoder.node_upd.weight_ih")
-    if w is not None:
-        return int(w.shape[-1]) > 64  # 65 = obj embed + contact degree
-    if "predictor.vel_head.weight" in sd:
-        return True
-    w = sd.get("predictor.cell.weight_ih")
-    if w is not None:
-        lat = int(ckpt.get("latent_dim", 128))
-        return int(w.shape[-1]) > 2 * lat + 2
-    return True
 
 
 class StateLeWM(nn.Module):
     def __init__(self, n_obj: int, num_obj_types: int = 3, latent_dim: int = 128,
-                 n_mp: int = 2, drop_tactile: bool = False, drop_geom: bool = False,
-                 rich_edges: bool = True):
+                 n_mp: int = 3, tactile_drop_prob: float = 0.5):
         super().__init__()
         self.n_obj = n_obj
         self.latent_dim = latent_dim
         self.n_mp = int(n_mp)
-        self.drop_tactile = bool(drop_tactile)
-        self.drop_geom = bool(drop_geom)
-        self.rich_edges = bool(rich_edges)
+        self.tactile_drop_prob = float(tactile_drop_prob)
         self.encoder = StateTactileEncoder(num_obj_types=num_obj_types,
                                            latent_dim=latent_dim,
-                                           n_mp=self.n_mp,
-                                           rich_edges=self.rich_edges)
-        self.predictor = LatentPredictor(latent_dim=latent_dim,
-                                         rich_edges=self.rich_edges)
-        self.decoder = StateTactileDecoder(n_obj=n_obj, latent_dim=latent_dim)
-        self.contact_head = mlp([latent_dim, 64, 1])
-        # Privileged pair / ground heads: solver contact labels at train
-        # time. Imagined rollouts feed pair_prob(z) back as prev_contact.
+                                           n_mp=self.n_mp)
+        self.predictor = LatentPredictor(latent_dim=latent_dim)
         self.pair_head = mlp([latent_dim * 3, 64, 1])
         self.ground_head = mlp([latent_dim, 32, 1])
         self.ss_prob = 0.6
 
     def encode(self, obj_types, obj_states, contact_feat, contact_mask,
-               tactile_summary, obj_geom=None):
+               tactile_summary, obj_geom=None, use_tactile: bool = True):
         """Encode a batch of frames (any leading dims are flattened).
 
-        obj_states: (..., N, 6); contact_feat: (..., K, 7);
-        contact_mask: (..., K); tactile_summary: (..., 4);
-        obj_types: (N,) or (..., N)
-        obj_geom: (..., N, 2) half-extents, optional
-        returns z: (..., N, latent_dim)
+        use_tactile: if False, zero the EE residual (state-only encode).
         """
         n_obj = obj_states.shape[-2]
         lead = obj_states.shape[:-2]
@@ -89,25 +50,20 @@ class StateLeWM(nn.Module):
             flat_types = obj_types.unsqueeze(0).expand(flat_states.shape[0], -1)
         else:
             flat_types = obj_types.reshape(-1, n_obj)
-        if self.drop_tactile:
+        if not use_tactile:
             flat_feat = flat_feat * 0
             flat_mask = flat_mask * 0
             flat_sum = flat_sum * 0
         flat_geom = None
         if obj_geom is not None:
             flat_geom = obj_geom.reshape(-1, n_obj, obj_geom.shape[-1])
-        if self.drop_geom:
-            if flat_geom is None:
-                flat_geom = flat_states.new_zeros(flat_states.shape[0], n_obj, 2)
-            else:
-                flat_geom = flat_geom * 0
 
         z = self.encoder(flat_types, flat_states, flat_feat, flat_mask, flat_sum,
                          obj_geom=flat_geom)
         return z.reshape(*lead, n_obj, self.latent_dim)
 
     def pair_prob(self, z):
-        """Soft symmetric pair-contact matrix from ``pair_head`` (..., N, N)."""
+        """Soft symmetric pair-contact matrix."""
         p = torch.sigmoid(self.pair_logit(z))
         p = 0.5 * (p + p.transpose(-1, -2))
         n = p.shape[-1]
@@ -116,19 +72,18 @@ class StateLeWM(nn.Module):
             eye = eye.unsqueeze(0)
         return p * (1.0 - eye)
 
-    def roll_step(self, z, a, h, geom, prev_c):
-        """One imagined step: current + previous contact from pair_prob."""
-        pair_now = self.pair_prob(z)
-        z, h, _ = self.predictor.step(
-            z, a, h, geom=geom, prev_contact=prev_c, pair_contact=pair_now)
-        return z, h, pair_now
+    def ground_prob(self, z):
+        """Per-node ground-contact probability."""
+        return torch.sigmoid(self.ground_logit(z))
 
-    def contact_logit(self, z):
-        """z: (..., N, L) or (..., L) -> logits (...). Uses the EE node."""
-        if z.dim() >= 3 and z.shape[-1] == self.latent_dim:
-            z = z[..., 0, :]
-        lead = z.shape[:-1]
-        return self.contact_head(z.reshape(-1, self.latent_dim)).squeeze(-1).reshape(*lead)
+    def roll_step(self, z, a, h, geom, prev_c):
+        """One imagined step: pair on edges, ground on the GRU node input."""
+        pair_now = self.pair_prob(z)
+        ground_now = self.ground_prob(z)
+        z, h, _ = self.predictor.step(
+            z, a, h, geom=geom, prev_contact=prev_c, pair_contact=pair_now,
+            ground=ground_now)
+        return z, h, pair_now
 
     def pair_logit(self, z):
         """z (..., N, L) -> pair logits (..., N, N)."""
@@ -160,18 +115,19 @@ class StateLeWM(nn.Module):
         geom_t = None
         if geom is not None:
             geom_t = geom.unsqueeze(1).expand(B, T, n_obj, geom.shape[-1])
+        use_tac = True
+        if self.training and self.tactile_drop_prob > 0:
+            use_tac = float(torch.rand(1)) >= self.tactile_drop_prob
         z = self.encode(obj_types.unsqueeze(1).expand(B, T, n_obj),
                         obj_states, contact_feat, contact_mask,
-                        summary, obj_geom=geom_t)     # (B, T, N, L)
+                        summary, obj_geom=geom_t,
+                        use_tactile=use_tac)
 
-        # Scheduled sampling: CEM rebuilds the graph from predicted xy, so
-        # training must sometimes do the same (not always teacher-forced).
         use_tf = (not self.training) or (float(torch.rand(1)) >= self.ss_prob)
         z_target = z[:, 1:].detach()
 
-        # Unroll with solver pair labels under teacher forcing; under
-        # scheduled sampling (and CEM) persistence is pair_prob(z).
         pair = batch.get("pair_contact")
+        ground = batch.get("ground_contact")
         h = self.predictor.init_hidden(z[:, 0])
         zt = z[:, 0]
         preds = []
@@ -185,41 +141,27 @@ class StateLeWM(nn.Module):
                 pair_now = pair[:, t]
             else:
                 pair_now = self.pair_prob(zt)
+            if use_tf and ground is not None:
+                g_now = ground[:, t]
+            else:
+                g_now = self.ground_prob(zt)
             zt, h, _ = self.predictor.step(
                 zt, actions[:, t], h, geom=geom, xy=xy,
-                prev_contact=prev_c, pair_contact=pair_now)
+                prev_contact=prev_c, pair_contact=pair_now, ground=g_now)
             preds.append(zt)
             prev_c = pair_now
         z_pred = torch.stack(preds, dim=1)
 
-        rec_s, rec_t = self.decoder(z.reshape(B * T, n_obj, self.latent_dim))
-        recon_states = rec_s.view(B, T, n_obj, -1)
-        recon_summary = rec_t.view(B, T, -1)
-
-        rec_ps, rec_pt = self.decoder(z_pred.reshape(B * (T - 1), n_obj, self.latent_dim))
-        pred_recon_states = rec_ps.view(B, T - 1, n_obj, -1)
-        pred_recon_summary = rec_pt.view(B, T - 1, -1)
-
-        contact_now = (contact_mask.sum(dim=-1) > 0).float()     # (B, T)
-        pair = batch.get("pair_contact")
-        ground = batch.get("ground_contact")
         return {
             "z": z,
             "z_pred": z_pred,
             "z_target": z_target,
-            "recon_states": recon_states,
-            "recon_summary": recon_summary,
-            "pred_recon_states": pred_recon_states,
-            "pred_recon_summary": pred_recon_summary,
             "states": obj_states,
             "summary": summary,
-            "contact_now": contact_now,
-            "contact_logit": self.contact_logit(z),
-            "contact_logit_pred": self.contact_logit(z_pred),
             "xy_enc": self.predictor.xy_head(z),
             "xy_pred": self.predictor.xy_head(z_pred),
-            "vel_enc": self.predictor.vel_head(z) if self.rich_edges else None,
-            "vel_pred": self.predictor.vel_head(z_pred) if self.rich_edges else None,
+            "vel_enc": self.predictor.vel_head(z),
+            "vel_pred": self.predictor.vel_head(z_pred),
             "pair_contact": pair,
             "ground_contact": ground,
             "actions": actions,
@@ -249,16 +191,10 @@ class StateLeWM(nn.Module):
     def set_ss_prob(self, prob: float):
         self.ss_prob = float(prob)
 
-    def compute_loss(self, out, w_dyn: float = 1.0, w_rec: float = 1.0,
-                     w_pred_rec: float = 1.0, w_var: float = 0.1,
-                     w_contact: float = 1.0, w_xy: float = 0.5,
-                     w_pair: float = 1.5, w_ground: float = 0.5,
-                     w_drift: float = 0.3, w_vel: float = 0.5,
-                     w_chain: float = 2.0):
+    def compute_loss(self, out, w_dyn: float = 1.0, w_var: float = 0.1,
+                     w_xy: float = 0.5, w_pair: float = 1.5, w_ground: float = 0.5,
+                     w_drift: float = 0.3, w_vel: float = 0.5):
         loss_dyn = F.mse_loss(out["z_pred"], out["z_target"])
-        loss_rec_s = F.mse_loss(out["recon_states"], out["states"])
-        loss_rec_t = F.mse_loss(out["recon_summary"], out["summary"])
-        loss_prt = F.mse_loss(out["pred_recon_summary"], out["summary"][:, 1:])
         loss_var = self.sigreg(out["z"])
         loss_xy = F.mse_loss(out["xy_enc"], out["states"][..., :2])
         loss_xy = loss_xy + F.mse_loss(out["xy_pred"], out["states"][:, 1:, :, :2])
@@ -269,56 +205,18 @@ class StateLeWM(nn.Module):
 
         pair = out.get("pair_contact")
         ground = out.get("ground_contact")
+        zero = d_true.new_zeros(())
 
-        # Chain displacement: if i is moving and solver-contacts j, j's
-        # Δxy must match. EE–object contact counts even when EE "moved"
-        # from force rather than a prior shove.
-        loss_chain = d_true.new_zeros(())
-        if pair is not None:
-            p = pair[:, :-1]
-            moved = (d_true.norm(dim=-1) > 0.01).to(d_true.dtype)
-            pusher = (p * moved.unsqueeze(-1)).sum(dim=-2).clamp(max=3.0)
-            pusher = pusher + p[:, :, 0, :]
-            pusher[:, :, 0] = 0.0
-            chain_err = (d_pred - d_true).pow(2).sum(dim=-1)
-            denom = pusher.sum().clamp(min=1.0)
-            loss_chain = (pusher * chain_err).sum() / denom
-
-        err = (out["pred_recon_states"] - out["states"][:, 1:]) ** 2
-        dim_w = err.new_tensor([2.0, 2.0, 1.0, 3.0, 3.0, 1.0])
-        node_w = err.new_ones(err.shape[:3])
-        if pair is not None:
-            node_w = node_w + 2.0 * pair[:, 1:].sum(dim=-1).clamp(max=3.0)
-        if ground is not None:
-            node_w = node_w + 1.0 * ground[:, 1:]
-        loss_prs = (err * node_w.unsqueeze(-1) * dim_w).mean()
-
-        # Zero-force drift: when EE action is small, non-EE objects should
-        # not move. Penalize predicted displacement under near-rest.
-        a_mag = out["actions"].norm(dim=-1, keepdim=True)   # (B, T-1, 1)
-        rest_mask = (a_mag < 0.3).to(err.dtype)             # (B, T-1, 1)
+        a_mag = out["actions"].norm(dim=-1, keepdim=True)
+        rest_mask = (a_mag < 0.3).to(d_true.dtype)
         d_rest = out["xy_pred"][:, :, 1:] - out["xy_enc"][:, :-1, 1:]
-        # d_rest: (B, T-1, N-1, 2) -> norm: (B, T-1, N-1)
-        # rest_mask broadcasts over the last (object) dim.
         loss_drift = (rest_mask * d_rest.norm(dim=-1)).mean()
 
-        # Velocity readout: the rich-edge features consume vel_head(z), so
-        # the readout must actually track true velocity or the collision
-        # features (approach speed) are fiction during imagined rollouts.
-        loss_vel = err.new_zeros(())
-        if out.get("vel_pred") is not None:
-            # state layout: (x, y, theta, vx, vy, omega) -> linear vel is [3:5]
-            v_true = out["states"][..., 3:5]
-            loss_vel = F.mse_loss(out["vel_enc"], v_true)
-            loss_vel = loss_vel + F.mse_loss(out["vel_pred"], v_true[:, 1:])
+        v_true = out["states"][..., 3:5]
+        loss_vel = F.mse_loss(out["vel_enc"], v_true)
+        loss_vel = loss_vel + F.mse_loss(out["vel_pred"], v_true[:, 1:])
 
-        c_now = out["contact_now"]
-        c_smooth = c_now * 0.9 + 0.05
-        loss_c = self.focal_bce_with_logits(out["contact_logit"], c_smooth)
-        loss_c = loss_c + self.focal_bce_with_logits(
-            out["contact_logit_pred"], c_smooth[:, 1:])
-
-        loss_pair = err.new_zeros(())
+        loss_pair = zero
         if pair is not None and out.get("pair_logit") is not None:
             n = pair.shape[-1]
             off = ~torch.eye(n, dtype=torch.bool, device=pair.device)
@@ -328,7 +226,7 @@ class StateLeWM(nn.Module):
             loss_pair = loss_pair + self.focal_bce_with_logits(
                 out["pair_logit_pred"][..., off], (pair[:, 1:] * 0.9 + 0.05)[..., off])
 
-        loss_g = err.new_zeros(())
+        loss_g = zero
         if ground is not None and out.get("ground_logit") is not None:
             g = ground * 0.9 + 0.05
             loss_g = self.focal_bce_with_logits(out["ground_logit"], g)
@@ -336,28 +234,18 @@ class StateLeWM(nn.Module):
                 out["ground_logit_pred"], g[:, 1:])
 
         total = (w_dyn * loss_dyn
-                 + w_rec * (loss_rec_s + loss_rec_t)
-                 + w_pred_rec * (loss_prs + loss_prt)
                  + w_var * loss_var
-                 + w_contact * loss_c
                  + w_xy * loss_xy
                  + w_pair * loss_pair
                  + w_ground * loss_g
                  + w_drift * loss_drift
-                 + w_vel * loss_vel
-                 + w_chain * loss_chain)
+                 + w_vel * loss_vel)
         return {
             "total": total,
             "dynamics": loss_dyn,
-            "recon_states": loss_rec_s,
-            "recon_summary": loss_rec_t,
-            "pred_recon_states": loss_prs,
-            "pred_recon_summary": loss_prt,
             "sigreg": loss_var,
-            "contact": loss_c,
             "pair": loss_pair,
             "ground": loss_g,
             "drift": loss_drift,
             "vel": loss_vel,
-            "chain": loss_chain,
         }

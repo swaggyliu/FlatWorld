@@ -1248,6 +1248,7 @@ def _add_pgs_row_func(
 def _assemble_ground_contact_constraints_wp(
     dt: float,
     contact_erp: float,
+    rolling_mu: float,
     max_constraints: int,
     num_ground_contacts: wp.array(dtype=int),
     ground_contact_rigid: wp.array(dtype=int),
@@ -1304,7 +1305,18 @@ def _assemble_ground_contact_constraints_wp(
                 max_constraints, numConstraints, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
                 pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
             )
-        ground_contact_pgs_indices[idx] = wp.vec3i(normal_row, t1_row, -1)
+        t2_row = -1
+        if mu > 1e-12 and rolling_mu > 1e-12 and normal_row >= 0:
+            r_arm = wp.length(lr)
+            if r_arm > 1e-8:
+                roll_lim = rolling_mu * r_arm
+                t2_row = _add_pgs_row_func(
+                    rid, -1, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0), 0.0,
+                    -roll_lim, roll_lim, normal_row,
+                    max_constraints, numConstraints, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+                    pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+                )
+        ground_contact_pgs_indices[idx] = wp.vec3i(normal_row, t1_row, t2_row)
 
 
 @wp.kernel
@@ -1486,6 +1498,12 @@ class RigidManager:
         self.hasHeightFieldOrVoxel = False  # Set True if any HeightField/Voxel domains exist
 
         self.contact_erp = 0.2  # Baumgarte error reduction parameter for ground contacts
+        # Rolling resistance (dimensionless C_rr). Coulomb friction alone cannot
+        # dissipate a rolling disk: no-slip => contact point velocity is 0, so
+        # the tangent row does no work. This extra PGS row is a torque about
+        # the contact, |Λ_roll| <= C_rr * |r| * Λ_n, which creates slip that
+        # Coulomb then damps. 0 disables it (old Coulomb-only behavior).
+        self.rolling_resistance = 0.25
         self.restitution_velocity_threshold = 1.0  # Ignore restitution for low-speed contacts
         self.skip_bvh = False  # When True, skip BVH broadphase and use direct ground pair generation
         self.control_dt = 1.0 / 60.0  # default: 60 Hz control
@@ -1777,7 +1795,7 @@ class RigidManager:
 
         self.needUpdate = False
 
-        self.stableTime = 1.0 / 1000.0  # Default stable time step
+        self.stableTime = 1.0 / 600.0  # Default stable time step
         # Process rigid domains and allocate data
         print("Processing domains for RigidManager...")
         self.processDomains_(domains)
@@ -3727,6 +3745,16 @@ class RigidManager:
             rhs_t1 = t1.dot(ground_vel)
             tangent1_row = self._add_pgs_row(rid, -1, jac_t1, wp.vec3(0.0, 0.0, 0.0), rhs_t1, -mu, mu, normal_row)
             self.ground_contact_pgs_indices[idx][1] = tangent1_row
+            rolling_mu = float(self.rolling_resistance)
+            if rolling_mu > 1e-12:
+                r_arm = float(wp.length(lr))
+                if r_arm > 1e-8:
+                    roll_lim = rolling_mu * r_arm
+                    roll_row = self._add_pgs_row(
+                        rid, -1, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0),
+                        0.0, -roll_lim, roll_lim, normal_row,
+                    )
+                    self.ground_contact_pgs_indices[idx][2] = roll_row
 
 
     def _assemble_pair_contact_rows(self, idx: int, dt: float):
@@ -3772,6 +3800,7 @@ class RigidManager:
             inputs=[
                 float(dt),
                 float(self.contact_erp),
+                float(self.rolling_resistance),
                 int(self.MAX_CONSTRAINTS),
                 self.num_ground_contacts,
                 self.ground_contact_rigid,

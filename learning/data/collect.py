@@ -20,7 +20,7 @@ from learning.env.flatworld_wrapper import PushSceneEnv
 
 
 def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray,
-                   ee_r: float = None) -> np.ndarray:
+                   ee_r: float = None, y_hi: float = None) -> np.ndarray:
     """Soft workspace walls shared by ALL collection modes.
 
     With the real (wide) box geometry the EE gets blocked by the pile and
@@ -37,10 +37,11 @@ def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray,
     elif ee_pos[0] > c.x_hi:
         a[0] -= k * (ee_pos[0] - c.x_hi)
     y_lo = max(float(c.y_lo), float(ee_r) + 0.005) if ee_r is not None else float(c.y_lo)
+    y_top = float(c.y_hi if y_hi is None else y_hi)
     if ee_pos[1] < y_lo:
         a[1] += k * (y_lo - ee_pos[1])
-    elif ee_pos[1] > c.y_hi:
-        a[1] -= k * (ee_pos[1] - c.y_hi)
+    elif ee_pos[1] > y_top:
+        a[1] -= k * (ee_pos[1] - y_top)
     return a
 
 
@@ -58,19 +59,9 @@ def sample_action(rng: np.random.Generator, cfg: Config, prev: np.ndarray,
                   ee_pos: np.ndarray, obj_pos: np.ndarray,
                   mode: str = "attract", cmd: np.ndarray = None,
                   ee_r: float = None) -> np.ndarray:
-    """Smooth random force. Three collection modes (see run_rollout):
+    """Smooth random force for free / attract / push / release.
 
-    - "free": unbiased force sweep -- a constant random force held for a
-      random interval (re-sampled by the caller). Teaches the true
-      force -> EE-motion mapping in BOTH axes with no directional bias;
-      the attraction-biased data alone makes the model believe force has
-      almost no effect on the EE.
-    - "attract": OU noise + capped attraction toward the nearest object
-      with a vertical deadband near the ground band, so the EE approaches
-      at push height instead of being pressed into the ground plane.
-    - "push": constant commanded force toward/away from the nearest
-      object, alternating on a timer (push ... withdraw ...). Teaches
-      contact making/breaking and that released objects stop moving.
+    Hop and pile have their own action functions.
     """
     c = cfg.collect
     if mode in ("push", "free", "release") and cmd is not None:
@@ -122,7 +113,7 @@ def _clip_action(a, cfg: Config, env: PushSceneEnv) -> np.ndarray:
 
 def pile_action(env: PushSceneEnv, obs: dict, target_idx: int,
                 rng: np.random.Generator, cfg: Config) -> np.ndarray:
-    """Shove the object in front of a (possibly buried) random target.
+    """Shove the object in front of a random target (target may sit behind others).
 
     Sign of Fx follows EE → target so left-side and right-side chain
     contact both appear in the dataset.
@@ -157,66 +148,56 @@ def pile_action(env: PushSceneEnv, obs: dict, target_idx: int,
     return _clip_action(a, cfg, env)
 
 
-def _neighbor_pair(states: np.ndarray, geom: np.ndarray):
-    """Closest neighbouring object pair along x (indices, signed gap)."""
-    order = 1 + np.argsort(states[1:, 0])
-    best = (1, min(2, len(states) - 1), 1.0)
-    best_gap = 1e9
-    for a, b in zip(order, order[1:]):
-        gap = float(states[b, 0] - states[a, 0]
-                    - geom[a, 0] - geom[b, 0])
-        if gap < best_gap:
-            best_gap = gap
-            best = (int(a), int(b), gap)
-    return best
+def hop_action(obs: dict, rng: np.random.Generator, cfg: Config,
+               mem: dict) -> np.ndarray:
+    """Lift on +Fy, cruise, then dive into a random object.
 
-
-def contrast_action(obs: dict, rng: np.random.Generator, cfg: Config,
-                    mode: str, mem: dict) -> np.ndarray:
-    """Demonstration for gap / kiss / around (not used at plan time).
-
-    gap:    push an isolated face so the neighbour should stay put
-    kiss:   push into a touching (or nearly touching) pair
-    around: approach the far face, then push back
+    Covers aerial hits (Bank-style): the EE is not glued to push height.
     """
-    fmax = float(cfg.collect.force_max)
+    c = cfg.collect
+    fmax = float(c.force_max)
+    hop_y = float(c.hop_y)
+    y_hi = float(c.hop_y_hi)
     states, geom = obs["obj_states"], obs["obj_geom"]
     ee = states[0]
-    if "i" not in mem:
-        i, j, gap = _neighbor_pair(states, geom)
-        mem["i"], mem["j"] = i, j
-        mem["phase"] = "approach"
-        xi, xj = float(states[i, 0]), float(states[j, 0])
-        toward = 1.0 if xj >= xi else -1.0
-        if mode == "kiss":
-            mem["sign"] = toward
-        elif mode == "gap":
-            mem["sign"] = -toward
-        else:
-            mem["sign"] = 1.0 if rng.random() < 0.5 else -1.0
-    i, sign = int(mem["i"]), float(mem["sign"])
-    standoff = float(geom[i, 0] + geom[0, 0])
-    cx = float(states[i, 0]) - sign * standoff
-    cy = max(float(states[i, 1]), float(geom[0, 1]) + 0.005)
-    if mem["phase"] == "approach":
-        if mode == "around" and float(ee[1]) < cy + 0.10 and abs(float(ee[0]) - cx) > 0.07:
-            a = np.array([0.15 * np.sign(cx - ee[0]) * fmax, 0.9 * fmax])
-        else:
-            dx, dy = cx - float(ee[0]), cy - float(ee[1])
-            nrm = max(float(np.hypot(dx, dy)), 1e-6)
-            a = np.array([dx / nrm, dy / nrm]) * 0.75 * fmax
-        if abs(float(ee[0]) - cx) < 0.05 and abs(float(ee[1]) - cy) < 0.07:
-            mem["phase"] = "push"
-            mem["left"] = int(rng.integers(22, 45))
+    n_obj = states.shape[0] - 1
+    if "tgt" not in mem:
+        mem["tgt"] = 1 + int(rng.integers(0, n_obj))
+        mem["side"] = 1.0 if rng.random() < 0.5 else -1.0
+        mem["phase"] = "lift"
+        mem["left"] = int(rng.integers(16, 28))
+    tgt = int(mem["tgt"])
+    standoff = float(geom[tgt, 0] + geom[0, 0])
+    aim_x = float(states[tgt, 0]) - float(mem["side"]) * (standoff + 0.05)
+    tx, ty = float(states[tgt, 0]), float(states[tgt, 1])
+    if mem["phase"] == "lift":
+        fy = 0.75 * fmax if float(ee[1]) < hop_y - 0.04 else 0.12 * fmax
+        fx = float(np.clip(8.0 * (aim_x - float(ee[0])), -0.35 * fmax, 0.35 * fmax))
+        mem["left"] -= 1
+        if float(ee[1]) >= hop_y - 0.05 or mem["left"] <= 0:
+            mem["phase"] = "cruise"
+            mem["left"] = int(rng.integers(18, 36))
+        a = np.array([fx, fy], dtype=np.float64)
+    elif mem["phase"] == "cruise":
+        fy = float(np.clip(14.0 * (hop_y - float(ee[1])), -0.55 * fmax, 0.55 * fmax))
+        fx = float(np.clip(10.0 * (aim_x - float(ee[0])), -0.75 * fmax, 0.75 * fmax))
+        mem["left"] -= 1
+        if abs(float(ee[0]) - aim_x) < 0.08 or mem["left"] <= 0:
+            mem["phase"] = "strike"
+            mem["left"] = int(rng.integers(22, 44))
+        a = np.array([fx, fy], dtype=np.float64)
     else:
-        mem["left"] = int(mem.get("left", 0)) - 1
+        dx, dy = tx - float(ee[0]), ty - float(ee[1])
+        nrm = max(float(np.hypot(dx, dy)), 1e-6)
+        mag = 0.80 * fmax
+        fx, fy = dx / nrm * mag, dy / nrm * mag
+        fy = min(fy, -0.20 * fmax)
+        mem["left"] -= 1
         if mem["left"] <= 0:
-            a = np.zeros(2, dtype=np.float64)
-        else:
-            fy = float(np.clip(10.0 * (cy - float(ee[1])), -0.4 * fmax, 0.4 * fmax))
-            a = np.array([sign * 0.8 * fmax, fy], dtype=np.float64)
-    a = a + 0.2 * cfg.collect.ou_sigma * rng.standard_normal(2)
-    a = apply_barriers(a, cfg, ee[:2], float(geom[0, 0]))
+            mem.clear()
+        a = np.array([fx, fy], dtype=np.float64)
+    a = a + 0.2 * c.ou_sigma * rng.standard_normal(2)
+    a = apply_barriers(a, cfg, ee[:2], float(geom[0, 0]), y_hi=y_hi)
     return np.clip(a, -fmax, fmax).astype(np.float32)
 
 
@@ -240,36 +221,27 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
     pile_target = 1 + int(rng.integers(0, obs["obj_states"].shape[0] - 1))
 
     u = rng.random()
-    if getattr(c, "contrast", False):
-        if u < 0.25:
-            mode = "around"
-        elif u < 0.50:
-            mode = "kiss"
-        elif u < 0.70:
-            mode = "gap"
-        elif u < 0.90:
-            mode = "release"
-        else:
-            mode = "push"
+    t_free = c.mode_free
+    t_attr = t_free + c.mode_attract
+    t_push = t_attr + c.mode_push
+    t_rel = t_push + c.mode_release
+    t_hop = t_rel + c.mode_hop
+    if u < t_free:
+        mode = "free"
+    elif u < t_attr:
+        mode = "attract"
+    elif u < t_push:
+        mode = "push"
+    elif u < t_rel:
+        mode = "release"
+    elif u < t_hop:
+        mode = "hop"
     else:
-        t_free = c.mode_free
-        t_attr = t_free + c.mode_attract
-        t_push = t_attr + c.mode_push
-        t_rel = t_push + getattr(c, "mode_release", 0.0)
-        if u < t_free:
-            mode = "free"
-        elif u < t_attr:
-            mode = "attract"
-        elif u < t_push:
-            mode = "push"
-        elif u < t_rel:
-            mode = "release"
-        else:
-            mode = "pile"
+        mode = "pile"
     cmd = None
     phase_left = 0
     pushing = True
-    contrast_mem = {}
+    hop_mem = {}
 
     a = np.zeros(2, dtype=np.float32)
     for _ in range(c.episode_len):
@@ -282,10 +254,10 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         nearest = obj_pos_all[np.argmin(
             np.linalg.norm(obj_pos_all - ee_pos, axis=1))]
         focus = attract_pos if mode in ("attract", "push", "release") else nearest
-        if mode in ("gap", "kiss", "around"):
-            a = contrast_action(obs, rng, cfg, mode, contrast_mem)
-        elif mode == "pile":
+        if mode == "pile":
             a = pile_action(env, obs, pile_target, rng, cfg)
+        elif mode == "hop":
+            a = hop_action(obs, rng, cfg, hop_mem)
         else:
             if phase_left <= 0:
                 if mode == "free":
@@ -346,13 +318,9 @@ def main():
     parser.add_argument("--out", type=str, default=None, help="output directory")
     parser.add_argument("--start-index", type=int, default=0,
                         help="first rollout index (resume after interruption)")
-    parser.add_argument("--contrast", action="store_true",
-                        help="collect gap/kiss/around/release contrast mix")
     args = parser.parse_args()
 
     cfg = Config()
-    if args.contrast:
-        cfg.collect.contrast = True
     if args.num_rollouts is not None:
         cfg.collect.num_rollouts = args.num_rollouts
     if args.episode_len is not None:

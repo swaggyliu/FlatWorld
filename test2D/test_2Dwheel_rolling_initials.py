@@ -52,6 +52,9 @@ def test_cylinder_wheel_rolling(headless=False):
     frame_dt = 1.0 / 60.0
     looper = ExplicitLoop(0.0, domains, useAdapativeDT=True)
     looper.stableTime = 1e-3
+    # Isolate Coulomb spin→roll conversion; dissipation is
+    # test_2Dball_rolling_friction.py.
+    looper.rigidManager.rolling_resistance = 0.0
 
     gui = create_gui_if_available("Cylinder Wheel Rolling", res=(800, 800)) if not headless else None
     t = 0.0

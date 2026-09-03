@@ -19,8 +19,9 @@ from learning.tasks.push_to_goal import PushToGoalTask, load_ensemble
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str,
-                        default="learning/checkpoints")
+    parser.add_argument("--checkpoint", nargs="+", type=str,
+                        default=["learning/checkpoints"],
+                        help="checkpoint dir(s) or file(s); multiple = ensemble")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--budget", type=int, default=None,
                         help="sim frames (default: Config.task.budget = 400)")
@@ -41,9 +42,25 @@ def build_parser():
     parser.add_argument("--results", type=str, default="learning/results")
     parser.add_argument("--uncert-cost", type=float, default=None,
                         help="override ensemble disagreement cost (default 0.1)")
+    parser.add_argument("--reduce", type=str, default="mean",
+                        choices=("mean", "min"),
+                        help="how to combine ensemble member costs")
     parser.add_argument("--only", type=str, default="",
                         help="comma-separated episode indices (seed+i); "
                              "skip all other episodes")
+    parser.add_argument("--no-reach", action="store_true",
+                        help="ablate reach (contact-face) cost")
+    parser.add_argument("--no-settle", action="store_true",
+                        help="ablate in-tolerance speed penalty")
+    parser.add_argument("--settle-w", type=float, default=None,
+                        help="in-tolerance imagined-speed weight (default 0)")
+    parser.add_argument("--tactile", type=str, default="gate",
+                        choices=("off", "gate", "on"),
+                        help="EE tactile residual: never / miss-gated / always")
+    parser.add_argument("--replay-fails", action="store_true", default=True,
+                        help="write MP4s for failed episodes after eval")
+    parser.add_argument("--no-replay-fails", action="store_true",
+                        help="skip fail MP4s")
     return parser
 
 
@@ -56,6 +73,14 @@ def run_eval(args):
               iterations=args.iterations, seed=args.seed)
     if args.uncert_cost is not None:
         pk["uncert_cost"] = float(args.uncert_cost)
+    pk["ensemble_reduce"] = getattr(args, "reduce", "mean")
+    if args.no_reach:
+        pk["reach_cost"] = 0.0
+    if getattr(args, "no_settle", False):
+        pk["settle_w"] = 0.0
+    if getattr(args, "settle_w", None) is not None:
+        pk["settle_w"] = float(args.settle_w)
+    pk["tactile_mode"] = args.tactile
     task = PushToGoalTask(
         cfg, model, norm, device=device, tol=args.tol,
         vel_tol=args.vel_tol, budget=args.budget,
@@ -64,7 +89,8 @@ def run_eval(args):
 
     records = []
     recorded = {"states": [], "masks": [], "actions": [], "goal": [],
-                "success": [], "target_idx": [], "geom": []}
+                "success": [], "target_idx": [], "geom": [], "types": [],
+                "episode_idx": [], "final_dist": [], "settle_frame": []}
     t0 = time.time()
     n_success = 0
     only = getattr(args, "only", "") or ""
@@ -89,6 +115,10 @@ def run_eval(args):
             recorded["success"].append(r["success"])
             recorded["target_idx"].append(r["target_idx"])
             recorded["geom"].append(task._geom().copy())
+            recorded["types"].append(np.asarray(task.env.obj_types_np, dtype=np.int64))
+            recorded["episode_idx"].append(i)
+            recorded["final_dist"].append(r["final_dist"])
+            recorded["settle_frame"].append(r["settle_frame"])
         records.append({key: v for key, v in r.items() if key != "frames"})
         if only.strip() or (k + 1) % 10 == 0 or k == 0:
             rate = n_success / (k + 1)
@@ -101,6 +131,7 @@ def run_eval(args):
     frames = [r["settle_frame"] for r in records]
     summary = {
         "checkpoint": args.checkpoint,
+        "seed": int(args.seed),
         "tag": args.tag,
         "episodes": n_run,
         "budget": task.budget,
@@ -118,7 +149,10 @@ def run_eval(args):
         "cem": {"horizon": args.horizon, "population": args.population,
                 "iterations": args.iterations,
                 "uncert_cost": args.uncert_cost,
+                "score": getattr(args, "score", "xy"),
                 "only": getattr(args, "only", "") or None},
+        "cost_ablate": {"reach": not args.no_reach},
+        "tactile": args.tactile,
     }
     os.makedirs(args.results, exist_ok=True)
     suffix = f"_{args.tag}" if args.tag else ""
@@ -136,6 +170,10 @@ def run_eval(args):
             success=np.asarray(recorded["success"]),
             target_idx=np.asarray(recorded["target_idx"]),
             geom=np.stack(recorded["geom"]).astype(np.float32),
+            types=np.stack(recorded["types"]).astype(np.int64),
+            episode_idx=np.asarray(recorded["episode_idx"], dtype=np.int32),
+            final_dist=np.asarray(recorded["final_dist"], dtype=np.float32),
+            settle_frame=np.asarray(recorded["settle_frame"], dtype=np.int32),
         )
 
     print("-" * 60)
@@ -146,6 +184,10 @@ def run_eval(args):
           f"mean settle frame {summary['mean_settle_frame']:.0f}")
     print(f"Elapsed {elapsed:.1f}s ({elapsed / n_run:.2f}s/episode)")
     print(f"Wrote {eval_path}")
+    if recorded["states"] and getattr(args, "replay_fails", True) \
+            and not getattr(args, "no_replay_fails", False):
+        from learning.replay import dump_eval_fails
+        dump_eval_fails(eval_path)
     return summary
 
 

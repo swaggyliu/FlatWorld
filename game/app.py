@@ -7,6 +7,8 @@ Usage (repo root):
 Start screen: pick a world-model checkpoint, then Start.
 Drop your own .pt into learning/world_models to see it in the list.
 
+Five campaign stages, then seeded random layouts (retry keeps the same mix).
+
 In-game:
     click gold     choose the body to push
     click empty    push it toward that x
