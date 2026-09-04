@@ -62,8 +62,8 @@ Full write-up, architecture, losses, and eval numbers:
 [`learning/`](learning/README.md) is a lightweight **state + tactile
 conditioned latent world model** (StateLeWM) trained inside FlatWorld:
 random-push data collection, latent dynamics training, and CEM planning
-for PushToGoal. Current numbers (50 episodes, CEM H=32): leftmost /
-rightmost **92%**, random **82%**. Shipped weights:
+for PushToGoal. **318K** parameters. Current numbers (50 episodes, CEM H=32): leftmost
+**94%**, rightmost **92%**, random **82%**. Shipped weights:
 `learning/checkpoints/best.pt`.
 
 ## Spirit Push
@@ -79,7 +79,7 @@ python -m game
 ```
 
 Gold is the target, red is a one-hit hazard, the star is the goal.
-Sliders set bounce / grip / size. `Shift` is a careful (weaker) push.
+Sliders set bounce / grip / size.
 
 <p align="center">
   <img src="docs/game/menu.png" width="720" alt="Spirit Push start menu" />
@@ -204,7 +204,7 @@ pytest test2D -q
 
 完整说明（架构、损失、评测）：**[learning/README.md](learning/README.md)**。
 
-[`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。当前成功率（50 局，CEM H=32）：最左 / 最右 **92%**，随机 **82%**。默认权重：`learning/checkpoints/best.pt`。
+[`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。模型 **31.8 万参数**。当前成功率（50 局，CEM H=32）：最左 **94%** / 最右 **92%**，随机 **82%**。默认权重：`learning/checkpoints/best.pt`。
 
 ## Spirit Push 游戏
 
@@ -214,7 +214,7 @@ pytest test2D -q
 python -m game
 ```
 
-金色是目标，红色碰一次就重来，星星是终点。右侧滑条改弹性 / 摩擦力 / 尺寸。`Shift` 为小心推（更小的力）。
+金色是目标，红色碰一次就重来，星星是终点。右侧滑条改弹性 / 摩擦力 / 尺寸。
 
 <p align="center">
   <img src="docs/game/menu.png" width="720" alt="Spirit Push 开始菜单" />

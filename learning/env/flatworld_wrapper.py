@@ -607,24 +607,13 @@ class PushSceneEnv:
         self.force_cap_override = snap.get("force_cap_override")
         self.rm.updateBBox()
 
-    def step(self, action: np.ndarray) -> dict:
-        """Apply action=(Fx,Fy), advance one visual frame, return the new observation.
-
-        The EE is admittance-controlled: the commanded force acts against a
-        viscous damping term (-c * v) and the EE speed is hard-clamped.
-        Without damping the EE is an undamped double integrator -- PGS
-        contact impulses launch it meters across the scene, which both
-        wrecks the collected force -> motion statistics and makes the
-        planning problem unstable.
-        """
+    def _apply_action_advance(self, action: np.ndarray):
+        """Admittance force + one visual frame. No observation."""
         sc = self.cfg.scene
         a = np.asarray(action, dtype=np.float64)
         if sc.ee_damping > 0.0:
             v = self.rm.V.numpy()[self.ee_idx]
             a = a - sc.ee_damping * v
-            # actuator saturation: the net force stays within the same
-            # range the actions were collected in, unless a caller
-            # (pile-clear) raises the cap for this step.
             fmax = float(self.cfg.collect.force_max)
             override = getattr(self, "force_cap_override", None)
             if override is not None:
@@ -638,6 +627,22 @@ class PushSceneEnv:
             if speed > sc.ee_vel_max:
                 v = v * (sc.ee_vel_max / speed)
                 _patch_array(self.rm.V, self.ee_idx, wp.vec2(float(v[0]), float(v[1])))
+
+    def advance_action(self, action: np.ndarray):
+        """Force + one visual frame, no observation (solver-CEM inner loop)."""
+        self._apply_action_advance(action)
+
+    def step(self, action: np.ndarray) -> dict:
+        """Apply action=(Fx,Fy), advance one visual frame, return the new observation.
+
+        The EE is admittance-controlled: the commanded force acts against a
+        viscous damping term (-c * v) and the EE speed is hard-clamped.
+        Without damping the EE is an undamped double integrator -- PGS
+        contact impulses launch it meters across the scene, which both
+        wrecks the collected force -> motion statistics and makes the
+        planning problem unstable.
+        """
+        self._apply_action_advance(action)
         return self._observe()
 
     # ------------------------------------------------------------------ #

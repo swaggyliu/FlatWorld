@@ -16,7 +16,9 @@ Default scene still has **N = 6** bodies: 1 circular EE + 3 boxes + 2 balls
 EE sits at a **random rank** and the five objects are shuffled each reset.
 Weights are **shared across bodies** (like a CNN over pixels): one encoder /
 predictor / contact+xy readout, applied to every object. `N` is not baked into
-parameter shapes. There is **no full-state decoder**; CEM scores `xy_head`.
+parameter shapes. The shipped checkpoint is **318K parameters** (0.32M):
+encoder 89K, predictor 201K, pair head 25K, ground head 4K. There is **no
+full-state decoder**; CEM scores `xy_head`.
 
 ```
  per frame
@@ -213,13 +215,31 @@ Protocol (`eval_task.py`):
   `iterations=5`. The game uses a shorter CEM (`H=6`, `P=48`, `iters=2`)
   to hold 60 Hz.
 
+### World-model vs solver rollouts
+
+CEM imagines `population × iterations × horizon` trajectories. The world
+model does that **batched on GPU**; the engine must step each candidate
+serially (`stride=5` visual frames per model step). Timed on this box
+(RTX 5060 Ti, Warp CPU scene, N=6):
+
+| CEM size | physics frames / plan | world model | solver CEM | ratio |
+|----------|----------------------:|------------:|-----------:|------:|
+| eval `H=32 P=96 I=5` | 76 800 | **0.24 s** | ~303 s | **~1 300×** |
+| game `H=6 P=48 I=2` | 2 880 | **27 ms** | ~11 s | **~400×** |
+
+The game replans every `stride=5` frames at 60 Hz (**83 ms** budget).
+World-model CEM fits (27 ms). The same CEM on the solver would be ~11 s
+per plan — about **140×** over budget, so the prototype would drop to
+well under 1 Hz. Eval-sized solver CEM is ~5 min **per replan**, not per
+episode.
+
 Cost on residual-corrected `xy_head` (unchanged by the planner split):
 
 1. `|target − goal|` each step, plus `2 ×` that distance at the horizon.
-2. Reach: EE toward the contact face behind the target (push direction
-   frozen at episode start). After overshoot or a fast roll toward the
-   goal, the reach target is a bumper at the goal. Inside the 8 cm band
-   the executed force is zero.
+2. Reach: EE toward the contact face behind the target (from the current
+   pose vs goal). When the target rolls fast toward the goal, the reach
+   target is a bumper at the goal. Inside the 8 cm band the executed
+   force is zero.
 3. Action L2. Ensemble: mean cost + `uncert_cost ×` std (default 0.1).
 
 Imagined `xy` is residual-corrected against a **zero-action baseline**
@@ -235,11 +255,11 @@ seed 1000. The shipped model is trained on `learning/data/rollouts_500`
 
 | protocol  | success | mean final dist | mean settle |
 |-----------|---------|-----------------|-------------|
-| leftmost  | 46/50 = **92%** | 0.048 m | 166 |
-| rightmost | 46/50 = **92%** | 0.044 m | 200 |
+| leftmost  | 47/50 = **94%** | 0.049 m | 159 |
+| rightmost | 46/50 = **92%** | 0.046 m | 201 |
 | random    | 41/50 = **82%** | 0.074 m | 180 |
 
-JSON: `learning/results/task_eval_500_H32_{leftmost,rightmost,random}.json`.
+JSON: `learning/results/task_eval_500_nofreeze_H32_{leftmost,rightmost,random}.json`.
 Failed episodes write MP4s under `learning/results/replays/500_H32_{mode}/`.
 
 ## Pipeline

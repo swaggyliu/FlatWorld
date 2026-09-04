@@ -63,6 +63,7 @@ depracted/
 !docs/gallery/*.png
 !docs/game/*.png
 results/*
+paper/*
 
 # Local research notes — keep on disk, never commit
 learning/improvement.md
@@ -75,7 +76,6 @@ learning/checkpoints/*
 !learning/checkpoints/normalizer.json
 learning/results/*
 !learning/results/*.png
-!learning/results/*.json
 !learning/results/*.csv
 *.txt
 !requirements.txt

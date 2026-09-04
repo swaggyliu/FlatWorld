@@ -66,8 +66,8 @@ def main():
     session = GameSession(ckpt, device, full_ensemble=False)
     session.level_seed_base = 42
     help_lines = [
-        "gold = goal     red = one hit     spring/grip/size = loadout",
-        "click gold, then a spot     Shift = careful",
+        "gold = goal     red = obstacle",
+        "click gold, then a spot     faster + fewer pushes = more stars",
     ]
     shots = (("push.png", 1), ("bank.png", 3), ("gauntlet.png", 5))
     for name, level in shots:
@@ -83,8 +83,8 @@ def main():
                 session.level_target_idx, session.hazard_idx, session.level_goal,
                 session.trail, 0.0, push_idx=session.level_target_idx,
                 restitution=session.restitution, friction=session.friction)
-            draw_hud(session.status, help_lines, W, False,
-                     level=session.level, name=spec.name,
+            draw_hud(session.status, help_lines, W,
+                     level=session.level,
                      elapsed=0.0, total_score=0, pace=0, par=spec.par,
                      pushes=0, push_cap=spec.push_cap, hint=spec.hint)
             draw_equipment_panel(W, session.restitution, session.friction,

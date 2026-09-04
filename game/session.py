@@ -118,7 +118,7 @@ class GameSession:
         self.pushes = 0
         self.last_stars = 0
         self.task.env.set_force((0.0, 0.0))
-        self.status = f"LEVEL {self.level}  ·  {spec.name}"
+        self.status = f"LEVEL {self.level}"
 
     def apply_equipment(self):
         """Write the current spring / tread / scale sliders onto the spirit."""
@@ -192,9 +192,7 @@ class GameSession:
             self.status = "CLICK THE GOLD ONE FIRST"
             return
         ty = float(self.obs["obj_states"][self.push_idx, 1])
-        x_lo, x_hi = self.task._workspace_x(self.push_idx)
-        wx = float(np.clip(wx, x_lo, x_hi))
-        self.steer_goal = np.array([wx, ty], dtype=np.float32)
+        self.steer_goal = np.array([float(wx), ty], dtype=np.float32)
         self.task.target_idx = self.push_idx
         self.running = True
         self.pushes += 1
@@ -229,7 +227,7 @@ class GameSession:
                 peak = max(peak, float(np.hypot(cf[i][0], cf[i][1])))
         return peak
 
-    def _policy(self, cur, careful: bool) -> np.ndarray:
+    def _policy(self, cur) -> np.ndarray:
         task = self.task
         task.target_idx = int(self.push_idx)
         goal = self.steer_goal
@@ -241,11 +239,9 @@ class GameSession:
             self.status = "READY  (click next object or spot)"
             return np.zeros(2, dtype=np.float32)
         a = task.plan_action(cur, goal)
-        if careful:
-            a = a * 0.55
         return np.asarray(a, dtype=np.float32)
 
-    def tick(self, careful: bool = False):
+    def tick(self):
         if self.obs is None:
             return
         self.trail.append((float(self.obs["obj_states"][0, 0]),
@@ -300,7 +296,7 @@ class GameSession:
             return
 
         if self.stride_left <= 0:
-            self.action = self._policy(cur, careful)
+            self.action = self._policy(cur)
             self.stride_left = self.task.stride
         self.stride_left -= 1
         self.obs = self.task.env.step(self.action)

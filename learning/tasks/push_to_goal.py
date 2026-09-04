@@ -86,11 +86,10 @@ class PushToGoalCost:
     """Decoded-xy cost for PushToGoal.
 
     Distance to goal plus a contact-face / catch-bumper term.
-    Push face is the original behind-the-target side (sign frozen at
-    episode start). After the target overshoots or is rolling toward
-    the goal, the face switches to a world-fixed bumper at the goal
-    instead of the far side of the ball (that side is usually jammed
-    against the pile).
+    Push face is the behind-the-target side from the current pose.
+    When the target is rolling fast toward the goal, the face switches
+    to a world-fixed bumper at the goal instead of the far side of the
+    ball (that side is usually jammed against the pile).
     """
 
     def __init__(self, action_cost: float = 0.0005, reach_cost: float = 0.35,
@@ -165,8 +164,12 @@ class PushToGoalTask:
                  ee_scale: float = 1.0, **_ignore):
         self.cfg = cfg
         self.env = PushSceneEnv(cfg)
-        self.models = list(model) if isinstance(model, (list, tuple)) else [model]
-        self.model = self.models[0] if self.models else None
+        if model is None:
+            self.models = []
+            self.model = None
+        else:
+            self.models = list(model) if isinstance(model, (list, tuple)) else [model]
+            self.model = self.models[0] if self.models else None
         self.device = device
         tc = getattr(cfg, "task", None)
         self.tol = float(tc.tol if tol is None and tc is not None else (tol if tol is not None else 0.08))
@@ -176,17 +179,26 @@ class PushToGoalTask:
         self.target_mode = target_mode
         self.ee_scale = float(ee_scale)
         pk = dict(planner_kwargs or {})
+        self.use_solver_cem = bool(pk.pop("use_solver_cem", False))
+        self.exec_horizon = int(pk.pop("exec_horizon", 1))
         cost_kw = {k: pk.pop(k) for k in _COST_KEYS if k in pk}
-        if "tactile_residual" not in pk:
-            pk["tactile_residual"] = bool(
-                getattr(self.models[0], "tactile_residual", False))
         self.cost = PushToGoalCost(device=device, **cost_kw)
         self.cost.tol = self.tol
-        self.planner = CEMPlanner(self.models, norm, device=device,
-                                  force_max=cfg.collect.force_max, **pk)
+        if self.use_solver_cem:
+            from learning.solver_planner import SolverCEMPlanner
+            self.models = []
+            self.model = None
+            self.planner = SolverCEMPlanner(
+                self.env, stride=stride,
+                force_max=cfg.collect.force_max, **pk)
+        else:
+            if "tactile_residual" not in pk:
+                pk["tactile_residual"] = bool(
+                    getattr(self.models[0], "tactile_residual", False))
+            self.planner = CEMPlanner(self.models, norm, device=device,
+                                      force_max=cfg.collect.force_max, **pk)
         self.target_idx = None
         self.ee_idx = 0
-        self.push_sign = 1.0
 
     def _geom(self) -> np.ndarray:
         if getattr(self.env, "obj_geom", None) is not None:
@@ -311,8 +323,8 @@ class PushToGoalTask:
             cur["obj_geom"] = self._geom()
         return cur
 
-    def plan_action(self, cur, goal) -> np.ndarray:
-        """CEM first action for ``cur`` → ``goal``."""
+    def _plan(self, cur, goal):
+        """Bind cost and run CEM. Solver CEM returns ``(H, 2)``; latent returns ``(2,)``."""
         if "obj_geom" not in cur:
             cur = dict(cur)
             cur["obj_geom"] = self._geom()
@@ -321,26 +333,35 @@ class PushToGoalTask:
             return np.zeros(2, dtype=np.float32)
         tgt = st[self.target_idx]
         d_pos = float(np.linalg.norm(tgt[:2] - goal[:2]))
-        speed = float(np.linalg.norm(tgt[3:5]))
-        along = float(tgt[3]) * float(self.push_sign)
-        past = (float(tgt[0]) - float(goal[0])) * float(self.push_sign) > 0.0
-        catch = past or (along > 0.12 and d_pos < 0.22)
+        sign = 1.0 if float(goal[0]) >= float(tgt[0]) else -1.0
+        along = float(tgt[3]) * sign
+        catch = along > 0.12 and d_pos < 0.22
         if d_pos < self.tol:
             return np.zeros(2, dtype=np.float32)
-        z0 = self.planner.encode_obs(cur)
         geom = self._geom()
         old_settle = self.cost.settle_w
         if catch and self.cost.settle_w <= 0:
             self.cost.settle_w = 3.0
         self.cost.bind(
             goal, st, geom, self.ee_idx, self.target_idx,
-            min_gap=float(self.cfg.scene.min_gap),
-            push_sign=self.push_sign, catch=catch)
+            min_gap=float(self.cfg.scene.min_gap), catch=catch)
+        if self.use_solver_cem:
+            seq = self.planner.plan_sequence(self.cost)
+            self.cost.settle_w = old_settle
+            return seq
+        z0 = self.planner.encode_obs(cur)
         action = self.planner.plan(
             z0, geom=geom, states_now=st, cost=self.cost)
-        self.cost.settle_w = old_settle
         self.planner.remember_first_step(z0, action, geom)
+        self.cost.settle_w = old_settle
         return action
+
+    def plan_action(self, cur, goal) -> np.ndarray:
+        """CEM first action for ``cur`` → ``goal``."""
+        out = self._plan(cur, goal)
+        if isinstance(out, np.ndarray) and out.ndim == 2:
+            return out[0]
+        return out
 
     def _plan_action(self, cur, goal):
         return self.plan_action(cur, goal)
@@ -352,7 +373,6 @@ class PushToGoalTask:
         self.target_idx = self._pick_target(obs, rng)
         goal = self._sample_goal(rng, obs, self.target_idx)
         target_pos = obs["obj_states"][self.target_idx, :2]
-        self.push_sign = 1.0 if float(goal[0]) >= float(target_pos[0]) else -1.0
         self.planner.reset()
         init_dist = float(np.linalg.norm(target_pos - goal))
 
@@ -373,8 +393,27 @@ class PushToGoalTask:
                 settle_frame = t
                 self.env.set_force((0.0, 0.0))
                 break
-            action = self.plan_action(cur, goal)
-            obs, t = self._hold(action, t, frames)
+            planned = self._plan(cur, goal)
+            if (self.use_solver_cem and self.exec_horizon > 1
+                    and isinstance(planned, np.ndarray) and planned.ndim == 2):
+                n_exec = min(self.exec_horizon, len(planned))
+                for j in range(n_exec):
+                    if t >= self.budget:
+                        break
+                    obs, t = self._hold(planned[j], t, frames)
+                    cur = self._observe()
+                    target_pos = cur["obj_states"][self.target_idx, :2]
+                    final_dist = float(np.linalg.norm(target_pos - goal))
+                    if self._succeeded(cur["obj_states"], goal):
+                        success = True
+                        settle_frame = t
+                        self.env.set_force((0.0, 0.0))
+                        break
+                if success:
+                    break
+            else:
+                action = planned[0] if getattr(planned, "ndim", 1) == 2 else planned
+                obs, t = self._hold(action, t, frames)
 
         result = {
             "success": bool(success),

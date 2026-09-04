@@ -13,10 +13,9 @@ In-game:
     click gold     choose the body to push
     click empty    push it toward that x
     sliders        bounce / grip / size (0.5x–2.0x)
-    Shift          careful (weaker force)
     R / Space      retry this stage (keeps loadout)
     N              skip (no score) and apply the next stage's suggested loadout
-    Esc            back to the start screen
+    Esc            quit
 """
 
 from __future__ import annotations
@@ -128,8 +127,7 @@ def main():
             continue
 
         if rl.is_key_pressed(rl.KEY_ESCAPE):
-            page = "menu"
-            continue
+            break
         if rl.is_key_pressed(rl.KEY_R) or rl.is_key_pressed(rl.KEY_SPACE):
             session.reset()
         if rl.is_key_pressed(rl.KEY_N):
@@ -163,8 +161,7 @@ def main():
             wx, wy = cam.to_world(mx, my)
             if wy > -0.05:
                 session.handle_click(wx, wy)
-        careful = rl.is_key_down(rl.KEY_LEFT_SHIFT)
-        session.tick(careful=careful)
+        session.tick()
 
         obs = session.obs
         rl.begin_drawing()
@@ -178,12 +175,12 @@ def main():
                    force=session.action if session.running else None)
         spec = session.spec
         help_lines = [
-            "gold = goal     red = one hit     spring/grip/size = loadout",
-            "click gold, then a spot     Shift = careful     faster + fewer pushes = more stars",
-            "R / Space = retry     N = skip (no score)     Esc = menu",
+            "gold = goal     red = obstacle",
+            "click gold, then a spot     faster + fewer pushes = more stars",
+            "R / Space = retry     N = skip (no score)     Esc = quit",
         ]
-        draw_hud(session.status, help_lines, args.width, careful,
-                 level=session.level, name=spec.name,
+        draw_hud(session.status, help_lines, args.width,
+                 level=session.level,
                  elapsed=session.elapsed, total_score=session.display_score(),
                  pace=session.pace_score(), par=spec.par,
                  pushes=session.pushes, push_cap=spec.push_cap,

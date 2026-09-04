@@ -62,7 +62,7 @@ LEVELS = (
     ),
     LevelSpec(
         name="Gauntlet",
-        hint="Red sits in the lane. Shift = careful. Don't touch it.",
+        hint="Red sits in the lane. Don't touch it.",
         xs=(0.26, 1.18, 1.62, 1.90, 0.68, 2.10),
         target=1, hazard=4, goal_x=1.48,
         par=20.0, push_cap=4,
@@ -101,7 +101,7 @@ _FLAVORS = (
     dict(
         tag="Lane", kind="any",
         bounce=(0.10, 0.20), grip=(0.50, 0.70), scale=(0.75, 1.00),
-        hint="Red sits in the lane. Shift = careful.",
+        hint="Red sits in the lane. Don't touch it.",
     ),
 )
 

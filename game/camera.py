@@ -25,3 +25,8 @@ class Camera:
 
     def px(self, metres: float) -> float:
         return metres * self.scale
+
+    def visible_x(self) -> tuple[float, float]:
+        """World-x at the left and right edges of the window."""
+        return ((0.0 - self.ox) / self.scale,
+                (self.width - self.ox) / self.scale)

@@ -169,12 +169,25 @@ def _box(cam: Camera, x, y, th, hw, hh, fill, outline=None):
         rl.draw_rectangle_pro(rec2, origin2, deg, outline)
 
 
-def _circle(cam: Camera, x, y, r, fill, core=None):
+def _tint(color, toward, t: float):
+    return rl.color_lerp(color, toward, max(0.0, min(1.0, t)))
+
+
+def _circle(cam: Camera, x, y, r, fill, th: float = 0.0, core=None):
+    """Ball with rotating wedges so spin is visible."""
     c = cam.to_screen(x, y)
     pr = cam.px(r)
-    rl.draw_circle_v(c, pr, fill)
+    deg = -math.degrees(th)
+    dark = _tint(fill, rl.Color(28, 22, 32, 255), 0.28)
+    pale = _tint(fill, rl.Color(255, 250, 240, 255), 0.22)
+    segs = max(10, int(pr * 0.45))
+    step = 60.0
+    for i in range(6):
+        col = pale if i % 2 == 0 else dark
+        rl.draw_circle_sector(c, pr, deg + i * step, deg + (i + 1) * step,
+                              segs, col)
     if core is not None:
-        rl.draw_circle_v(c, pr * 0.35, core)
+        rl.draw_circle_v(c, pr * 0.28, core)
 
 
 def draw_spring_along(ax, ay, bx, by, coils: int, amp: float,
@@ -471,13 +484,13 @@ def draw_scene(cam: Camera, states: np.ndarray, types, geom: np.ndarray,
                restitution: float = 0.15, friction: float = 0.5,
                force=None):
     rl.draw_rectangle(0, int(cam.oy), cam.width, cam.height - int(cam.oy), GROUND)
-    for gx in np.arange(0.0, 2.2, 0.2):
+    x0, x1 = cam.visible_x()
+    for gx in np.arange(math.floor(x0 / 0.2) * 0.2, x1 + 0.2, 0.2):
         a = cam.to_screen(gx, 0.0)
         b = cam.to_screen(gx, 0.55)
         rl.draw_line_ex(a, b, 1.0, GRID)
-    g0 = cam.to_screen(0.0, 0.0)
-    g1 = cam.to_screen(2.15, 0.0)
-    rl.draw_line_ex(g0, g1, 4.0, GROUND_LINE)
+    rl.draw_line_ex(rl.Vector2(0.0, cam.oy),
+                    rl.Vector2(float(cam.width), cam.oy), 4.0, GROUND_LINE)
 
     if trail:
         for i in range(1, len(trail)):
@@ -525,9 +538,10 @@ def draw_scene(cam: Camera, states: np.ndarray, types, geom: np.ndarray,
                 _hazard_mark(cam, x, y, hw, hh)
         else:
             fill = HAZARD if i == hazard_idx else (TARGET if i == target_idx else BALL)
-            _circle(cam, x, y, hw, fill)
+            _circle(cam, x, y, hw, fill, th)
             if i == target_idx:
-                rl.draw_poly(cam.to_screen(x, y), 4, cam.px(0.025), 45.0,
+                rl.draw_poly(cam.to_screen(x, y), 4, cam.px(0.025),
+                             -math.degrees(th) + 45.0,
                              rl.Color(40, 30, 10, 220))
             if i == hazard_idx:
                 _hazard_mark(cam, x, y, hw, hh)
@@ -542,16 +556,16 @@ def draw_scene(cam: Camera, states: np.ndarray, types, geom: np.ndarray,
 
 
 def draw_hud(status: str, lines: list[str],
-             width: int, careful: bool, level: int = 1, name: str = "",
+             width: int, level: int = 1,
              elapsed: float = 0.0, total_score: int = 0, pace: int = 0,
              par: float = 0.0, pushes: int = 0, push_cap: int = 3,
              best: float | None = None, stars: int = 0, hint: str = ""):
     panel = rl.Rectangle(16, 12, 500, 168)
     rl.draw_rectangle_rounded(panel, 0.12, 6, PANEL)
     if level <= CAMPAIGN_LEN:
-        title = f"Spirit Push   ·   {level}/{CAMPAIGN_LEN}  {name}"
+        title = f"Spirit Push   ·   {level}/{CAMPAIGN_LEN}"
     else:
-        title = f"Spirit Push   ·   {level}  {name}"
+        title = f"Spirit Push   ·   {level}"
     text(title, 28, 20, 18, TEXT)
     text(f"TIME  {elapsed:5.1f}s", 28, 48, 16, TEXT)
     text(f"PAR {par:.0f}s", 188, 48, 16, MUTED)
@@ -565,8 +579,6 @@ def draw_hud(status: str, lines: list[str],
         rl.draw_poly(rl.Vector2(400 + i * 22, 80), 5, 8, -90, col)
     col = rl.GOLD if "WIN" in status else (HAZARD if "LOSE" in status else TEXT)
     text(status, 28, 98, 16, col)
-    if careful:
-        text("CAREFUL", 400, 98, 16, TARGET)
     if hint:
         text(hint, 28, 122, 14, MUTED)
     y = 192

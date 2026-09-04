@@ -149,6 +149,23 @@ def save_traj_npz(path: str, episodes: list[Episode]) -> None:
 def _task_from_summary(summary: dict, device: str):
     from learning.tasks.push_to_goal import PushToGoalTask, load_ensemble
 
+    cfg = Config()
+    if summary.get("planner") == "solver_cem":
+        pk = dict(
+            use_solver_cem=True,
+            horizon=int(summary.get("horizon") or 16),
+            population=int(summary.get("population") or 12),
+            iterations=int(summary.get("iterations") or 2),
+            seed=int(summary.get("seed") or 1000),
+            exec_horizon=int(summary.get("exec_horizon") or 4),
+        )
+        return PushToGoalTask(
+            cfg, None, None, device="cpu",
+            budget=summary.get("budget"),
+            stride=int(summary.get("stride") or 5),
+            target_mode=summary.get("mode") or summary.get("target_mode") or "leftmost",
+            planner_kwargs=pk)
+
     ckpt = summary.get("checkpoint") or "learning/checkpoints"
     model, norm, stride = load_ensemble(ckpt, device)
     cem = summary.get("cem") or {}
@@ -162,7 +179,6 @@ def _task_from_summary(summary: dict, device: str):
     ab = summary.get("cost_ablate") or {}
     if ab.get("reach") is False:
         pk["reach_cost"] = 0.0
-    cfg = Config()
     return PushToGoalTask(
         cfg, model, norm, device=device,
         tol=summary.get("tol"), vel_tol=summary.get("vel_tol"),
