@@ -62,6 +62,10 @@ depracted/
 *.png
 !docs/gallery/*.png
 !docs/game/*.png
+!docs/statelewm_inference.png
+!docs/statelewm_inference.svg
+!docs/statelewm_worldmodel.png
+!docs/statelewm_worldmodel.svg
 results/*
 paper/*
 

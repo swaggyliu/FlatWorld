@@ -5,6 +5,14 @@ the FlatWorld physics engine. No vision: the model consumes structured
 physical states and the end-effector's variable-length contact set, and
 predicts **per-object** latent dynamics for model-predictive control.
 
+<p align="center">
+  <img src="../docs/statelewm_worldmodel.png" width="920" alt="StateLeWM one-step world model: current frame to predicted next frame" />
+</p>
+
+<p align="center">
+  <img src="../docs/statelewm_inference.png" width="920" alt="StateLeWM inference: observe, encode, latent, CEM imagination, act in FlatWorld" />
+</p>
+
 Actions are **not** produced by the network. The world model answers
 "what happens if I apply this force"; a CEM planner (or the collection
 policy) supplies `(Fx, Fy)` on the end-effector.
@@ -19,6 +27,9 @@ predictor / contact+xy readout, applied to every object. `N` is not baked into
 parameter shapes. The shipped checkpoint is **318K parameters** (0.32M):
 encoder 89K, predictor 201K, pair head 25K, ground head 4K. There is **no
 full-state decoder**; CEM scores `xy_head`.
+
+The network is a **one-step predictor**: encode the current frame, apply a
+force on the EE, read out the next `xy`. Repeat that step to unroll a horizon.
 
 ```
  per frame

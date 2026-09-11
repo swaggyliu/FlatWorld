@@ -65,9 +65,3 @@ class SpringMassDomain(DomainBase):
         aabb[0, :] = np.min(self.coords, axis=0)
         aabb[1, :] = np.max(self.coords, axis=0)
         return aabb
-
-    def getBBoxKernel3D(self):
-        aabb = np.zeros((2, 3), dtype=np.float32)
-        aabb[0, :] = np.min(self.coords, axis=0)
-        aabb[1, :] = np.max(self.coords, axis=0)
-        return aabb

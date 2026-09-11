@@ -1,5 +1,4 @@
 import warp as wp
-from gjk import gjk_epa_collision
 
 
 # ===== 2D SAT helpers (explicit coordinates) =====
@@ -140,54 +139,64 @@ def obb2d_signed_distance_quad_vs_quad(
 
 
 @wp.func
+def _obb2d_corners(center: wp.vec2, half: wp.vec2, rot: wp.mat22):
+    ax = wp.vec2(rot[0, 0], rot[1, 0]) * half[0]
+    ay = wp.vec2(rot[0, 1], rot[1, 1]) * half[1]
+    a0 = center - ax - ay
+    a1 = center + ax - ay
+    a2 = center + ax + ay
+    a3 = center - ax + ay
+    return a0, a1, a2, a3
+
+
+@wp.func
+def _quad_support(a0: wp.vec2, a1: wp.vec2, a2: wp.vec2, a3: wp.vec2, direction: wp.vec2):
+    best = a0
+    best_d = wp.dot(a0, direction)
+    d1 = wp.dot(a1, direction)
+    if d1 > best_d:
+        best = a1
+        best_d = d1
+    d2 = wp.dot(a2, direction)
+    if d2 > best_d:
+        best = a2
+        best_d = d2
+    d3 = wp.dot(a3, direction)
+    if d3 > best_d:
+        best = a3
+    return best
+
+
+@wp.func
 def obb2d_contact_quad_vs_quad(
     center_a: wp.vec2, half_ext_a: wp.vec2, rot_a: wp.mat22, center_b: wp.vec2, half_ext_b: wp.vec2, rot_b: wp.mat22
 ):
-    """Resolve penetrating 2D OBB-OBB contact (depth, normal, point on mid-surface)."""
+    """Resolve penetrating 2D OBB-OBB contact via SAT (depth, normal A→B, midpoint)."""
+    a0, a1, a2, a3 = _obb2d_corners(center_a, half_ext_a, rot_a)
+    b0, b1, b2, b3 = _obb2d_corners(center_b, half_ext_b, rot_b)
+    signed, n_axis = obb2d_signed_distance_quad_vs_quad(a0, a1, a2, a3, b0, b1, b2, b3)
     hit = int(0)
     penetration = float(0.0)
-    normal = wp.vec2(1.0, 0.0)
+    normal = n_axis
     cpoint = (center_a + center_b) * 0.5
-
-    params_a = wp.vec4(half_ext_a[0], half_ext_a[1], 0.0, 0.0)
-    params_b = wp.vec4(half_ext_b[0], half_ext_b[1], 0.0, 0.0)
-    center_a3 = wp.vec3(center_a[0], center_a[1], 0.0)
-    center_b3 = wp.vec3(center_b[0], center_b[1], 0.0)
-    rot_a3 = wp.mat33(
-        rot_a[0, 0], rot_a[0, 1], 0.0, rot_a[1, 0], rot_a[1, 1], 0.0, 0.0, 0.0, 1.0
-    )
-    rot_b3 = wp.mat33(
-        rot_b[0, 0], rot_b[0, 1], 0.0, rot_b[1, 0], rot_b[1, 1], 0.0, 0.0, 0.0, 1.0
-    )
-
-    has_collision, penetration_depth, contact_normal, contact_point_a, contact_point_b = gjk_epa_collision(
-        0,
-        center_a3,
-        params_a,
-        rot_a3,
-        0,
-        center_b3,
-        params_b,
-        rot_b3,
-        2,
-    )
-    if has_collision == 1:
+    if signed < 0.0:
         hit = 1
-        n2 = wp.vec2(contact_normal[0], contact_normal[1])
-        n2_len = wp.length(n2)
-        if n2_len > 1e-9:
-            normal = n2 / n2_len
+        nlen = wp.length(n_axis)
+        if nlen > 1e-9:
+            normal = n_axis / nlen
         else:
             diff = center_b - center_a
-            diff_len = wp.length(diff)
-            if diff_len > 1e-9:
-                normal = diff / diff_len
+            dlen = wp.length(diff)
+            if dlen > 1e-9:
+                normal = diff / dlen
             else:
                 normal = wp.vec2(1.0, 0.0)
-        penetration = -penetration_depth
-        cpoint = (
-            wp.vec2(contact_point_a[0], contact_point_a[1]) + wp.vec2(contact_point_b[0], contact_point_b[1])
-        ) * 0.5
+        penetration = signed
+        if wp.dot(center_b - center_a, normal) < 0.0:
+            normal = -normal
+        sa = _quad_support(a0, a1, a2, a3, normal)
+        sb = _quad_support(b0, b1, b2, b3, -normal)
+        cpoint = (sa + sb) * 0.5
     return hit, penetration, normal, cpoint
 
 
@@ -438,148 +447,3 @@ def obb2d_signed_distance_quad_vs_circle(
         signed = -best_pen
 
     return signed, n_axis
-
-
-# ===== 3D OBB vs OBB SAT =====
-@wp.func
-def obb3d_signed_distance(centerA: wp.vec3, extentsA: wp.vec3, quatA: wp.vec4, centerB: wp.vec3, extentsB: wp.vec3, quatB: wp.vec4):
-    """
-    SAT-based OBB vs OBB collision detection for 3D.
-    Returns: (signed_distance, normal)
-    - signed_distance > 0: separated
-    - signed_distance < 0: penetrating (negative penetration depth)
-    - normal: points from A to B
-    """
-    heA = 0.5 * extentsA
-    heB = 0.5 * extentsB
-    a0, a1, a2 = obb_axes_from_quat(quatA)
-    b0, b1, b2 = obb_axes_from_quat(quatB)
-
-    best_sep = float(-1e9)
-    best_sep_axis = wp.vec3(1.0, 0.0, 0.0)
-    best_pen = float(1e9)
-    best_pen_axis = wp.vec3(1.0, 0.0, 0.0)
-    found_separating = int(0)
-
-    # 3 face normals of A
-    for i in range(3):
-        axis = a0 if i == 0 else (a1 if i == 1 else a2)
-        sep, pen, ax, side = _eval_axis_obb_vs_obb(centerA, heA, a0, a1, a2, centerB, heB, b0, b1, b2, axis)
-        if sep > 0.0:
-            found_separating = 1
-            if sep > best_sep:
-                best_sep = sep
-                best_sep_axis = ax if side >= 0 else -ax
-        elif pen < best_pen:
-            best_pen = pen
-            best_pen_axis = ax
-
-    # 3 face normals of B
-    for i in range(3):
-        axis = b0 if i == 0 else (b1 if i == 1 else b2)
-        sep, pen, ax, side = _eval_axis_obb_vs_obb(centerA, heA, a0, a1, a2, centerB, heB, b0, b1, b2, axis)
-        if sep > 0.0:
-            found_separating = 1
-            if sep > best_sep:
-                best_sep = sep
-                best_sep_axis = ax if side >= 0 else -ax
-        elif pen < best_pen:
-            best_pen = pen
-            best_pen_axis = ax
-
-    # 9 cross-product axes (edge-edge)
-    for i in range(3):
-        ai = a0 if i == 0 else (a1 if i == 1 else a2)
-        for j in range(3):
-            bj = b0 if j == 0 else (b1 if j == 1 else b2)
-            axis = wp.cross(ai, bj)
-            # Skip degenerate edge-edge cases (parallel edges)
-            if wp.length(axis) > 1e-6:
-                sep, pen, ax, side = _eval_axis_obb_vs_obb(
-                    centerA, heA, a0, a1, a2, centerB, heB, b0, b1, b2, axis
-                )
-                if sep > 0.0:
-                    found_separating = 1
-                    if sep > best_sep:
-                        best_sep = sep
-                        best_sep_axis = ax if side >= 0 else -ax
-                elif pen < best_pen:
-                    best_pen = pen
-                    best_pen_axis = ax
-
-    signed = float(0.0)
-    n_axis = wp.vec3(1.0, 0.0, 0.0)
-
-    if found_separating:
-        # Boxes are separated
-        n_axis = best_sep_axis
-        if wp.dot(centerA - centerB, n_axis) < 0.0:
-            n_axis = -n_axis
-        signed = best_sep
-    else:
-        # Boxes are penetrating, use minimum penetration axis
-        n_axis = best_pen_axis
-        if wp.dot(centerA - centerB, n_axis) < 0.0:
-            n_axis = -n_axis
-        signed = -best_pen
-
-    return signed, n_axis
-
-
-@wp.func
-def _eval_axis_obb_vs_obb(
-    centerA: wp.vec3,
-    heA: wp.vec3,
-    a0: wp.vec3,
-    a1: wp.vec3,
-    a2: wp.vec3,
-    centerB: wp.vec3,
-    heB: wp.vec3,
-    b0: wp.vec3,
-    b1: wp.vec3,
-    b2: wp.vec3,
-    axis: wp.vec3,
-):
-    """
-    Evaluate separation/penetration along a given axis for OBB vs OBB.
-    Returns: (separation, penetration, normalized_axis, side)
-    """
-    ax = axis
-    ln = wp.length(ax)
-
-    # Initialize return values
-    sep = float(0.0)
-    pen = float(0.0)
-    side = int(0)
-
-    # Handle degenerate axis case
-    is_degenerate = int(0)
-    if ln < 1e-12:
-        is_degenerate = 1
-        ax = wp.vec3(1.0, 0.0, 0.0)
-    else:
-        ax = ax / ln
-
-    if is_degenerate == 0:
-        amin, amax = sat_project_obb_on_axis(centerA, heA, a0, a1, a2, ax)
-        bmin, bmax = sat_project_obb_on_axis(centerB, heB, b0, b1, b2, ax)
-
-        # Check for separation
-        d1 = amin - bmax  # A's min beyond B's max
-        d2 = bmin - amax  # B's min beyond A's max
-
-        if d1 > 0.0:
-            # Separated: A is on positive side
-            sep = d1
-            side = +1
-        elif d2 > 0.0:
-            # Separated: B is on positive side
-            sep = d2
-            side = -1
-        else:
-            # Overlapping: compute penetration depth
-            pen_pos = bmax - amin  # penetration if pushed along +axis
-            pen_neg = amax - bmin  # penetration if pushed along -axis
-            pen = wp.min(pen_pos, pen_neg)
-
-    return sep, pen, ax, side

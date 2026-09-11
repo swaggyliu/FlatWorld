@@ -66,6 +66,14 @@ for PushToGoal. **318K** parameters. Current numbers (50 episodes, CEM H=32): le
 **94%**, rightmost **92%**, random **82%**. Shipped weights:
 `learning/checkpoints/best.pt`.
 
+<p align="center">
+  <img src="docs/statelewm_worldmodel.png" width="920" alt="StateLeWM one-step world model: current frame to predicted next frame" />
+</p>
+
+<p align="center">
+  <img src="docs/statelewm_inference.png" width="920" alt="StateLeWM inference: observe, encode, latent, CEM imagination, act in FlatWorld" />
+</p>
+
 ## Spirit Push
 
 A raylib prototype that uses the world model as a **spirit**: you click
@@ -205,6 +213,14 @@ pytest test2D -q
 完整说明（架构、损失、评测）：**[learning/README.md](learning/README.md)**。
 
 [`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。模型 **31.8 万参数**。当前成功率（50 局，CEM H=32）：最左 **94%** / 最右 **92%**，随机 **82%**。默认权重：`learning/checkpoints/best.pt`。
+
+<p align="center">
+  <img src="docs/statelewm_worldmodel.png" width="920" alt="StateLeWM 一步预测：当前帧到下一帧" />
+</p>
+
+<p align="center">
+  <img src="docs/statelewm_inference.png" width="920" alt="StateLeWM 推理：观察、编码、潜变量、CEM 想象、在 FlatWorld 执行" />
+</p>
 
 ## Spirit Push 游戏
 

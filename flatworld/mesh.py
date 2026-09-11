@@ -30,12 +30,8 @@ class Mesh:
             self.numBoundNodes = self.numNodes
             self.boundaryNodes = np.array([i for i in range(self.numNodes)])
         else:
-            if d == 2:
-                self.numNodePerEl = 3
-                self.massWeights = 1 / 3
-            else:
-                self.numNodePerEl = 4
-                self.massWeights = 1 / 4
+            self.numNodePerEl = 3
+            self.massWeights = 1 / 3
 
             self.boundaryElements = np.array(self.getBoundaryEdges_(conns))
             self.numBoundElements = self.boundaryElements.shape[0]
@@ -53,7 +49,7 @@ class Mesh:
     def getBoundaryEdges_(self, conns):
         """Return a list of edges that appear only once in connectivity (boundary edges)."""
         edge_count = defaultdict(int)
-        n_vertices = self.d + 1  # 2D: 3, 3D: 4
+        n_vertices = 3  # linear triangle
 
         for cell in conns:
             for i in range(n_vertices):
