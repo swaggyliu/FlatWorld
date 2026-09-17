@@ -52,7 +52,7 @@ def create_gui_if_available(title, res=(720, 720), background_color=0x112F41):
 
 
 def create_window_if_available(title, size=(720, 720)):
-    """3D window helper — maps to Viewer for Warp."""
+    """2D window helper — maps to Viewer for Warp."""
     return create_gui_if_available(title, res=size)
 
 

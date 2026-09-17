@@ -24,10 +24,8 @@ class RigidBase:
         self.mesh = None
         self.initial_quat = None
         # rotational inertia in body frame. For 2D this is a scalar (around z),
-        # for 3D this is a 3x3 inertia matrix stored as a numpy array.
         self.inertia_body = None
-        # world-space inertia (scalar for 2D, 3x3 matrix for 3D)
-
+        # world-space inertia (scalar for 2D)
         # Transform for rendering/export (offset, scale, rotation)
         self.transform = None
 

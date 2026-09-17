@@ -19,42 +19,24 @@ class VoxelGridDomain(DomainBase):
         self.lb = np.asarray(lb, dtype=np.float32)
         self.ub = np.asarray(ub, dtype=np.float32)
 
-        if d == 2:
-            self.dx = (self.ub[0] - self.lb[0]) / max(self.nx, 1)
-            self.dz = (self.ub[1] - self.lb[1]) / max(self.ny, 1)
+        self.dx = (self.ub[0] - self.lb[0]) / max(self.nx, 1)
+        self.dz = (self.ub[1] - self.lb[1]) / max(self.ny, 1)
 
-            self.occ = np.zeros((self.nx, self.ny), dtype=np.int32)
-            self.max_edges = self.nx * self.ny * 4
-            self.edge_p0 = np.zeros((self.max_edges, 2), dtype=np.float32)
-            self.edge_p1 = np.zeros((self.max_edges, 2), dtype=np.float32)
-            self.edge_n = np.zeros((self.max_edges, 2), dtype=np.float32)
-            self.edge_count = 0
-        else:
-            assert nz is not None, "VoxelGridDomain(d=3) requires nz to be specified"
-            self.nz = int(nz)
-            self.dx = (self.ub[0] - self.lb[0]) / max(self.nx, 1)
-            self.dy = (self.ub[1] - self.lb[1]) / max(self.ny, 1)
-            self.dz = (self.ub[2] - self.lb[2]) / max(self.nz, 1)
-
-            self.occ = np.zeros((self.nx, self.ny, self.nz), dtype=np.int32)
-            self.max_faces = self.nx * self.ny * self.nz * 6
-            self.face_o = np.zeros((self.max_faces, 3), dtype=np.float32)
-            self.face_u = np.zeros((self.max_faces, 3), dtype=np.float32)
-            self.face_v = np.zeros((self.max_faces, 3), dtype=np.float32)
-            self.face_n = np.zeros((self.max_faces, 3), dtype=np.float32)
-            self.face_count = 0
+        self.occ = np.zeros((self.nx, self.ny), dtype=np.int32)
+        self.max_edges = self.nx * self.ny * 4
+        self.edge_p0 = np.zeros((self.max_edges, 2), dtype=np.float32)
+        self.edge_p1 = np.zeros((self.max_edges, 2), dtype=np.float32)
+        self.edge_n = np.zeros((self.max_edges, 2), dtype=np.float32)
+        self.edge_count = 0
 
         if occupancy_np is not None:
-            assert occupancy_np.shape == (self.nx, self.ny) or (
-                d == 3 and occupancy_np.shape == (self.nx, self.ny, self.nz)
-            )
+            assert occupancy_np.shape == (self.nx, self.ny)
             self.occ[:] = occupancy_np.astype(np.int32)
 
         self.nnodes = 1
         self.nelements = 0
 
-        if d == 2:
-            self.build_edges()
+        self.build_edges()
 
         self.category_bits = COLLISION_CATEGORY_GROUND
         self.collide_bits = COLLISION_MASK_ALL

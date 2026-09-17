@@ -26,7 +26,7 @@
 |------|------|
 | 语言 | Python 3 |
 | 计算后端 | NVIDIA Warp（GPU/CPU 并行内核） |
-| 依赖 | warp-lang, numpy, scipy, meshio, tetgen, pymeshlab, usd-core, pytest |
+| 依赖 | warp-lang, numpy, scipy, meshio, pytest |
 
 ### 1.2 目录结构
 

@@ -1,4 +1,7 @@
-"""2D contact-detection and geometry-contact tests (Warp)."""
+"""2D contact-detection and geometry-contact tests (Warp).
+
+PYTEST_DONT_REWRITE
+"""
 
 import os
 import sys

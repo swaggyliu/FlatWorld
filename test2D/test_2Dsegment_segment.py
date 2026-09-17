@@ -1,4 +1,7 @@
-"""2D segment-segment closest-point tests (Warp)."""
+"""2D segment-segment closest-point tests (Warp).
+
+PYTEST_DONT_REWRITE
+"""
 
 import math
 import os

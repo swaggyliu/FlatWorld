@@ -162,12 +162,6 @@ def getShapeFnsTri(psi: float, eta: float):
 
 
 @wp.func
-def getShapeFnsTet(psi: float, eta: float, gamma: float):
-    """Return linear tetrahedral shape functions evaluated at (psi,eta,gamma)."""
-    return wp.vec4(psi, eta, gamma, 1.0 - psi - eta - gamma)
-
-
-@wp.func
 def getBoundaryShapeFns(psi: float, eta: float):
     """Return 1D shape functions for a boundary edge parameter psi."""
     return wp.vec2(1.0 - psi, psi)
@@ -198,58 +192,4 @@ def getBMatrix2D(psi: float, eta: float, gamma: float, F: wp.mat22, J_inv: wp.ma
         BMat[1, 2 * i + 1] = dndx[i, 1] * F[1, 1]
         BMat[2, 2 * i] = dndx[i, 1] * F[0, 0] + dndx[i, 0] * F[0, 1]
         BMat[2, 2 * i + 1] = dndx[i, 0] * F[1, 1] + dndx[i, 1] * F[1, 0]
-    return BMat
-
-
-@wp.func
-def getJacobian3D(c1: wp.vec3, c2: wp.vec3, c3: wp.vec3, c4: wp.vec3, psi: float, eta: float, gamma: float):
-    """Compute the 3x3 Jacobian for tetrahedron i at param coords (psi,eta,gamma)."""
-    return wp.mat33(
-        c1[0] - c4[0],
-        c2[0] - c4[0],
-        c3[0] - c4[0],
-        c1[1] - c4[1],
-        c2[1] - c4[1],
-        c3[1] - c4[1],
-        c1[2] - c4[2],
-        c2[2] - c4[2],
-        c3[2] - c4[2],
-    )
-
-
-@wp.func
-def getWeights3D(jac: wp.mat33):
-    """Return tetrahedron volume weight = |det(J)| / 6."""
-    return wp.abs(wp.determinant(jac)) * (1.0 / 6.0)
-
-
-@wp.func
-def getBMatrix3D(psi: float, eta: float, gamma: float, F: wp.mat33, J_inv: wp.mat33):
-    """Assemble the 6x12 B-matrix for linear tetrahedral elasticity at param coords."""
-    shapeDparam = _Mat34(1.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 1.0, -1.0)
-    dndx = wp.transpose(shapeDparam) @ J_inv  # 4x3 matrix
-    BMat = _Mat6x12(0.0)
-    for i in range(4):
-        BMat[0, 3 * i] = dndx[i, 0] * F[0, 0]
-        BMat[0, 3 * i + 1] = dndx[i, 0] * F[1, 0]
-        BMat[0, 3 * i + 2] = dndx[i, 0] * F[2, 0]
-        BMat[1, 3 * i] = dndx[i, 1] * F[0, 1]
-        BMat[1, 3 * i + 1] = dndx[i, 1] * F[1, 1]
-        BMat[1, 3 * i + 2] = dndx[i, 1] * F[2, 1]
-        BMat[2, 3 * i] = dndx[i, 2] * F[0, 2]
-        BMat[2, 3 * i + 1] = dndx[i, 2] * F[1, 2]
-        BMat[2, 3 * i + 2] = dndx[i, 2] * F[2, 2]
-
-        BMat[3, 3 * i] = dndx[i, 1] * F[0, 0] + dndx[i, 0] * F[0, 1]
-        BMat[3, 3 * i + 1] = dndx[i, 0] * F[1, 1] + dndx[i, 1] * F[1, 0]
-        BMat[3, 3 * i + 2] = dndx[i, 1] * F[2, 0] + dndx[i, 0] * F[2, 1]
-
-        BMat[4, 3 * i] = dndx[i, 1] * F[0, 2] + dndx[i, 2] * F[0, 1]
-        BMat[4, 3 * i + 1] = dndx[i, 2] * F[1, 1] + dndx[i, 1] * F[1, 2]
-        BMat[4, 3 * i + 2] = dndx[i, 1] * F[2, 2] + dndx[i, 2] * F[2, 1]
-
-        BMat[5, 3 * i] = dndx[i, 2] * F[0, 0] + dndx[i, 0] * F[0, 2]
-        BMat[5, 3 * i + 1] = dndx[i, 2] * F[1, 0] + dndx[i, 0] * F[1, 2]
-        BMat[5, 3 * i + 2] = dndx[i, 0] * F[2, 2] + dndx[i, 2] * F[2, 0]
-
     return BMat

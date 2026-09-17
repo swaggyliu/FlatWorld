@@ -1,4 +1,7 @@
-"""2D SAT collision tests (Warp)."""
+"""2D SAT collision tests (Warp).
+
+PYTEST_DONT_REWRITE
+"""
 
 import os
 import sys

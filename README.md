@@ -5,15 +5,15 @@
 
 **English** | [中文](#flat-world-中文)
 
-Warp-accelerated 2D/3D physics engine with **explicit FEM**, **impulse-based rigid bodies**, and **batched mixed-domain contact** (analytical ground, height fields, voxel maps).
+Warp-accelerated **2D** physics engine with **explicit FEM**, **impulse-based rigid bodies**, and **mixed-domain contact** (analytical ground, height fields, voxel maps).
 
 ## Features
 
 - **FEM / soft bodies** — explicit dynamics, linear elastic / Neo-Hookean / J2 plasticity
-- **Rigid bodies** — ball, box, capsule, mesh; SAT / GJK; PGS constraints
-- **Ground types** — `GroundDomain` (plane), `HeightFieldDomain`, `VoxelGridDomain`
+- **Rigid bodies** — ball, box, capsule, mesh; 2D SAT; PGS impulses
+- **Ground types** — `GroundDomain` (plane), `HeightFieldDomain`, `VoxelGridDomain`; rigid and FEM contacts run as batched Warp kernels
 - **Joints** — revolute, weld, prismatic, spherical
-- **GPU batching** — unified FEM manager + `MixedContact` batched kernels
+- **GPU batching** — unified FEM / spring manager + `MixedContact` penalty kernels
 
 ## Quick start
 
@@ -42,17 +42,21 @@ for _ in range(60):
     looper.advanceWithTime(1.0 / 60.0)
 ```
 
+`.msh` / `.vtu` meshes go through `FEMesher` and need **meshio** (`pip install meshio`). The Spirit Push game needs **raylib**.
+
 ## Tests
 
 ```bash
 # Headless (recommended for CI)
-HEADLESS=1 pytest test2D -q
+set HEADLESS=1          # Windows
+export HEADLESS=1       # Linux / macOS
+pytest test2D -q
 
 # With GUI when a display is available
 pytest test2D/test_2Dfem_elastic.py
 ```
 
-50 pytest modules under `test2D/` cover FEM, rigid contact, joints, friction, and all ground types.
+51 pytest modules under `test2D/` cover FEM, rigid contact, joints, friction, and all ground types.
 
 ## Learning world models
 
@@ -138,9 +142,10 @@ Regenerate locally: `python scripts/capture_gallery.py`
 FlatWorld/
 ├── flatworld/          # Core engine
 │   ├── explicitloop.py # Main simulation loop
-│   ├── mixedcontact.py # Batched FEM/rigid/ground contact
+│   ├── mixedcontact.py # Batched FEM / spring / ground contact
 │   ├── femspringmanager.py
-│   └── rigidmanager.py
+│   ├── rigidmanager.py # Rigid SAT / PGS / batched ground contact
+│   └── sat.py          # 2D box–box SAT
 ├── learning/           # StateLeWM world model + PushToGoal CEM
 ├── game/               # raylib prototype (python -m game)
 ├── test2D/             # 2D examples & pytest suite
@@ -149,12 +154,13 @@ FlatWorld/
 
 ## Third-party dependencies
 
-| Package | License |
-|---------|---------|
-| [NVIDIA Warp](https://github.com/NVIDIA/warp) | Apache-2.0 |
-| numpy, scipy | BSD |
-| meshio | MIT |
-| tetgen, pymeshlab, usd-core | See respective projects |
+| Package | License | Used for |
+|---------|---------|----------|
+| [NVIDIA Warp](https://github.com/NVIDIA/warp) | Apache-2.0 | GPU/CPU kernels |
+| numpy | BSD | Arrays |
+| meshio | MIT | `.msh` / `.vtu` via `FEMesher` |
+| matplotlib | PSF | Viewer / plots |
+| [raylib](https://github.com/electronstudio/raylib-python-cffi) (optional) | zlib | `python -m game` |
 
 ## License
 
@@ -166,24 +172,26 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 # Flat World (中文)
 
-基于 **NVIDIA Warp** 的实时物理仿真引擎，支持刚体、有限元（FEM）、弹簧-质量系统，以及三种地面表示（解析平面、高度场、体素网格）。
+基于 **NVIDIA Warp** 的 **2D** 实时物理仿真引擎，支持刚体、有限元（FEM）、弹簧-质量系统，以及三种地面表示（解析平面、高度场、体素网格）。
 
 ## 功能概览
 
 | 模块 | 说明 |
 |------|------|
 | 有限元 | 显式动力学，线性弹性 / Neo-Hookean / J2 塑性 |
-| 刚体 | 球、盒、胶囊、网格；PGS 冲量求解 |
-| 地面 | `GroundDomain`、`HeightFieldDomain`、`VoxelGridDomain` |
-| 接触 | `mixedcontact.py` 批处理惩罚接触内核 |
+| 刚体 | 球、盒、胶囊、网格；2D SAT；PGS 冲量求解 |
+| 地面 | `GroundDomain`、`HeightFieldDomain`、`VoxelGridDomain`；刚体与 FEM 接触均为 batched Warp kernel |
+| 关节 | 转动、焊接、滑动、球铰 |
+| 接触 | `mixedcontact.py` FEM/弹簧惩罚接触；`rigidmanager.py` 刚体 PGS |
 
 ## 安装与运行
 
 ```bash
 pip install -r requirements.txt
 pip install -e .
-pytest test2D
 ```
+
+读 `.msh` / `.vtu` 需要 `meshio`；Spirit Push 游戏需要 `raylib`。
 
 无显示器环境（CI）请设置：
 
@@ -192,6 +200,8 @@ set HEADLESS=1          # Windows
 export HEADLESS=1       # Linux / macOS
 pytest test2D -q
 ```
+
+`test2D/` 下共 51 个 pytest 模块。
 
 ## 图库 Gallery
 
@@ -248,6 +258,7 @@ python -m game
 
 - [学习世界模型](learning/README.md)
 - [理论与实现](docs/THEORY_AND_IMPLEMENTATION.md)
+- [贡献指南](CONTRIBUTING.md)
 
 ## 开源协议
 

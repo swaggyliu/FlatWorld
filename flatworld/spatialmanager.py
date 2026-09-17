@@ -498,7 +498,7 @@ class SpatialHashManager:
     """Sort-based spatial hash for fast point-to-element queries.
 
     Args:
-        d: Spatial dimension (2 only; 3D expand path was never complete).
+        d: Spatial dimension (2D only).
         max_elements: Upper bound on boundary elements.
         max_cells: Upper bound on grid cells.
         max_elements_per_cell: Ignored (API compatibility).

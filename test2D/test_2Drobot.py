@@ -243,9 +243,9 @@ def test_robot(headless=False, kernel_profile=False):
     print("=" * 60)
     print(f"total：pass {passed_count} item，fail {failed_count} item")
     if failed_count == 0:
-        print("✅ 3DRobot simulation test completed(2Dversion) - All checks passed")
+        print("✅ 2DRobot simulation test completed - All checks passed")
     else:
-        assert False, f"⚠️  3DRobot simulation test completed（2D） - have {failed_count} Check failed"
+        assert False, f"⚠️  2DRobot simulation test completed - have {failed_count} Check failed"
 
 
 if __name__ == "__main__":

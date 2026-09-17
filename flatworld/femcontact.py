@@ -103,20 +103,13 @@ class ContactBase:
 
         k = slsfac * K * A_seg^2 / V_elem
 
-        With A_tri = L^2/2, V_tet = L^3/6:
+        With A_tri = L^2/2:
         - 2D:    A_edge=L, V_tri=L^2/2   =>  k = 2 * slsfac * K
         - Shell: A=L^2/2, V=A*t=L^2*t/2  =>  k = slsfac * K * L^2 / (2t)
-        - Solid: A=L^2/2, V=L^3/6        =>  k = 3/2 * slsfac * K * L
         """
         mat = dom.prop.mat
         K = ContactBase._bulk_modulus(mat)
-        L = dom.mesh.charAverageLength
-        if dom.d == 2:
-            # A_edge=L, V_tri=L^2/2 => A^2/V = 2
-            return 2.0 * slsfac * K
-        else:
-            # A=L^2/2, V=L^3/6 => A^2/V = 3L/2
-            return 1.5 * slsfac * K * L
+        return 2.0 * slsfac * K
 
     def calStableTime(self, penalty, femdomain):
         """Stable time step: dt = 0.9 * sqrt(m_min / k).
@@ -125,12 +118,8 @@ class ContactBase:
         """
         mat = femdomain.prop.mat
         L = femdomain.mesh.charLength
-        if femdomain.d == 2:
-            # 2D tri: area ~ L^2/2, 3 nodes
-            m_node = mat.rho * (L * L * 0.5) / 3.0
-        else:
-            # 3D tet: volume ~ L^3/6, 4 nodes
-            m_node = mat.rho * (L * L * L / 6.0) / 4.0
+        # 2D tri: area ~ L^2/2, 3 nodes
+        m_node = mat.rho * (L * L * 0.5) / 3.0
 
         stableTime = 0.9 * (m_node / penalty) ** 0.5
         print(

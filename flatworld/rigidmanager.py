@@ -277,6 +277,11 @@ RIGID_TYPE_BOX = 0b00010
 RIGID_TYPE_CAPSULE = 0b01000
 RIGID_TYPE_MESH = 0b10000
 
+GROUND_KIND_NONE = 0
+GROUND_KIND_PLANE = 1
+GROUND_KIND_HF = 2
+GROUND_KIND_VOXEL = 3
+
 CONTACT_BALLBALL = 0b00001
 CONTACT_BOXBALL = 0b00011
 CONTACT_CAPSULEBALL = 0b01001
@@ -1200,6 +1205,7 @@ def _detect_analytical_prim_contacts_wp(
     restitution_velocity_threshold: float,
     use_aabb_early_out: wp.array(dtype=int),
     groundprim_pairs_buffer: wp.array(dtype=wp.vec2i),
+    ground_kind: wp.array(dtype=int),
     rigidDomainIds: wp.array(dtype=wp.vec3i),
     rigidParams: wp.array(dtype=wp.vec2, ndim=2),
     radius: wp.array(dtype=float),
@@ -1233,6 +1239,8 @@ def _detect_analytical_prim_contacts_wp(
     for p in range(n_pairs):
         anal_idx = groundprim_pairs_buffer[p][0]
         rigid_idx = groundprim_pairs_buffer[p][1]
+        if ground_kind[anal_idx] != GROUND_KIND_PLANE:
+            continue
         planepoint = rigidParams[anal_idx, 0]
         normal = rigidParams[anal_idx, 1]
         anal_vel = V[anal_idx]
@@ -1309,7 +1317,7 @@ def _detect_analytical_prim_contacts_wp(
                             ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
                         )
             elif rtype == RIGID_TYPE_BOX:
-                # Check all 4 box vertices against the plane (same as host detectAnalaytical2Rigid).
+                # Check all 4 box vertices against the plane.
                 for vi in range(4):
                     pos = _get_box_vertex_func(rigid_idx, vi, rigidParams, cached_rotation_matrix)
                     d_v, _, _ = detectPointToAnalyticalPlane(pos, planepoint, normal)
@@ -1322,6 +1330,762 @@ def _detect_analytical_prim_contacts_wp(
                             ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
                             ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
                         )
+
+
+@wp.func
+def _nearest_on_curve_packed(
+    x: float,
+    z: float,
+    height: wp.array(dtype=float),
+    offset: int,
+    nx: int,
+    lb_x: float,
+    ub_x: float,
+    reverse: int,
+):
+    span = ub_x - lb_x
+    u = float(0.0)
+    if span > 1e-12:
+        u = (x - lb_x) / span
+    u = wp.clamp(u, 0.0, 1.0)
+    s = u * float(nx - 1)
+    i0 = int(wp.floor(s))
+    i1 = i0 + 1
+    if i0 < 0:
+        i0 = 0
+    if i1 >= nx:
+        i1 = nx - 1
+    t = s - float(i0)
+    h = height[offset + i0] + (height[offset + i1] - height[offset + i0]) * t
+    i_round = int(wp.round(s))
+    if i_round < 0:
+        i_round = 0
+    if i_round >= nx:
+        i_round = nx - 1
+    j0 = i_round - 1
+    j1 = i_round + 1
+    if j0 < 0:
+        j0 = 0
+    if j1 >= nx:
+        j1 = nx - 1
+    dx_world = span / float(nx - 1)
+    denom = dx_world * float(j1 - j0)
+    dhdx = float(0.0)
+    if denom > 1e-6:
+        dhdx = (height[offset + j1] - height[offset + j0]) / denom
+    nrm = wp.vec2(-dhdx, 1.0)
+    if reverse == 1:
+        nrm = -nrm
+    nlen = wp.length(nrm)
+    if nlen > 1e-12:
+        nrm = nrm / nlen
+    foot = wp.vec2(x, h)
+    signed = wp.dot(wp.vec2(x, z) - foot, nrm)
+    return foot, nrm, signed
+
+
+@wp.func
+def _hf_maxmin_height_range(
+    x_min: float,
+    x_max: float,
+    height: wp.array(dtype=float),
+    offset: int,
+    nx: int,
+    lb_x: float,
+    ub_x: float,
+):
+    span = ub_x - lb_x
+    x0 = wp.clamp(x_min, lb_x, ub_x)
+    x1 = wp.clamp(x_max, lb_x, ub_x)
+    u0 = float(0.0)
+    u1 = float(0.0)
+    if span > 1e-12:
+        u0 = (x0 - lb_x) / span
+        u1 = (x1 - lb_x) / span
+    i_min = int(wp.floor(u0 * float(nx - 1)))
+    i_max = int(wp.ceil(u1 * float(nx - 1)))
+    if i_min < 0:
+        i_min = 0
+    if i_max < 0:
+        i_max = 0
+    if i_min > nx - 1:
+        i_min = nx - 1
+    if i_max > nx - 1:
+        i_max = nx - 1
+    max_h = float(-1e9)
+    min_h = float(1e9)
+    for i in range(i_min, i_max + 1):
+        h = height[offset + i]
+        if h > max_h:
+            max_h = h
+        if h < min_h:
+            min_h = h
+    return max_h, min_h
+
+
+@wp.func
+def _emit_static_ground_contact(
+    rid: int,
+    cpoint: wp.vec2,
+    nrm: wp.vec2,
+    depth: float,
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    _cache_ground_contact_func(
+        rid,
+        cpoint,
+        nrm,
+        wp.vec2(0.0, 0.0),
+        depth,
+        max_ground_contacts,
+        restitution_velocity_threshold,
+        rigidParams,
+        V,
+        RotV,
+        contactParams,
+        rigid_env_id,
+        num_ground_contacts,
+        ground_contact_rigid,
+        ground_contact_point,
+        ground_contact_normal,
+        ground_contact_vel,
+        ground_contact_depth,
+        ground_contact_bounce_vel,
+        ground_contact_tangent1,
+        ground_contact_env_count,
+        ground_contact_env_idx,
+        max_envs_alloc,
+        max_gc_per_env,
+    )
+
+
+@wp.func
+def _hf_emit_from_point(
+    rigid_idx: int,
+    p: wp.vec2,
+    radius: float,
+    slot: int,
+    hf_offset: wp.array(dtype=int),
+    hf_nx: wp.array(dtype=int),
+    hf_lb_x: wp.array(dtype=float),
+    hf_ub_x: wp.array(dtype=float),
+    hf_reverse: wp.array(dtype=int),
+    hf_height: wp.array(dtype=float),
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    _foot, nrm, signed = _nearest_on_curve_packed(
+        p[0],
+        p[1],
+        hf_height,
+        hf_offset[slot],
+        hf_nx[slot],
+        hf_lb_x[slot],
+        hf_ub_x[slot],
+        hf_reverse[slot],
+    )
+    if radius > 0.0:
+        if radius - signed > 0.0:
+            _emit_static_ground_contact(
+                rigid_idx, p - nrm * radius, nrm, signed - radius, max_ground_contacts,
+                restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                ground_contact_point, ground_contact_normal, ground_contact_vel,
+                ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+            )
+    else:
+        if signed < 0.0:
+            _emit_static_ground_contact(
+                rigid_idx, p, nrm, signed, max_ground_contacts,
+                restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                ground_contact_point, ground_contact_normal, ground_contact_vel,
+                ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+            )
+
+
+@wp.func
+def _closest_on_edge_2d(p: wp.vec2, a: wp.vec2, b: wp.vec2):
+    ab = b - a
+    ab2 = wp.dot(ab, ab) + 1e-12
+    t = wp.dot(p - a, ab) / ab2
+    return a + ab * t, t
+
+
+@wp.func
+def _voxel_sdf_2d(
+    p: wp.vec2,
+    occ: wp.array(dtype=int),
+    occ_off: int,
+    nx: int,
+    ny: int,
+    lb: wp.vec2,
+    dx: float,
+    dz: float,
+    edge_p0: wp.array(dtype=wp.vec2),
+    edge_p1: wp.array(dtype=wp.vec2),
+    edge_n: wp.array(dtype=wp.vec2),
+    edge_off: int,
+    edge_count: int,
+    limit_penetration: float,
+):
+    best_d = float(1e9)
+    best_n = wp.vec2(0.0, 1.0)
+    best_c = p
+    i = int(wp.floor((p[0] - lb[0]) / dx))
+    j = int(wp.floor((p[1] - lb[1]) / dz))
+    if i >= 0 and i < nx and j >= 0 and j < ny:
+        if occ[occ_off + i * ny + j] == 1:
+            dist_neg_x = float(1e9)
+            for step in range(nx):
+                idx = i - 1 - step
+                if idx < 0 or occ[occ_off + idx * ny + j] == 0:
+                    dist_neg_x = p[0] - (lb[0] + float(idx + 1) * dx)
+                    break
+            dist_pos_x = float(1e9)
+            for step in range(nx):
+                idx = i + 1 + step
+                if idx >= nx or occ[occ_off + idx * ny + j] == 0:
+                    dist_pos_x = (lb[0] + float(idx) * dx) - p[0]
+                    break
+            dist_neg_y = float(1e9)
+            for step in range(ny):
+                idx = j - 1 - step
+                if idx < 0 or occ[occ_off + i * ny + idx] == 0:
+                    dist_neg_y = p[1] - (lb[1] + float(idx + 1) * dz)
+                    break
+            dist_pos_y = float(1e9)
+            for step in range(ny):
+                idx = j + 1 + step
+                if idx >= ny or occ[occ_off + i * ny + idx] == 0:
+                    dist_pos_y = (lb[1] + float(idx) * dz) - p[1]
+                    break
+            min_v = dist_neg_x
+            min_face = 0
+            if dist_pos_x < min_v:
+                min_v = dist_pos_x
+                min_face = 1
+            if dist_neg_y < min_v:
+                min_v = dist_neg_y
+                min_face = 2
+            if dist_pos_y < min_v:
+                min_v = dist_pos_y
+                min_face = 3
+            if min_face == 0:
+                best_d = -dist_neg_x
+                best_n = wp.vec2(-1.0, 0.0)
+                best_c = wp.vec2(p[0] - dist_neg_x, p[1])
+            elif min_face == 1:
+                best_d = -dist_pos_x
+                best_n = wp.vec2(1.0, 0.0)
+                best_c = wp.vec2(p[0] + dist_pos_x, p[1])
+            elif min_face == 2:
+                best_d = -dist_neg_y
+                best_n = wp.vec2(0.0, -1.0)
+                best_c = wp.vec2(p[0], p[1] - dist_neg_y)
+            else:
+                best_d = -dist_pos_y
+                best_n = wp.vec2(0.0, 1.0)
+                best_c = wp.vec2(p[0], p[1] + dist_pos_y)
+        else:
+            lp = float(limit_penetration)
+            for eid in range(edge_count):
+                a = edge_p0[edge_off + eid]
+                b = edge_p1[edge_off + eid]
+                nrm = edge_n[edge_off + eid]
+                c, t = _closest_on_edge_2d(p, a, b)
+                d = wp.dot(p - c, nrm)
+                elen = wp.length(b - a)
+                if 0.1 * elen > lp:
+                    lp = 0.1 * elen
+                ad = d
+                if ad < 0.0:
+                    ad = -ad
+                if d < best_d and t >= 0.0 and t <= 1.0 and ad < lp:
+                    best_d = d
+                    best_n = nrm
+                    best_c = c
+    return best_d, best_n, best_c
+
+
+@wp.func
+def _voxel_emit_from_point(
+    rigid_idx: int,
+    p: wp.vec2,
+    limit_penetration: float,
+    slot: int,
+    vox_offset: wp.array(dtype=int),
+    vox_nx: wp.array(dtype=int),
+    vox_ny: wp.array(dtype=int),
+    vox_lb: wp.array(dtype=wp.vec2),
+    vox_dx: wp.array(dtype=float),
+    vox_dz: wp.array(dtype=float),
+    vox_occ: wp.array(dtype=int),
+    vox_edge_off: wp.array(dtype=int),
+    vox_edge_count: wp.array(dtype=int),
+    vox_edge_p0: wp.array(dtype=wp.vec2),
+    vox_edge_p1: wp.array(dtype=wp.vec2),
+    vox_edge_n: wp.array(dtype=wp.vec2),
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    d, nrm, c = _voxel_sdf_2d(
+        p,
+        vox_occ,
+        vox_offset[slot],
+        vox_nx[slot],
+        vox_ny[slot],
+        vox_lb[slot],
+        vox_dx[slot],
+        vox_dz[slot],
+        vox_edge_p0,
+        vox_edge_p1,
+        vox_edge_n,
+        vox_edge_off[slot],
+        vox_edge_count[slot],
+        limit_penetration,
+    )
+    if d < 0.0:
+        _emit_static_ground_contact(
+            rigid_idx, c, nrm, d, max_ground_contacts,
+            restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+
+
+@wp.kernel
+def _detect_hf_prim_contacts_wp(
+    num_groundprim_pairs: wp.array(dtype=int),
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    groundprim_pairs_buffer: wp.array(dtype=wp.vec2i),
+    ground_kind: wp.array(dtype=int),
+    ground_geom_slot: wp.array(dtype=int),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    radius: wp.array(dtype=float),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+    compound_count: wp.array(dtype=int),
+    compound_offset: wp.array(dtype=int),
+    compound_local_pos: wp.array(dtype=wp.vec2),
+    compound_radius: wp.array(dtype=float),
+    hf_offset: wp.array(dtype=int),
+    hf_nx: wp.array(dtype=int),
+    hf_lb_x: wp.array(dtype=float),
+    hf_ub_x: wp.array(dtype=float),
+    hf_reverse: wp.array(dtype=int),
+    hf_height: wp.array(dtype=float),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    tid = wp.tid()
+    n_pairs = num_groundprim_pairs[0]
+    if tid >= n_pairs:
+        return
+    anal_idx = groundprim_pairs_buffer[tid][0]
+    rigid_idx = groundprim_pairs_buffer[tid][1]
+    if ground_kind[anal_idx] != GROUND_KIND_HF:
+        return
+    slot = ground_geom_slot[anal_idx]
+    domain_idx = rigidDomainIds[rigid_idx][0]
+    bbox_min = aabb[domain_idx, 0]
+    bbox_max = aabb[domain_idx, 1]
+    max_h, min_h = _hf_maxmin_height_range(
+        bbox_min[0], bbox_max[0], hf_height, hf_offset[slot], hf_nx[slot], hf_lb_x[slot], hf_ub_x[slot]
+    )
+    if max_h + 0.05 < bbox_min[1]:
+        return
+    if hf_reverse[slot] == 1 and min_h > bbox_max[1]:
+        return
+
+    n_sub = compound_count[rigid_idx]
+    if n_sub > 0:
+        base = compound_offset[rigid_idx]
+        parent_center = rigidParams[rigid_idx, 0]
+        R = cached_rotation_matrix[rigid_idx]
+        for k in range(n_sub):
+            world_p = R @ compound_local_pos[base + k] + parent_center
+            _hf_emit_from_point(
+                rigid_idx, world_p, compound_radius[base + k], slot,
+                hf_offset, hf_nx, hf_lb_x, hf_ub_x, hf_reverse, hf_height,
+                max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                ground_contact_point, ground_contact_normal, ground_contact_vel,
+                ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+            )
+        return
+
+    rtype = rigidDomainIds[rigid_idx][1]
+    if rtype == RIGID_TYPE_BOX:
+        for vi in range(4):
+            pos = _get_box_vertex_func(rigid_idx, vi, rigidParams, cached_rotation_matrix)
+            _hf_emit_from_point(
+                rigid_idx, pos, 0.0, slot,
+                hf_offset, hf_nx, hf_lb_x, hf_ub_x, hf_reverse, hf_height,
+                max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                ground_contact_point, ground_contact_normal, ground_contact_vel,
+                ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+            )
+    elif rtype == RIGID_TYPE_BALL:
+        _hf_emit_from_point(
+            rigid_idx, rigidParams[rigid_idx, 0], radius[rigid_idx], slot,
+            hf_offset, hf_nx, hf_lb_x, hf_ub_x, hf_reverse, hf_height,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+    elif rtype == RIGID_TYPE_CAPSULE:
+        center = rigidParams[rigid_idx, 0]
+        lcdir = rigidParams[rigid_idx, 1]
+        lc = cached_rotation_matrix[rigid_idx] @ lcdir + center
+        uc = center * 2.0 - lc
+        r = radius[rigid_idx]
+        _hf_emit_from_point(
+            rigid_idx, lc, r, slot,
+            hf_offset, hf_nx, hf_lb_x, hf_ub_x, hf_reverse, hf_height,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+        _hf_emit_from_point(
+            rigid_idx, uc, r, slot,
+            hf_offset, hf_nx, hf_lb_x, hf_ub_x, hf_reverse, hf_height,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+
+
+@wp.kernel
+def _detect_hf_mesh_contacts_wp(
+    num_groundmesh_pairs: wp.array(dtype=int),
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    groundmesh_pairs_buffer: wp.array(dtype=wp.vec2i),
+    ground_kind: wp.array(dtype=int),
+    ground_geom_slot: wp.array(dtype=int),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+    rigid2MeshIndices: wp.array(dtype=int),
+    meshBoundaryNodeOffset: wp.array(dtype=int),
+    meshBoundaryNodeCount: wp.array(dtype=int),
+    meshBoundaryCoords: wp.array(dtype=wp.vec2),
+    hf_offset: wp.array(dtype=int),
+    hf_nx: wp.array(dtype=int),
+    hf_lb_x: wp.array(dtype=float),
+    hf_ub_x: wp.array(dtype=float),
+    hf_reverse: wp.array(dtype=int),
+    hf_height: wp.array(dtype=float),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    tid = wp.tid()
+    n_pairs = num_groundmesh_pairs[0]
+    if tid >= n_pairs:
+        return
+    anal_idx = groundmesh_pairs_buffer[tid][0]
+    rigid_idx = groundmesh_pairs_buffer[tid][1]
+    if ground_kind[anal_idx] != GROUND_KIND_HF:
+        return
+    slot = ground_geom_slot[anal_idx]
+    domain_idx = rigidDomainIds[rigid_idx][0]
+    bbox_min = aabb[domain_idx, 0]
+    bbox_max = aabb[domain_idx, 1]
+    max_h, min_h = _hf_maxmin_height_range(
+        bbox_min[0], bbox_max[0], hf_height, hf_offset[slot], hf_nx[slot], hf_lb_x[slot], hf_ub_x[slot]
+    )
+    if max_h + 0.05 < bbox_min[1]:
+        return
+    if hf_reverse[slot] == 1 and min_h > bbox_max[1]:
+        return
+    mesh_local = rigid2MeshIndices[rigid_idx]
+    if mesh_local < 0:
+        return
+    off = meshBoundaryNodeOffset[mesh_local]
+    nnodes = meshBoundaryNodeCount[mesh_local]
+    for nidx in range(nnodes):
+        _hf_emit_from_point(
+            rigid_idx, meshBoundaryCoords[off + nidx], 0.0, slot,
+            hf_offset, hf_nx, hf_lb_x, hf_ub_x, hf_reverse, hf_height,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+
+
+@wp.kernel
+def _detect_voxel_prim_contacts_wp(
+    num_groundprim_pairs: wp.array(dtype=int),
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    groundprim_pairs_buffer: wp.array(dtype=wp.vec2i),
+    ground_kind: wp.array(dtype=int),
+    ground_geom_slot: wp.array(dtype=int),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    radius: wp.array(dtype=float),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    cached_rotation_matrix: wp.array(dtype=wp.mat22),
+    vox_offset: wp.array(dtype=int),
+    vox_nx: wp.array(dtype=int),
+    vox_ny: wp.array(dtype=int),
+    vox_lb: wp.array(dtype=wp.vec2),
+    vox_dx: wp.array(dtype=float),
+    vox_dz: wp.array(dtype=float),
+    vox_occ: wp.array(dtype=int),
+    vox_edge_off: wp.array(dtype=int),
+    vox_edge_count: wp.array(dtype=int),
+    vox_edge_p0: wp.array(dtype=wp.vec2),
+    vox_edge_p1: wp.array(dtype=wp.vec2),
+    vox_edge_n: wp.array(dtype=wp.vec2),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    tid = wp.tid()
+    n_pairs = num_groundprim_pairs[0]
+    if tid >= n_pairs:
+        return
+    anal_idx = groundprim_pairs_buffer[tid][0]
+    rigid_idx = groundprim_pairs_buffer[tid][1]
+    if ground_kind[anal_idx] != GROUND_KIND_VOXEL:
+        return
+    slot = ground_geom_slot[anal_idx]
+    rtype = rigidDomainIds[rigid_idx][1]
+    if rtype == RIGID_TYPE_BOX:
+        for vi in range(4):
+            pos = _get_box_vertex_func(rigid_idx, vi, rigidParams, cached_rotation_matrix)
+            _voxel_emit_from_point(
+                rigid_idx, pos, 0.0, slot,
+                vox_offset, vox_nx, vox_ny, vox_lb, vox_dx, vox_dz, vox_occ,
+                vox_edge_off, vox_edge_count, vox_edge_p0, vox_edge_p1, vox_edge_n,
+                max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+                rigid_env_id, num_ground_contacts, ground_contact_rigid,
+                ground_contact_point, ground_contact_normal, ground_contact_vel,
+                ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+                ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+            )
+    elif rtype == RIGID_TYPE_BALL:
+        _voxel_emit_from_point(
+            rigid_idx, rigidParams[rigid_idx, 0], radius[rigid_idx], slot,
+            vox_offset, vox_nx, vox_ny, vox_lb, vox_dx, vox_dz, vox_occ,
+            vox_edge_off, vox_edge_count, vox_edge_p0, vox_edge_p1, vox_edge_n,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+    elif rtype == RIGID_TYPE_CAPSULE:
+        center = rigidParams[rigid_idx, 0]
+        lcdir = rigidParams[rigid_idx, 1]
+        lc = cached_rotation_matrix[rigid_idx] @ lcdir + center
+        uc = center * 2.0 - lc
+        r = radius[rigid_idx]
+        _voxel_emit_from_point(
+            rigid_idx, lc, r, slot,
+            vox_offset, vox_nx, vox_ny, vox_lb, vox_dx, vox_dz, vox_occ,
+            vox_edge_off, vox_edge_count, vox_edge_p0, vox_edge_p1, vox_edge_n,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+        _voxel_emit_from_point(
+            rigid_idx, uc, r, slot,
+            vox_offset, vox_nx, vox_ny, vox_lb, vox_dx, vox_dz, vox_occ,
+            vox_edge_off, vox_edge_count, vox_edge_p0, vox_edge_p1, vox_edge_n,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
+
+
+@wp.kernel
+def _detect_voxel_mesh_contacts_wp(
+    num_groundmesh_pairs: wp.array(dtype=int),
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    groundmesh_pairs_buffer: wp.array(dtype=wp.vec2i),
+    ground_kind: wp.array(dtype=int),
+    ground_geom_slot: wp.array(dtype=int),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+    rigid2MeshIndices: wp.array(dtype=int),
+    meshBoundaryNodeOffset: wp.array(dtype=int),
+    meshBoundaryNodeCount: wp.array(dtype=int),
+    meshBoundaryCoords: wp.array(dtype=wp.vec2),
+    vox_offset: wp.array(dtype=int),
+    vox_nx: wp.array(dtype=int),
+    vox_ny: wp.array(dtype=int),
+    vox_lb: wp.array(dtype=wp.vec2),
+    vox_dx: wp.array(dtype=float),
+    vox_dz: wp.array(dtype=float),
+    vox_occ: wp.array(dtype=int),
+    vox_edge_off: wp.array(dtype=int),
+    vox_edge_count: wp.array(dtype=int),
+    vox_edge_p0: wp.array(dtype=wp.vec2),
+    vox_edge_p1: wp.array(dtype=wp.vec2),
+    vox_edge_n: wp.array(dtype=wp.vec2),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    tid = wp.tid()
+    n_pairs = num_groundmesh_pairs[0]
+    if tid >= n_pairs:
+        return
+    anal_idx = groundmesh_pairs_buffer[tid][0]
+    rigid_idx = groundmesh_pairs_buffer[tid][1]
+    if ground_kind[anal_idx] != GROUND_KIND_VOXEL:
+        return
+    slot = ground_geom_slot[anal_idx]
+    mesh_local = rigid2MeshIndices[rigid_idx]
+    if mesh_local < 0:
+        return
+    domain_idx = rigidDomainIds[rigid_idx][0]
+    extent = aabb[domain_idx, 1] - aabb[domain_idx, 0]
+    extent_scale = 0.2 * wp.length(extent)
+    off = meshBoundaryNodeOffset[mesh_local]
+    nnodes = meshBoundaryNodeCount[mesh_local]
+    for nidx in range(nnodes):
+        _voxel_emit_from_point(
+            rigid_idx, meshBoundaryCoords[off + nidx], extent_scale, slot,
+            vox_offset, vox_nx, vox_ny, vox_lb, vox_dx, vox_dz, vox_occ,
+            vox_edge_off, vox_edge_count, vox_edge_p0, vox_edge_p1, vox_edge_n,
+            max_ground_contacts, restitution_velocity_threshold, rigidParams, V, RotV, contactParams,
+            rigid_env_id, num_ground_contacts, ground_contact_rigid,
+            ground_contact_point, ground_contact_normal, ground_contact_vel,
+            ground_contact_depth, ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx, max_envs_alloc, max_gc_per_env,
+        )
 
 
 @wp.func
@@ -1558,6 +2322,9 @@ class RigidManager:
         count_mesh_nodes = 0
         count_mesh_elems = 0
         count_compound_shapes = 0
+        count_hf_samples = 0
+        count_vox_occ = 0
+        count_vox_edges = 0
 
         for dom in domains:
             if dom.type == DomainType.RIGID:
@@ -1571,6 +2338,12 @@ class RigidManager:
                     count_compound_shapes += len(dom.collision_shapes)
             elif dom.type in [DomainType.ANALYTICAL, DomainType.HEIGHTFIELD, DomainType.VOXELMAP]:
                 count_anal += 1
+                if dom.type == DomainType.HEIGHTFIELD:
+                    count_hf_samples += int(dom.nx) * int(getattr(dom, "ny", 1))
+                elif dom.type == DomainType.VOXELMAP:
+                    ny = int(getattr(dom, "ny", 1))
+                    count_vox_occ += int(dom.nx) * ny
+                    count_vox_edges += int(getattr(dom, "edge_count", 0))
 
         # Dynamic allocation (count + buffer) - drastically reduces memory when few rigids/meshes are used
         num_joints = 0 if joints is None else len(joints)
@@ -1609,6 +2382,9 @@ class RigidManager:
         self._ground_use_aabb_early_out = wp.zeros(1, dtype=int)
         _assign_scalar(self._ground_use_aabb_early_out, 1)
         self.hasHeightFieldOrVoxel = False  # Set True if any HeightField/Voxel domains exist
+        self.hasHeightField = False
+        self.hasVoxel = False
+        self.hasAnalyticalPlane = False
 
         self.contact_erp = 0.2  # Baumgarte error reduction parameter for ground contacts
         # Rolling resistance (dimensionless C_rr). Coulomb friction alone cannot
@@ -1635,9 +2411,8 @@ class RigidManager:
 
             # Boundary node coordinates (world space and local)
             self.meshBoundaryCoords = wp.zeros(self.MAX_BOUNDARY_NODES, dtype=wp.vec2)
-            # Boundary element connectivity (edges for 2D, triangles for 3D)
+            # Boundary element connectivity (edges for 2D)
             # For 2D: each element has 2 node indices
-            # For 3D: each element has 3 node indices
             self.meshBoundaryElements = wp.zeros(self.MAX_BOUNDARY_ELEMENTS, dtype=wp.vec3i)
             # Cached per-element AABBs (updated once per substep)
             self.meshElemLB = wp.zeros(self.MAX_BOUNDARY_ELEMENTS, dtype=wp.vec2)
@@ -1768,7 +2543,7 @@ class RigidManager:
         self.U = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
         self.V = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
         self.accumulated_impulse = wp.zeros(self.MAX_NODES, dtype=wp.vec2)
-        # Rotation representation: 2D uses scalar angle, 3D uses quaternion
+        # Rotation representation: 2D uses scalar angle
         self.quat = wp.zeros(self.MAX_NODES, dtype=float)  # angle for 2D
         self.quat_initial = wp.zeros(self.MAX_NODES, dtype=float)  # initial orientation snapshot
         self.RotV = wp.zeros(self.MAX_NODES, dtype=float)
@@ -1814,6 +2589,30 @@ class RigidManager:
         self.num_mixed_pairs = wp.zeros(1, dtype=int)
         self.num_groundprim_pairs = wp.zeros(1, dtype=int)
         self.num_groundmesh_pairs = wp.zeros(1, dtype=int)
+
+        self.ground_kind = wp.zeros(self.MAX_NODES, dtype=int)
+        self.ground_geom_slot = wp.zeros(self.MAX_NODES, dtype=int)
+        self.MAX_HF_SAMPLES = max(count_hf_samples, 1)
+        self.MAX_VOX_OCC = max(count_vox_occ, 1)
+        self.MAX_VOX_EDGES = max(count_vox_edges, 1)
+        self.hf_offset = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.hf_nx = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.hf_lb_x = wp.zeros(self.MAX_ANAL, dtype=float)
+        self.hf_ub_x = wp.zeros(self.MAX_ANAL, dtype=float)
+        self.hf_reverse = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.hf_height = wp.zeros(self.MAX_HF_SAMPLES, dtype=float)
+        self.vox_offset = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.vox_nx = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.vox_ny = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.vox_lb = wp.zeros(self.MAX_ANAL, dtype=wp.vec2)
+        self.vox_dx = wp.zeros(self.MAX_ANAL, dtype=float)
+        self.vox_dz = wp.zeros(self.MAX_ANAL, dtype=float)
+        self.vox_occ = wp.zeros(self.MAX_VOX_OCC, dtype=int)
+        self.vox_edge_off = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.vox_edge_count = wp.zeros(self.MAX_ANAL, dtype=int)
+        self.vox_edge_p0 = wp.zeros(self.MAX_VOX_EDGES, dtype=wp.vec2)
+        self.vox_edge_p1 = wp.zeros(self.MAX_VOX_EDGES, dtype=wp.vec2)
+        self.vox_edge_n = wp.zeros(self.MAX_VOX_EDGES, dtype=wp.vec2)
 
         # ==== Contact Cache: Store detected contacts to avoid redundant detection in PGS iterations ====
         self.MAX_CONTACTS = max(self.MAX_NODES * 16, 10000)
@@ -2554,6 +3353,8 @@ class RigidManager:
                     self.numRigidGroundContact += 1
 
         # Process analytical domains (planes, heightfields, voxel maps)
+        hf_slots = []
+        vox_slots = []
         for i, domain in enumerate(domains):
             if (
                 domain.type == DomainType.ANALYTICAL
@@ -2582,11 +3383,110 @@ class RigidManager:
                 if domain.type == DomainType.ANALYTICAL:
                     _patch_array(self.rigidParams, (self.numRigids + self.numAnalytical, 0), domain.point)
                     _patch_array(self.rigidParams, (self.numRigids + self.numAnalytical, 1), domain.normal)
+                    _patch_array(self.ground_kind, anal_idx, GROUND_KIND_PLANE)
+                    self.hasAnalyticalPlane = True
                     if len(domain.bcs) > 0:
                         self.needUpdate = True
-                elif domain.type in (DomainType.HEIGHTFIELD, DomainType.VOXELMAP):
+                elif domain.type == DomainType.HEIGHTFIELD:
+                    self.hasHeightField = True
                     self.hasHeightFieldOrVoxel = True
+                    hf_slots.append((anal_idx, domain))
+                elif domain.type == DomainType.VOXELMAP:
+                    self.hasVoxel = True
+                    self.hasHeightFieldOrVoxel = True
+                    vox_slots.append((anal_idx, domain))
                 self.numAnalytical += 1
+
+        self._upload_hf_voxel_geometry(hf_slots, vox_slots)
+
+    def _upload_hf_voxel_geometry(self, hf_slots, vox_slots):
+        """Pack HeightField / Voxel samples into device buffers (once at init)."""
+        if hf_slots:
+            height_np = np.zeros(self.MAX_HF_SAMPLES, dtype=np.float32)
+            off_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            nx_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            lb_np = np.zeros(self.MAX_ANAL, dtype=np.float32)
+            ub_np = np.zeros(self.MAX_ANAL, dtype=np.float32)
+            rev_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            cursor = 0
+            kind_np = self.ground_kind.numpy()
+            slot_np = self.ground_geom_slot.numpy()
+            for slot, (anal_idx, domain) in enumerate(hf_slots):
+                h = np.asarray(domain.height, dtype=np.float32).reshape(-1)
+                n = int(h.shape[0])
+                height_np[cursor : cursor + n] = h
+                off_np[slot] = cursor
+                nx_np[slot] = int(domain.nx)
+                lb_np[slot] = float(domain.lb[0])
+                ub_np[slot] = float(domain.ub[0])
+                rev_np[slot] = 1 if domain.reverse else 0
+                kind_np[anal_idx] = GROUND_KIND_HF
+                slot_np[anal_idx] = slot
+                cursor += n
+            self.hf_height.assign(height_np)
+            self.hf_offset.assign(off_np)
+            self.hf_nx.assign(nx_np)
+            self.hf_lb_x.assign(lb_np)
+            self.hf_ub_x.assign(ub_np)
+            self.hf_reverse.assign(rev_np)
+            self.ground_kind.assign(kind_np)
+            self.ground_geom_slot.assign(slot_np)
+
+        if vox_slots:
+            occ_np = np.zeros(self.MAX_VOX_OCC, dtype=np.int32)
+            p0_np = np.zeros((self.MAX_VOX_EDGES, 2), dtype=np.float32)
+            p1_np = np.zeros((self.MAX_VOX_EDGES, 2), dtype=np.float32)
+            n_np = np.zeros((self.MAX_VOX_EDGES, 2), dtype=np.float32)
+            off_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            nx_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            ny_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            lb_np = np.zeros((self.MAX_ANAL, 2), dtype=np.float32)
+            dx_np = np.zeros(self.MAX_ANAL, dtype=np.float32)
+            dz_np = np.zeros(self.MAX_ANAL, dtype=np.float32)
+            eoff_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            ecnt_np = np.zeros(self.MAX_ANAL, dtype=np.int32)
+            occ_cursor = 0
+            edge_cursor = 0
+            kind_np = self.ground_kind.numpy()
+            slot_np = self.ground_geom_slot.numpy()
+            for slot, (anal_idx, domain) in enumerate(vox_slots):
+                occ = np.asarray(domain.occ, dtype=np.int32)
+                nx = int(domain.nx)
+                ny = int(domain.ny)
+                flat = occ.reshape(-1)
+                n_occ = int(flat.shape[0])
+                occ_np[occ_cursor : occ_cursor + n_occ] = flat
+                off_np[slot] = occ_cursor
+                nx_np[slot] = nx
+                ny_np[slot] = ny
+                lb_np[slot] = (float(domain.lb[0]), float(domain.lb[1]))
+                dx_np[slot] = float(domain.dx)
+                dz_np[slot] = float(domain.dz)
+                occ_cursor += n_occ
+                ec = int(domain.edge_count)
+                if ec > 0:
+                    p0_np[edge_cursor : edge_cursor + ec] = domain.edge_p0[:ec]
+                    p1_np[edge_cursor : edge_cursor + ec] = domain.edge_p1[:ec]
+                    n_np[edge_cursor : edge_cursor + ec] = domain.edge_n[:ec]
+                eoff_np[slot] = edge_cursor
+                ecnt_np[slot] = ec
+                edge_cursor += ec
+                kind_np[anal_idx] = GROUND_KIND_VOXEL
+                slot_np[anal_idx] = slot
+            self.vox_occ.assign(occ_np)
+            self.vox_edge_p0.assign(p0_np)
+            self.vox_edge_p1.assign(p1_np)
+            self.vox_edge_n.assign(n_np)
+            self.vox_offset.assign(off_np)
+            self.vox_nx.assign(nx_np)
+            self.vox_ny.assign(ny_np)
+            self.vox_lb.assign(lb_np)
+            self.vox_dx.assign(dx_np)
+            self.vox_dz.assign(dz_np)
+            self.vox_edge_off.assign(eoff_np)
+            self.vox_edge_count.assign(ecnt_np)
+            self.ground_kind.assign(kind_np)
+            self.ground_geom_slot.assign(slot_np)
 
 
     def processJoints(self, joints):
@@ -2719,6 +3619,7 @@ class RigidManager:
                 float(self.restitution_velocity_threshold),
                 self._ground_use_aabb_early_out,
                 self.groundprim_pairs_buffer,
+                self.ground_kind,
                 self.rigidDomainIds,
                 self.rigidParams,
                 self.radius,
@@ -3003,64 +3904,176 @@ class RigidManager:
     # ----------------------------------------------------------------------------------
 
     def detectRigidGroundContact(self):
-        """Run analytical-vs-rigid and analytical-vs-mesh contact detectors.
-
-        OPTIMIZATION: Analytical plane contacts use kernelized dispatch.
-        HeightField/Voxel contacts require Python loops (wp.template() args),
-        but are skipped entirely when hasHeightFieldOrVoxel is False.
-
-        When heightfield/voxel domains exist, we must NOT run the blanket
-        analytical-plane kernel for ALL groundprim pairs, because it would
-        treat heightfield/voxel domains as flat planes and generate incorrect
-        duplicate contacts.  Instead, we dispatch each pair to the correct
-        handler in the Python loop.
-        """
-        if not self.hasHeightFieldOrVoxel:
-            self.detect_analyticalprim_contacts_kernel()
-            if self.numMeshRigidInContact > 0:
+        """Detect rigid contacts against planes, heightfields, and voxel maps (Warp kernels)."""
+        self.detect_analyticalprim_contacts_kernel()
+        if self.hasHeightField:
+            self._detect_hf_prim_kernel()
+        if self.hasVoxel:
+            self._detect_voxel_prim_kernel()
+        if self.numMeshRigidInContact > 0:
+            if self.hasAnalyticalPlane:
                 self.detect_analyticalmesh_contacts_kernel()
-            return
+            if self.hasHeightField:
+                self._detect_hf_mesh_kernel()
+            if self.hasVoxel:
+                self._detect_voxel_mesh_kernel()
 
-        # ── Slow path: mix of analytical planes, heightfields, and voxelmaps ──
-        # Primitive rigids vs ground domains
-        n_gp = int(self.num_groundprim_pairs.numpy()[0])
-        if n_gp > 0:
-            gp_pairs = self.groundprim_pairs_buffer.numpy()
-            domain_ids = self.rigidDomainIds.numpy()
-            for i in range(n_gp):
-                rigid_i, rigid_j = int(gp_pairs[i][0]), int(gp_pairs[i][1])  # rigid_i : ground, rigid_j : rigid
-                anlDomain = self.domains[int(domain_ids[rigid_i][0])]
-                if anlDomain.type == DomainType.HEIGHTFIELD and anlDomain.considerContact:
-                    self.detectHeightField2Rigids_(rigid_j, anlDomain)
-                elif anlDomain.type == DomainType.VOXELMAP and anlDomain.considerContact:
-                    self.detectVoxel2Rigids_(rigid_j, anlDomain)
-                elif anlDomain.considerContact:
-                    # True analytical plane — single-pair kernel dispatch
-                    self._detect_single_analyticalprim_kernel(int(rigid_i), int(rigid_j))
+    def _ground_cache_inputs(self):
+        return [
+            int(self.MAX_GROUND_CONTACTS),
+            float(self.restitution_velocity_threshold),
+        ]
 
-        # Mesh rigids vs ground domains
-        n_gm = int(self.num_groundmesh_pairs.numpy()[0])
-        if n_gm > 0:
-            gm_pairs = self.groundmesh_pairs_buffer.numpy()
-            domain_ids = self.rigidDomainIds.numpy()
-            for i in range(n_gm):
-                rigid_i, rigid_j = int(gm_pairs[i][0]), int(gm_pairs[i][1])  # rigid_i : ground, rigid_j : rigid
-                anlDomain = self.domains[int(domain_ids[rigid_i][0])]
-                if anlDomain.type == DomainType.HEIGHTFIELD and anlDomain.considerContact:
-                    self.detectHeightField2MeshContacts_(rigid_j, anlDomain)
-                elif anlDomain.type == DomainType.VOXELMAP and anlDomain.considerContact:
-                    self.detectVoxel2MeshContacts_(rigid_j, anlDomain)
-                elif anlDomain.considerContact:
-                    # True analytical plane — single-pair kernel dispatch
-                    self._detect_single_analyticalmesh_kernel(int(rigid_i), int(rigid_j))
+    def _ground_cache_arrays(self):
+        return [
+            self.num_ground_contacts,
+            self.ground_contact_rigid,
+            self.ground_contact_point,
+            self.ground_contact_normal,
+            self.ground_contact_vel,
+            self.ground_contact_depth,
+            self.ground_contact_bounce_vel,
+            self.ground_contact_tangent1,
+            self.ground_contact_env_count,
+            self.ground_contact_env_idx,
+            int(self.MAX_ENVS_ALLOC),
+            int(self.MAX_GC_PER_ENV),
+        ]
 
-    def _detect_single_analyticalprim_kernel(self, analIdx: int, rigidIdx: int):
-        """Dispatch a single analytical-plane vs primitive-rigid contact check."""
-        self.detectAnalaytical2Rigid(analIdx, rigidIdx)
+    def _detect_hf_prim_kernel(self):
+        wp.launch(
+            _detect_hf_prim_contacts_wp,
+            dim=self.MAX_GROUND_PAIRS,
+            inputs=[
+                self.num_groundprim_pairs,
+                *self._ground_cache_inputs(),
+                self.groundprim_pairs_buffer,
+                self.ground_kind,
+                self.ground_geom_slot,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.radius,
+                self.V,
+                self.RotV,
+                self.contactParams,
+                self.rigid_env_id,
+                self.cached_rotation_matrix,
+                self.aabb,
+                self.compound_count,
+                self.compound_offset,
+                self.compound_local_pos,
+                self.compound_radius,
+                self.hf_offset,
+                self.hf_nx,
+                self.hf_lb_x,
+                self.hf_ub_x,
+                self.hf_reverse,
+                self.hf_height,
+                *self._ground_cache_arrays(),
+            ],
+        )
 
-    def _detect_single_analyticalmesh_kernel(self, analIdx: int, rigidIdx: int):
-        """Dispatch a single analytical-plane vs mesh-rigid contact check."""
-        self.detectAnalytical2MeshPair(analIdx, rigidIdx)
+    def _detect_hf_mesh_kernel(self):
+        wp.launch(
+            _detect_hf_mesh_contacts_wp,
+            dim=self.MAX_GROUND_PAIRS,
+            inputs=[
+                self.num_groundmesh_pairs,
+                *self._ground_cache_inputs(),
+                self.groundmesh_pairs_buffer,
+                self.ground_kind,
+                self.ground_geom_slot,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.V,
+                self.RotV,
+                self.contactParams,
+                self.rigid_env_id,
+                self.aabb,
+                self.rigid2MeshIndices,
+                self.meshBoundaryNodeOffset,
+                self.meshBoundaryNodeCount,
+                self.meshBoundaryCoords,
+                self.hf_offset,
+                self.hf_nx,
+                self.hf_lb_x,
+                self.hf_ub_x,
+                self.hf_reverse,
+                self.hf_height,
+                *self._ground_cache_arrays(),
+            ],
+        )
+
+    def _detect_voxel_prim_kernel(self):
+        wp.launch(
+            _detect_voxel_prim_contacts_wp,
+            dim=self.MAX_GROUND_PAIRS,
+            inputs=[
+                self.num_groundprim_pairs,
+                *self._ground_cache_inputs(),
+                self.groundprim_pairs_buffer,
+                self.ground_kind,
+                self.ground_geom_slot,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.radius,
+                self.V,
+                self.RotV,
+                self.contactParams,
+                self.rigid_env_id,
+                self.cached_rotation_matrix,
+                self.vox_offset,
+                self.vox_nx,
+                self.vox_ny,
+                self.vox_lb,
+                self.vox_dx,
+                self.vox_dz,
+                self.vox_occ,
+                self.vox_edge_off,
+                self.vox_edge_count,
+                self.vox_edge_p0,
+                self.vox_edge_p1,
+                self.vox_edge_n,
+                *self._ground_cache_arrays(),
+            ],
+        )
+
+    def _detect_voxel_mesh_kernel(self):
+        wp.launch(
+            _detect_voxel_mesh_contacts_wp,
+            dim=self.MAX_GROUND_PAIRS,
+            inputs=[
+                self.num_groundmesh_pairs,
+                *self._ground_cache_inputs(),
+                self.groundmesh_pairs_buffer,
+                self.ground_kind,
+                self.ground_geom_slot,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.V,
+                self.RotV,
+                self.contactParams,
+                self.rigid_env_id,
+                self.aabb,
+                self.rigid2MeshIndices,
+                self.meshBoundaryNodeOffset,
+                self.meshBoundaryNodeCount,
+                self.meshBoundaryCoords,
+                self.vox_offset,
+                self.vox_nx,
+                self.vox_ny,
+                self.vox_lb,
+                self.vox_dx,
+                self.vox_dz,
+                self.vox_occ,
+                self.vox_edge_off,
+                self.vox_edge_count,
+                self.vox_edge_p0,
+                self.vox_edge_p1,
+                self.vox_edge_n,
+                *self._ground_cache_arrays(),
+            ],
+        )
 
     def detect_analyticalmesh_contacts_kernel(self):
         """Detect analytical-plane vs mesh-rigid contacts, parallelized over ground-mesh pairs.
@@ -3073,93 +4086,13 @@ class RigidManager:
         if n <= 0:
             return
         pairs = self.groundmesh_pairs_buffer.numpy()
+        kind = self.ground_kind.numpy() if self.hasHeightFieldOrVoxel else None
         for i in range(n):
             analIdx = int(pairs[i][0])
             rigidIdx = int(pairs[i][1])
+            if kind is not None and int(kind[analIdx]) != GROUND_KIND_PLANE:
+                continue
             self.detectAnalytical2MeshPair(analIdx, rigidIdx)
-
-    def detectAnalaytical2Rigid(self, analIdx, rigidIdx):
-        """Detect and resolve collisions between analytical plane and rigids."""
-        params = self.rigidParams.numpy()
-        V = self.V.numpy()
-        domain_ids = self.rigidDomainIds.numpy()
-        aabb = self.aabb.numpy()
-        radius_np = self.radius.numpy()
-        rot = self.cached_rotation_matrix.numpy()
-        compound_count = self.compound_count.numpy()
-        compound_offset = self.compound_offset.numpy()
-        compound_local_pos = self.compound_local_pos.numpy()
-        compound_radius = self.compound_radius.numpy()
-
-        planepoint = params[analIdx, 0]
-        normal = params[analIdx, 1]
-        anal_vel = V[analIdx]
-
-        contact_margin = 0.0005
-        run_narrow_phase = True
-
-        if int(self._ground_use_aabb_early_out.numpy()[0]) == 1:
-            domain_idx = int(domain_ids[rigidIdx][0])
-            bbox_min = aabb[domain_idx, 0]
-            bbox_max = aabb[domain_idx, 1]
-
-            support_point = np.zeros(self.d, dtype=np.float32)
-            for dim in range(self.d):
-                support_point[dim] = bbox_max[dim] if normal[dim] < 0 else bbox_min[dim]
-
-            min_dist = float(np.dot(support_point - planepoint, normal))
-            run_narrow_phase = min_dist <= contact_margin
-
-        if run_narrow_phase:
-            n_sub = int(compound_count[rigidIdx])
-            if n_sub > 0:
-                base = int(compound_offset[rigidIdx])
-                parent_center = params[rigidIdx, 0]
-                R = rot[rigidIdx]
-                for k in range(n_sub):
-                    idx = base + k
-                    local_p = compound_local_pos[idx]
-                    r_sub = float(compound_radius[idx])
-                    world_p = R @ local_p + parent_center
-                    d_sub, _, _ = detectPointToAnalyticalPlane(world_p, planepoint, normal)
-                    if d_sub < r_sub + contact_margin:
-                        cpoint = world_p - normal * r_sub
-                        depth = d_sub - r_sub
-                        self.cacheGroundContact(rigidIdx, cpoint, normal, anal_vel, depth)
-            else:
-                type = int(domain_ids[rigidIdx][1])
-
-                if type == RigidType.BOX:
-                    num_verts = 4
-                    for i in range(num_verts):
-                        pos = self.get_box_vertex(rigidIdx, i)
-                        d, _, _ = detectPointToAnalyticalPlane(pos, planepoint, normal)
-                        if d < contact_margin:
-                            self.cacheGroundContact(rigidIdx, pos, normal, anal_vel, d)
-
-                elif type == RigidType.BALL:
-                    center = params[rigidIdx, 0]
-                    radius = float(radius_np[rigidIdx])
-                    d, _, _ = detectPointToAnalyticalPlane(center, planepoint, normal)
-                    if d < radius + contact_margin:
-                        cpoint = center - normal * radius
-                        depth = d - radius
-                        self.cacheGroundContact(rigidIdx, cpoint, normal, anal_vel, depth)
-
-                elif type == RigidType.CAPSULE:
-                    center = params[rigidIdx, 0]
-                    lcdir = params[rigidIdx, 1]
-                    lc = rot[rigidIdx] @ lcdir + center
-                    uc = center * 2.0 - lc
-                    radius = float(radius_np[rigidIdx])
-
-                    for ep in range(2):
-                        test_p = lc if ep == 0 else uc
-                        d_ep, _, _ = detectPointToAnalyticalPlane(test_p, planepoint, normal)
-                        if d_ep < radius + contact_margin:
-                            cpoint = test_p - normal * radius
-                            depth = d_ep - radius
-                            self.cacheGroundContact(rigidIdx, cpoint, normal, anal_vel, depth)
 
     def detectAnalytical2MeshPair(self, analIdx, rigidIdx):
         """Detect representative boundary-node contacts between an analytical plane
@@ -3170,7 +4103,6 @@ class RigidManager:
         selects up to 5 representative contacts that span the contact patch:
           - 1 deepest penetrating node
           - 2 extreme nodes along first tangent direction (max / min t1)
-          - 2 extreme nodes along second tangent direction (max / min t2, 3D only)
         This matches the ~4-8 contacts that primitive box bodies generate.
         """
         params = self.rigidParams.numpy()
@@ -3243,170 +4175,6 @@ class RigidManager:
                         np.linalg.norm(min_t1_pos - max_t1_pos)
                     ) > sep:
                         self.cacheGroundContact(rigidIdx, min_t1_pos, normal, anal_vel, min_t1_d)
-
-
-    def detectHeightField2Rigids_(self, rigidIdx: int, hf):
-        """Detect and resolve collisions between a heightfield ground and rigids."""
-        if rigidIdx == -1:
-            return
-        j = int(rigidIdx)
-        domain_ids = self.rigidDomainIds.numpy()
-        aabb = self.aabb.numpy()
-        params = self.rigidParams.numpy()
-        radius_arr = self.radius.numpy()
-        rot = self.cached_rotation_matrix.numpy()
-        compound_count = self.compound_count.numpy()
-        compound_offset = self.compound_offset.numpy()
-        compound_local_pos = self.compound_local_pos.numpy()
-        compound_radius = self.compound_radius.numpy()
-
-        domain_idx = int(domain_ids[j][0])
-        rigid_min_x = float(aabb[domain_idx, 0][0])
-        rigid_max_x = float(aabb[domain_idx, 1][0])
-        rigid_min_z = float(aabb[domain_idx, 0][self.d - 1])
-        rigid_max_z = float(aabb[domain_idx, 1][self.d - 1])
-
-        max_height_in_range, min_height_in_range = hf.get_maxmin_height_in_range_2d(rigid_min_x, rigid_max_x)
-        if max_height_in_range < rigid_min_z or (hf.reverse and (min_height_in_range > rigid_max_z)):
-            return
-
-        n_sub = int(compound_count[j])
-        if n_sub > 0:
-            base = int(compound_offset[j])
-            parent_center = params[j, 0]
-            R = rot[j]
-            for k in range(n_sub):
-                sidx = base + k
-                local_p = compound_local_pos[sidx]
-                r_sub = float(compound_radius[sidx])
-                world_p = R @ local_p + parent_center
-                foot, n, signed = hf.nearest_on_curve_2d(float(world_p[0]), float(world_p[1]))
-                penetration = r_sub - signed
-                if penetration > 0.0:
-                    cpoint = world_p - np.asarray(n, dtype=np.float32) * r_sub
-                    self.cacheGroundContact(j, cpoint, n, (0.0, 0.0), signed - r_sub)
-            return
-
-        rtype = int(domain_ids[j][1])
-        if rtype == RigidType.BOX:
-            for vi in range(4):
-                pos = self.get_box_vertex(j, vi)
-                foot, n, signed = hf.nearest_on_curve_2d(float(pos[0]), float(pos[1]))
-                if signed < 0.0:
-                    self.cacheGroundContact(j, pos, n, (0.0, 0.0), signed)
-        elif rtype == RigidType.BALL:
-            center = params[j, 0]
-            radius = float(radius_arr[j])
-            foot, n, signed = hf.nearest_on_curve_2d(float(center[0]), float(center[1]))
-            penetration = radius - signed
-            if penetration > 0.0:
-                n = np.asarray(n, dtype=np.float32)
-                cpoint = center - n * radius
-                self.cacheGroundContact(j, cpoint, n, (0.0, 0.0), signed - radius)
-        elif rtype == RigidType.CAPSULE:
-            center = params[j, 0]
-            lcdir = params[j, 1]
-            lc = rot[j] @ lcdir + center
-            uc = center * 2.0 - lc
-            radius = float(radius_arr[j])
-            for test_p in (lc, uc):
-                foot, n, signed = hf.nearest_on_curve_2d(float(test_p[0]), float(test_p[1]))
-                penetration = radius - signed
-                if penetration > 0.0:
-                    n = np.asarray(n, dtype=np.float32)
-                    cpoint = test_p - n * radius
-                    self.cacheGroundContact(j, cpoint, n, (0.0, 0.0), signed - radius)
-
-    def detectHeightField2MeshContacts_(self, rigidIdx: int, hf):
-        """Heightfield vs mesh rigid boundary nodes."""
-        if rigidIdx == -1:
-            return
-        j = int(rigidIdx)
-        domain_ids = self.rigidDomainIds.numpy()
-        aabb = self.aabb.numpy()
-        mesh_ids = self.rigid2MeshIndices.numpy()
-        node_off = self.meshBoundaryNodeOffset.numpy()
-        node_cnt = self.meshBoundaryNodeCount.numpy()
-        coords = self.meshBoundaryCoords.numpy()
-
-        domain_idx = int(domain_ids[j][0])
-        rigid_min_x = float(aabb[domain_idx, 0][0])
-        rigid_max_x = float(aabb[domain_idx, 1][0])
-        rigid_min_z = float(aabb[domain_idx, 0][self.d - 1])
-        rigid_max_z = float(aabb[domain_idx, 1][self.d - 1])
-        max_height_in_range, min_height_in_range = hf.get_maxmin_height_in_range_2d(rigid_min_x, rigid_max_x)
-        if max_height_in_range < rigid_min_z or (hf.reverse and (min_height_in_range > rigid_max_z)):
-            return
-
-        mesh_local = int(mesh_ids[j])
-        if mesh_local < 0:
-            return
-        off = int(node_off[mesh_local])
-        nnodes = int(node_cnt[mesh_local])
-        for nidx in range(nnodes):
-            pos = coords[off + nidx]
-            foot, n, signed = hf.nearest_on_curve_2d(float(pos[0]), float(pos[1]))
-            if signed < 0.0:
-                self.cacheGroundContact(j, pos, n, (0.0, 0.0), signed)
-
-    def detectVoxel2Rigids_(self, rigidIdx: int, vox):
-        """Voxel map vs primitive rigid."""
-        if rigidIdx == -1:
-            return
-        j = int(rigidIdx)
-        domain_ids = self.rigidDomainIds.numpy()
-        params = self.rigidParams.numpy()
-        radius_arr = self.radius.numpy()
-        rot = self.cached_rotation_matrix.numpy()
-        rtype = int(domain_ids[j][1])
-        if rtype == RigidType.BOX:
-            for vi in range(4):
-                pos = self.get_box_vertex(j, vi)
-                d, n, c = vox.signed_distance_to_edges_2d(pos, 0.0)
-                if d < 0.0:
-                    self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
-        elif rtype == RigidType.BALL:
-            center = params[j, 0]
-            radius = float(radius_arr[j])
-            d, n, c = vox.signed_distance_to_edges_2d(center, radius)
-            if d < 0.0:
-                self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
-        elif rtype == RigidType.CAPSULE:
-            center = params[j, 0]
-            lcdir = params[j, 1]
-            lc = rot[j] @ lcdir + center
-            uc = center * 2.0 - lc
-            radius = float(radius_arr[j])
-            for test_p in (lc, uc):
-                d, n, c = vox.signed_distance_to_edges_2d(test_p, radius)
-                if d < 0.0:
-                    self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
-
-    def detectVoxel2MeshContacts_(self, rigidIdx: int, vox):
-        """Voxel map vs mesh rigid boundary nodes."""
-        if rigidIdx == -1:
-            return
-        j = int(rigidIdx)
-        domain_ids = self.rigidDomainIds.numpy()
-        aabb = self.aabb.numpy()
-        mesh_ids = self.rigid2MeshIndices.numpy()
-        node_off = self.meshBoundaryNodeOffset.numpy()
-        node_cnt = self.meshBoundaryNodeCount.numpy()
-        coords = self.meshBoundaryCoords.numpy()
-
-        domain_idx = int(domain_ids[j][0])
-        mesh_local = int(mesh_ids[j])
-        if mesh_local < 0:
-            return
-        off = int(node_off[mesh_local])
-        nnodes = int(node_cnt[mesh_local])
-        minExtent = aabb[domain_idx, 1] - aabb[domain_idx, 0]
-        extent_scale = 0.2 * float(np.linalg.norm(minExtent))
-        for nidx in range(nnodes):
-            pos = coords[off + nidx]
-            d, n, c = vox.signed_distance_to_edges_2d(pos, extent_scale)
-            if d < 0.0:
-                self.cacheGroundContact(j, c, n, (0.0, 0.0), d)
 
     # -------  End of Rigid-Ground contact related functions -----------------------------
     # ----------------------------------------------------------------------------------
@@ -4339,19 +5107,6 @@ class RigidManager:
         if (bc_type & ROTVTYPE) != 0:
             _patch_array(self.RotV, i, float(bc_r[i]))
 
-    def get_box_vertex(self, rigidIdx: int, v_idx: int):
-        params = self.rigidParams.numpy()
-        center = params[rigidIdx, 0]
-        extent = params[rigidIdx, 1]
-
-        # 0: - -, 1: + -, 2: + +, 3: - +
-        sx = -1.0 if (v_idx == 0 or v_idx == 3) else 1.0
-        sy = -1.0 if (v_idx == 0 or v_idx == 1) else 1.0
-
-        local_pos = 0.5 * np.array([sx * extent[0], sy * extent[1]], dtype=np.float32)
-        rotMat = self.cached_rotation_matrix.numpy()[rigidIdx]
-        return center + rotMat @ local_pos
-
     def getPrimitiveRigidBBox(self, rigidId: int):
         """Compute and store AABB for a single primitive rigid based on packed params."""
         # Host path: launch full bbox update (cheap for small scenes).
@@ -4465,7 +5220,7 @@ class RigidManager:
 
         boundary_radius = np.zeros(n, dtype=np.float32)
         center_speed = np.linalg.norm(V_np, axis=1)
-        # 2D RotV is a scalar per rigid (1-D); 3D would be a vector.
+        # 2D RotV is a scalar per rigid (1-D)
         W_np = np.asarray(W_np)
         if W_np.ndim == 1:
             omega_speed = np.abs(W_np.astype(np.float32))

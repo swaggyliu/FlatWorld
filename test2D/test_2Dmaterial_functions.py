@@ -1,4 +1,7 @@
-"""2D material-function tests (Warp)."""
+"""2D material-function tests (Warp).
+
+PYTEST_DONT_REWRITE
+"""
 
 import os
 import sys
