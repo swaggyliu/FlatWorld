@@ -3,6 +3,7 @@
 Usage (repo root):
     python -m learning.eval_task --checkpoint learning/checkpoints \\
         --episodes 50 --target-mode random
+    python -m learning.eval_task --task push_t --solver-cem --episodes 10
 """
 
 import argparse
@@ -11,10 +12,22 @@ import os
 import time
 
 import numpy as np
-import torch
 
 from learning.configs.default import Config
-from learning.tasks.push_to_goal import PushToGoalTask, load_ensemble
+
+
+def _task_bundle(name: str):
+    if name in ("two_room", "two-room"):
+        from learning.tasks.two_room import TwoRoomTask, two_room_config
+        return TwoRoomTask, two_room_config()
+    if name in ("push_t", "push-t"):
+        from learning.tasks.push_t import PushTTask, push_t_config
+        return PushTTask, push_t_config()
+    if name == "reacher":
+        from learning.tasks.reacher import ReacherTask, reacher_config
+        return ReacherTask, reacher_config()
+    from learning.tasks.push_to_goal import PushToGoalTask
+    return PushToGoalTask, Config()
 
 
 def build_parser():
@@ -22,15 +35,30 @@ def build_parser():
     parser.add_argument("--checkpoint", nargs="+", type=str,
                         default=["learning/checkpoints"],
                         help="checkpoint dir(s) or file(s); multiple = ensemble")
+    parser.add_argument("--task", type=str, default="push",
+                        help="push | two_room | push_t | reacher")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--budget", type=int, default=None,
                         help="sim frames (default: Config.task.budget = 400)")
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--vel-tol", type=float, default=None)
     parser.add_argument("--seed", type=int, default=1000)
-    parser.add_argument("--horizon", type=int, default=32)
-    parser.add_argument("--population", type=int, default=96)
-    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--horizon", type=int, default=None,
+                        help="CEM horizon (default WM 32 / push_t 12 / solver 16)")
+    parser.add_argument("--population", type=int, default=None,
+                        help="CEM population (default WM 96 / push_t 192 / solver 12)")
+    parser.add_argument("--iterations", type=int, default=None,
+                        help="CEM iterations (default WM 5 / push_t 10 / solver 2)")
+    parser.add_argument("--elites", type=int, default=None,
+                        help="CEM elites (default WM 16 / push_t 32 / solver 4)")
+    parser.add_argument("--stride", type=int, default=None,
+                        help="action hold frames (default: ckpt WM / 1 solver=collect)")
+    parser.add_argument("--solver-cem", action="store_true",
+                        help="CEM over FlatWorld solver (same physics as collect); no WM")
+    parser.add_argument("--servo", action="store_true",
+                        help="closed-loop hint servo (no CEM, no world model)")
+    parser.add_argument("--exec-horizon", type=int, default=4,
+                        help="solver-CEM steps to execute before replanning")
     parser.add_argument("--target-mode", type=str, default="leftmost",
                         choices=("leftmost", "rightmost", "random"))
     parser.add_argument("--record", type=int, default=50,
@@ -39,6 +67,10 @@ def build_parser():
                         help="optional suffix for output files, e.g. random")
     parser.add_argument("--ee-scale", type=float, default=1.0,
                         help="EE radius multiplier (game slider is 0.5-2.0)")
+    parser.add_argument("--ee-spawn", type=str, default="default",
+                        choices=("default", "support"),
+                        help="push-T EE reset: default random standoff, or "
+                             "support = 1-2 cm behind the T (goal-opposite face)")
     parser.add_argument("--results", type=str, default="learning/results")
     parser.add_argument("--uncert-cost", type=float, default=None,
                         help="override ensemble disagreement cost (default 0.1)")
@@ -61,31 +93,81 @@ def build_parser():
                         help="write MP4s for failed episodes after eval")
     parser.add_argument("--no-replay-fails", action="store_true",
                         help="skip fail MP4s")
+    parser.add_argument("--simple-cost", action="store_true",
+                        help="use simplified PushTCost (task decomposition, no state machine)")
     return parser
 
 
+def _cem_defaults(task_name: str, solver: bool):
+    """Shorter H + denser CEM on Push-T (indirect contact); other tasks keep prior defaults."""
+    is_pt = task_name in ("push_t", "push-t")
+    if solver:
+        return (16, 16, 3, 6) if is_pt else (16, 12, 2, 4)
+    if is_pt:
+        return 12, 192, 10, 32
+    return 32, 96, 5, 16
+
+
 def run_eval(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = Config()
-    model, norm, stride = load_ensemble(args.checkpoint, device)
-    n_models = len(model) if isinstance(model, list) else 1
-    pk = dict(horizon=args.horizon, population=args.population,
-              iterations=args.iterations, seed=args.seed)
-    if args.uncert_cost is not None:
-        pk["uncert_cost"] = float(args.uncert_cost)
-    pk["ensemble_reduce"] = getattr(args, "reduce", "mean")
-    if args.no_reach:
-        pk["reach_cost"] = 0.0
-    if getattr(args, "no_settle", False):
-        pk["settle_w"] = 0.0
-    if getattr(args, "settle_w", None) is not None:
-        pk["settle_w"] = float(args.settle_w)
-    pk["tactile_mode"] = args.tactile
-    task = PushToGoalTask(
+    solver = bool(getattr(args, "solver_cem", False))
+    servo = bool(getattr(args, "servo", False))
+    task_name = getattr(args, "task", "push")
+    TaskCls, cfg = _task_bundle(task_name)
+    dH, dP, dI, dE = _cem_defaults(task_name, solver)
+    H = args.horizon if args.horizon is not None else dH
+    P = args.population if args.population is not None else dP
+    I = args.iterations if args.iterations is not None else dI
+    elites = args.elites if args.elites is not None else dE
+    if servo:
+        device = "cpu"
+        model, norm = None, None
+        stride = int(args.stride) if args.stride is not None else 1
+        n_models = 0
+        pk = dict(use_servo=True)
+        print("hint servo (closed-loop face/spin, no CEM)", flush=True)
+    elif solver:
+        device = "cpu"
+        model, norm = None, None
+        stride = int(args.stride) if args.stride is not None else 1
+        n_models = 0
+        pk = dict(
+            use_solver_cem=True,
+            horizon=H, population=P, iterations=I, elites=elites,
+            seed=args.seed,
+            exec_horizon=int(getattr(args, "exec_horizon", 4)),
+        )
+        if args.no_reach:
+            pk["reach_cost"] = 0.0
+        print(f"solver CEM H={H} P={P} iters={I} elites={elites} "
+              f"stride={stride} exec={pk['exec_horizon']} "
+              f"(same ExplicitLoop as collect)", flush=True)
+    else:
+        import torch
+        from learning.tasks.push_to_goal import load_ensemble
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, norm, ckpt_stride = load_ensemble(args.checkpoint, device)
+        n_models = len(model) if isinstance(model, list) else 1
+        stride = int(args.stride) if args.stride is not None else int(ckpt_stride)
+        pk = dict(horizon=H, population=P, iterations=I, seed=args.seed,
+                  elites=elites)
+        if args.uncert_cost is not None:
+            pk["uncert_cost"] = float(args.uncert_cost)
+        pk["ensemble_reduce"] = getattr(args, "reduce", "mean")
+        if args.no_reach:
+            pk["reach_cost"] = 0.0
+        if getattr(args, "no_settle", False):
+            pk["settle_w"] = 0.0
+        if getattr(args, "settle_w", None) is not None:
+            pk["settle_w"] = float(args.settle_w)
+        pk["tactile_mode"] = args.tactile
+    task = TaskCls(
         cfg, model, norm, device=device, tol=args.tol,
         vel_tol=args.vel_tol, budget=args.budget,
         stride=stride, target_mode=args.target_mode,
-        ee_scale=args.ee_scale, planner_kwargs=pk)
+        ee_scale=args.ee_scale, planner_kwargs=pk,
+        ee_spawn=getattr(args, "ee_spawn", "default"),
+        simple_cost=bool(getattr(args, "simple_cost", False)))
+    print(f"ee_spawn={getattr(args, 'ee_spawn', 'default')}", flush=True)
 
     records = []
     recorded = {"states": [], "masks": [], "actions": [], "goal": [],
@@ -120,10 +202,18 @@ def run_eval(args):
             recorded["final_dist"].append(r["final_dist"])
             recorded["settle_frame"].append(r["settle_frame"])
         records.append({key: v for key, v in r.items() if key != "frames"})
-        if only.strip() or (k + 1) % 10 == 0 or k == 0:
+        if only.strip() or (k + 1) % 10 == 0 or k == 0 or n_run <= 15:
             rate = n_success / (k + 1)
+            extra = ""
+            if "init_ee_gap" in r:
+                extra = f" init_ee_gap {r['init_ee_gap']:.3f}"
             print(f"[ep {i} {k + 1}/{n_run}] success so far {n_success}/{k + 1} "
-                  f"({100 * rate:.1f}%), last final_dist {r['final_dist']:.3f}")
+                  f"({100 * rate:.1f}%), last final_dist {r['final_dist']:.3f}"
+                  f"{extra}",
+                  flush=True)
+        if device == "cuda":
+            import torch
+            torch.cuda.empty_cache()
 
     rate = n_success / n_run
     elapsed = time.time() - t0
@@ -144,10 +234,15 @@ def run_eval(args):
         "mean_settle_frame": float(np.mean(frames)),
         "elapsed_s": elapsed,
         "n_models": n_models,
-        "target_mode": args.target_mode,
+        "planner": "servo" if servo else ("solver_cem" if solver else "wm_cem"),
+        "target_mode": getattr(args, "target_mode", ""),
+        "task": getattr(args, "task", "push"),
         "ee_scale": args.ee_scale,
-        "cem": {"horizon": args.horizon, "population": args.population,
-                "iterations": args.iterations,
+        "ee_spawn": getattr(args, "ee_spawn", "default"),
+        "cem": {"horizon": H, "population": P,
+                "iterations": I, "elites": elites,
+                "stride": stride,
+                "exec_horizon": int(getattr(args, "exec_horizon", 4)) if solver else 1,
                 "uncert_cost": args.uncert_cost,
                 "score": getattr(args, "score", "xy"),
                 "only": getattr(args, "only", "") or None},

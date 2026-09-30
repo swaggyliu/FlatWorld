@@ -114,7 +114,7 @@ def plot_success_summary(eval_json, out, title_extra=""):
         extra += f"  target={mode}"
     if h is not None:
         extra += f"  H={h}"
-    ax.set_title(f"PushToGoal  (tol={s['tol']}, budget={s['budget']}f){extra}")
+    ax.set_title(f"{s.get('task', 'PushToGoal')}  (tol={s['tol']}, budget={s['budget']}f){extra}")
     ax.set_ylabel("episodes")
 
     ax = axes[1]
@@ -136,21 +136,27 @@ def plot_success_summary(eval_json, out, title_extra=""):
     plt.close(fig)
 
 
-def _draw_scene(ax, states, cfg, target_idx=None, alpha=1.0, geom=None):
+def _draw_scene(ax, states, cfg, target_idx=None, alpha=1.0, geom=None,
+                types=None):
     """Draw one scene frame. states: (N, 6). geom: (N, 2) half-extents."""
     sc = cfg.scene
-    types = [0] + [1] * sc.num_boxes + [2] * sc.num_balls
+    n = len(states)
+    if types is None:
+        types = [0] + [1] * sc.num_boxes + [2] * sc.num_balls
+        if len(types) < n:
+            types = [0] + [1] * (n - 1)
     ax.axhline(0.0, color="k", lw=2, alpha=alpha)  # ground
     for i, st in enumerate(states):
         x, y, th = st[0], st[1], st[2]
         is_target = (target_idx is not None and i == target_idx)
+        ti = int(types[i]) if i < len(types) else 1
         if geom is not None:
             hw, hh = float(geom[i, 0]), float(geom[i, 1])
-        elif types[i] == 1:
+        elif ti == 1:
             hw, hh = sc.box_ext
         else:
             hw = hh = sc.ee_radius if i == 0 else sc.ball_radius
-        if types[i] == 1:  # box: rotated rectangle
+        if ti == 1:  # box: rotated rectangle
             c, s = np.cos(th), np.sin(th)
             R = np.array([[c, -s], [s, c]])
             corners = R @ np.array([[hw, hh], [-hw, hh], [-hw, -hh], [hw, -hh]]).T
@@ -166,13 +172,14 @@ def _draw_scene(ax, states, cfg, target_idx=None, alpha=1.0, geom=None):
             ax.plot(x, y, "k*", ms=14, alpha=alpha)
 
 
-def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5):
+def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5, title=None):
     d = np.load(traj_npz, allow_pickle=True)
     states = d["states"]
     goals = d["goal"]
     succ = d["success"]
     tgt_idx = d["target_idx"] if "target_idx" in d else [1] * len(states)
     geoms = d["geom"] if "geom" in d.files else None
+    types_all = d["types"] if "types" in d.files else None
     n = len(states) if n_show is None else min(n_show, len(states))
     ncols = min(ncols, n)
     nrows = int(np.ceil(n / ncols))
@@ -183,8 +190,9 @@ def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5):
         traj = states[i]
         ti = int(tgt_idx[i])
         gi = geoms[i] if geoms is not None else None
-        _draw_scene(ax, traj[0], cfg, ti, alpha=0.30, geom=gi)
-        _draw_scene(ax, traj[-1], cfg, ti, geom=gi)
+        ty = types_all[i] if types_all is not None else None
+        _draw_scene(ax, traj[0], cfg, ti, alpha=0.30, geom=gi, types=ty)
+        _draw_scene(ax, traj[-1], cfg, ti, geom=gi, types=ty)
         ax.plot(traj[:, 0, 0], traj[:, 0, 1], "-", color="#2a9d8f", lw=1.2,
                 alpha=0.8, label="EE path")
         ax.plot(traj[:, ti, 0], traj[:, ti, 1], "-", color="#b8860b", lw=1.2,
@@ -195,9 +203,10 @@ def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5):
         color = "#2a9d8f" if succ[i] else "#e76f51"
         final_d = np.linalg.norm(traj[-1, ti, :2] - g)
         ax.set_title(f"{i}: {tag}  d={final_d:.3f}", color=color, fontsize=9)
-        xmax = max(1.6, float(np.nanmax(traj[..., 0])) + 0.05)
+        xmax = max(1.6, float(np.nanmax(traj[..., 0])) + 0.08)
+        ymax = max(0.55, float(np.nanmax(traj[..., 1])) + 0.08)
         ax.set_xlim(0.0, xmax)
-        ax.set_ylim(-0.08, 0.55)
+        ax.set_ylim(-0.08, ymax)
         ax.set_aspect("equal")
         ax.grid(alpha=0.25)
         ax.tick_params(labelsize=7)
@@ -205,7 +214,7 @@ def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5):
             ax.legend(loc="upper right", fontsize=6)
     for j in range(n, len(axes)):
         axes[j].axis("off")
-    fig.suptitle("PushToGoal: all recorded episodes  (light=init, bold=final)",
+    fig.suptitle(title or "Task rollouts  (light=init, bold=final)",
                  fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=130)

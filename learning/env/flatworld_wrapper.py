@@ -203,7 +203,10 @@ class PushSceneEnv:
         """Write sampled sizes into the live RigidManager arrays."""
         for i, gid in enumerate(self.rigid_ids):
             if i == 0:
-                _patch_array(self.rm.radius, gid, float(self.obj_geom[0, 0]))
+                if int(self.obj_types[0]) == OBJ_TYPE_BOX:
+                    _patch_array(self.rm.rigidParams, (gid, 1), self.ee_rigid.ext)
+                else:
+                    _patch_array(self.rm.radius, gid, float(self.obj_geom[0, 0]))
                 continue
             t = self.obj_types[i]
             rigid = self.obj_rigids[i - 1]
@@ -302,9 +305,7 @@ class PushSceneEnv:
             else:
                 factor = rng.uniform(*sc.dr_mass_range)
             m = self.base_mass[i] * factor
-            if i == 0:
-                I = 0.5 * m * float(self.obj_geom[0, 0]) ** 2
-            elif self.obj_types[i] == OBJ_TYPE_BOX:
+            if int(self.obj_types[i]) == OBJ_TYPE_BOX:
                 w, h = 2.0 * self.obj_geom[i, 0], 2.0 * self.obj_geom[i, 1]
                 I = (1.0 / 12.0) * m * (w * w + h * h)
             else:
@@ -321,10 +322,7 @@ class PushSceneEnv:
         restitution = float(sc.restitution)
         for i, gid in enumerate(self.rigid_ids):
             m = float(self.base_mass[i])
-            if i == 0:
-                r = float(self.obj_geom[0, 0])
-                I = 0.5 * m * r * r
-            elif self.obj_types[i] == OBJ_TYPE_BOX:
+            if int(self.obj_types[i]) == OBJ_TYPE_BOX:
                 w, h = 2.0 * self.obj_geom[i, 0], 2.0 * self.obj_geom[i, 1]
                 I = (1.0 / 12.0) * m * (w * w + h * h)
             else:
@@ -405,10 +403,13 @@ class PushSceneEnv:
         rm = self.rm
         ids = self.rigid_ids
         n = len(ids)
+        skip = getattr(self, "connected_pairs", None) or set()
         buf = np.asarray(rm.primitive_pairs_buffer.numpy())
         k = 0
         for i in range(n):
             for j in range(i + 1, n):
+                if (i, j) in skip or (j, i) in skip:
+                    continue
                 buf[k] = (int(ids[i]), int(ids[j]))
                 k += 1
         rm.primitive_pairs_buffer.assign(buf)
@@ -465,6 +466,10 @@ class PushSceneEnv:
     # ------------------------------------------------------------------ #
     # Control
     # ------------------------------------------------------------------ #
+    def hold_action(self) -> np.ndarray:
+        """Action that holds the current pose (zero force for EE scenes)."""
+        return np.zeros(2, dtype=np.float32)
+
     def set_force(self, f):
         """Set the force (Fx, Fy) applied to the EE, in Newtons. Call once per frame."""
         _patch_array(self.rm.bcTValues, self.ee_idx,
@@ -490,7 +495,9 @@ class PushSceneEnv:
         _patch_array(self.rm.inertia, self.ee_idx, 0.5 * m * r * r)
         pos = np.asarray(self.rm.rigidParams.numpy())[self.ee_idx, 0]
         min_y = r + float(self.cfg.scene.spawn_drop)
-        if float(pos[1]) < min_y:
+        if (not getattr(self, "torque_control", False)
+                and not getattr(self, "planar", False)
+                and float(pos[1]) < min_y):
             _patch_array(self.rm.rigidParams, (self.ee_idx, 0),
                          [float(pos[0]), min_y])
             self.ee_rigid.origin[1] = np.float32(min_y)
@@ -570,8 +577,9 @@ class PushSceneEnv:
             "obj_half_heights": list(self.obj_half_heights),
             "obj_mass": np.asarray(self.obj_mass).copy(),
             "obj_mu": np.asarray(self.obj_mu).copy(),
-            "ee_radius": float(self.ee_rigid.radius),
+            "ee_radius": float(getattr(self.ee_rigid, "radius", self.obj_geom[0, 0])),
             "force_cap_override": getattr(self, "force_cap_override", None),
+            "joint_control_target": np.asarray(self.rm.joint_control_target.numpy()).copy(),
         }
 
     def restore(self, snap: dict):
@@ -581,7 +589,10 @@ class PushSceneEnv:
             if i == 0:
                 self.ee_rigid.origin[0] = np.float32(x)
                 self.ee_rigid.origin[1] = np.float32(y)
-                self.ee_rigid.radius = float(snap["ee_radius"])
+                if int(self.obj_types[0]) == OBJ_TYPE_BOX:
+                    self.ee_rigid.ext = np.asarray(snap["ext"][i], dtype=np.float32)
+                else:
+                    self.ee_rigid.radius = float(snap["ee_radius"])
             else:
                 self.obj_rigids[i - 1].origin[0] = np.float32(x)
                 self.obj_rigids[i - 1].origin[1] = np.float32(y)
@@ -605,12 +616,80 @@ class PushSceneEnv:
         self.obj_mass = np.asarray(snap["obj_mass"], dtype=np.float32).copy()
         self.obj_mu = np.asarray(snap["obj_mu"], dtype=np.float32).copy()
         self.force_cap_override = snap.get("force_cap_override")
+        if "joint_control_target" in snap:
+            self.rm.joint_control_target.assign(
+                np.asarray(snap["joint_control_target"], dtype=np.float32))
         self.rm.updateBBox()
 
-    def _apply_action_advance(self, action: np.ndarray):
-        """Admittance force + one visual frame. No observation."""
+    def _apply_table_friction(self, dt: float):
+        """Planar Coulomb table drag. N = m * table_g out of the x-y plane.
+
+        Kinetic: a = -μ g v̂ (mass cancels). Static: lock if μ_s N Δt can
+        kill the remaining momentum. Also a spin torque -μ N r_eff sign(ω)
+        so a sliding T does not rotate forever. Skips fixed / huge-mass
+        bodies. EE is optional (admittance already damps it).
+        """
         sc = self.cfg.scene
-        a = np.asarray(action, dtype=np.float64)
+        g = float(getattr(sc, "table_g", 0.0))
+        if g <= 0.0 or not getattr(self, "planar", False):
+            return
+        dt = float(dt)
+        if dt <= 0.0:
+            return
+        mu_k = float(getattr(sc, "table_mu", 0.20))
+        mu_s = 1.2 * mu_k
+        v_stick = float(getattr(sc, "table_v_stick", 0.03))
+        on_ee = bool(getattr(sc, "table_on_ee", False))
+        base_mu = max(float(sc.friction), 1e-6)
+        V = self.rm.V.numpy()
+        W = self.rm.RotV.numpy()
+        mass = self.rm.mass.numpy()
+        inertia = self.rm.inertia.numpy()
+        geom = np.asarray(self.obj_geom, dtype=np.float64)
+        mu_body = np.asarray(self.obj_mu, dtype=np.float64)
+        fixed = getattr(self, "fixed_slots", set()) or set()
+        for i, gid in enumerate(self.rigid_ids):
+            if i in fixed or (i == 0 and not on_ee):
+                continue
+            m = float(mass[gid])
+            if not np.isfinite(m) or m <= 1e-8 or m >= 1e8:
+                continue
+            mu = mu_k * (float(mu_body[i]) / base_mu)
+            N = m * g
+            vx, vy = float(V[gid][0]), float(V[gid][1])
+            speed = float(np.hypot(vx, vy))
+            mu_now = mu_s * (float(mu_body[i]) / base_mu) if speed < v_stick else mu
+            fmax = mu_now * N
+            if speed * m <= fmax * dt:
+                vx, vy = 0.0, 0.0
+            elif speed > 1e-9:
+                ax = fmax / m
+                s = ax * dt / speed
+                vx -= s * vx
+                vy -= s * vy
+            _patch_array(self.rm.V, gid, wp.vec2(vx, vy))
+            I = float(inertia[gid])
+            if not np.isfinite(I) or I <= 1e-10:
+                continue
+            w = float(W[gid])
+            r_eff = 0.5 * float(np.hypot(geom[i, 0], geom[i, 1]))
+            tmax = mu_now * N * max(r_eff, 1e-4)
+            if I * abs(w) <= tmax * dt:
+                w = 0.0
+            else:
+                w -= np.sign(w) * (tmax / I) * dt
+            _patch_array(self.rm.RotV, gid, float(w))
+
+    def _apply_action_advance(self, action: np.ndarray):
+        """Clip + apply action for one visual frame. No observation."""
+        sc = self.cfg.scene
+        a = np.asarray(action, dtype=np.float64).reshape(-1)
+        if getattr(self, "torque_control", False):
+            tmax = float(self.cfg.collect.force_max)
+            a = np.clip(a[:2], -tmax, tmax)
+            self.set_force(a)
+            self.looper.advanceWithTime(sc.frame_dt)
+            return
         if sc.ee_damping > 0.0:
             v = self.rm.V.numpy()[self.ee_idx]
             a = a - sc.ee_damping * v
@@ -621,6 +700,7 @@ class PushSceneEnv:
             a = np.clip(a, -fmax, fmax)
         self.set_force(a)
         self.looper.advanceWithTime(sc.frame_dt)
+        self._apply_table_friction(sc.frame_dt)
         if sc.ee_vel_max > 0.0:
             v = self.rm.V.numpy()[self.ee_idx].copy()
             speed = float(np.hypot(v[0], v[1]))
@@ -674,7 +754,7 @@ class PushSceneEnv:
             states[:, 5] += self._noise_rng.normal(0.0, sc.noise_vel * 0.5, len(ids))
             cfeat[:, 4:6] += self._noise_rng.normal(0.0, sc.noise_force, (cfeat.shape[0], 2))
             csum[0:3] += self._noise_rng.normal(0.0, sc.noise_force, 3)
-        return {
+        out = {
             "obj_states": states,
             "obj_types": self.obj_types_np,
             "obj_geom": self.obj_geom.copy(),
@@ -682,6 +762,12 @@ class PushSceneEnv:
             "contact_mask": cmask,
             "tactile_summary": csum,
         }
+        if hasattr(self, "rel_type_mat"):
+            out["rel_type"] = self.rel_type_mat()
+        else:
+            from learning.models.relations import empty_rel
+            out["rel_type"] = empty_rel(len(ids))
+        return out
 
     def _tactile(self, ee_pos: np.ndarray):
         """Extract all EE contacts. Returns (feat (K,7), mask (K,), summary (4,)).

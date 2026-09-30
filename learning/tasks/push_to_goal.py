@@ -29,13 +29,27 @@ def _load_one(ckpt_path: str, device: str):
         n_mp=int(ckpt.get("n_mp", 3)),
         tactile_drop_prob=0.0,
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+    sd = ckpt["model"]
+    cur = model.state_dict()
+    for k, v in cur.items():
+        if k not in sd:
+            sd[k] = v
+    model.load_state_dict(sd)
     model.tactile_residual = bool(ckpt.get("tactile_residual", True))
     model.eval()
     norm_name = ckpt.get("normalizer", "normalizer.json")
     ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path)) or "."
     norm = Normalizer.load(os.path.join(ckpt_dir, os.path.basename(norm_name)))
+    gm = norm.stats.get("obj_geom")
+    model.set_state_norm(
+        norm.stats["obj_states"]["mean"],
+        norm.stats["obj_states"]["std"],
+        geom_mean=None if gm is None else gm["mean"],
+        geom_std=None if gm is None else gm["std"],
+    )
     stride = int(ckpt.get("stride", 1))
+    nodes = ckpt.get("action_nodes")
+    model.action_nodes = tuple(int(x) for x in nodes) if nodes else None
     return model, norm, stride
 
 
@@ -140,18 +154,20 @@ class PushToGoalCost:
         self.face_t = torch.tensor([fx, fy], device=self.device, dtype=torch.float32)
 
     def step(self, xy, a_t, prev=None):
-        d_goal = (xy[:, self.target_idx] - self.goal_t).norm(dim=-1)
-        d_face = (xy[:, self.ee_idx] - self.face_t).norm(dim=-1)
+        p = xy[..., :2]
+        d_goal = (p[:, self.target_idx] - self.goal_t).norm(dim=-1)
+        d_face = (p[:, self.ee_idx] - self.face_t).norm(dim=-1)
         cost = d_goal + self.reach_cost * d_face \
             + self.action_cost * (a_t ** 2).mean(dim=-1)
         if prev is not None and self.settle_w > 0:
-            speed = (xy[:, self.target_idx] - prev[:, self.target_idx]).norm(dim=-1)
+            speed = (p[:, self.target_idx] - prev[..., :2][:, self.target_idx]).norm(dim=-1)
             in_tol = (self.tol - d_goal).clamp(min=0.0) / max(self.tol, 1e-6)
             cost = cost + self.settle_w * in_tol * speed
         return cost
 
     def terminal(self, xy):
-        return 2.0 * (xy[:, self.target_idx] - self.goal_t).norm(dim=-1)
+        p = xy[..., :2]
+        return 2.0 * (p[:, self.target_idx] - self.goal_t).norm(dim=-1)
 
 
 class PushToGoalTask:

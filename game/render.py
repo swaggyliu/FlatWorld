@@ -513,7 +513,7 @@ def draw_scene(cam: Camera, states: np.ndarray, types, geom: np.ndarray,
         x, y, th = float(states[i, 0]), float(states[i, 1]), float(states[i, 2])
         hw, hh = float(geom[i, 0]), float(geom[i, 1])
         t = int(types[i])
-        if i == 0:
+        if i == 0 and t != OBJ_TYPE_BOX:
             if steer_goal is not None:
                 look_x = float(steer_goal[0]) - x
                 look_y = float(steer_goal[1]) - y

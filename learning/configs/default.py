@@ -11,9 +11,22 @@ from dataclasses import dataclass, field, asdict
 @dataclass
 class SceneConfig:
     """Push scene: circular end-effector + several boxes/balls + ground."""
-    gravity: float = 10.0            # m/s^2, applied to objects only (EE floats, no gravity)
-    friction: float = 0.5            # friction coefficient for all rigid bodies
+    kind: str = "push"               # push | two_room | push_t | reacher
+    gravity: float = 10.0            # m/s^2, in-plane (0, -g); side-view scenes only
+    loop_damping: float = 0.0        # ExplicitLoop viscous V *= (1 - c dt); not Coulomb
+    use_ground: bool = True          # y=0 floor plane; planar top-down scenes keep False
+    friction: float = 0.5            # Coulomb mu at rigid-rigid / ground contacts
+    # Top-down table: out-of-plane normal N = m * table_g, in-plane Coulomb
+    # F = -μ N v̂ (kinetic) so sliding bodies stop in finite time. 0 disables.
+    # Do not reuse in-plane gravity + GroundDomain — that makes bodies fall in y.
+    table_g: float = 0.0             # m/s^2, table normal (Push-T uses 10)
+    table_mu: float = 0.20           # kinetic mu on the table (static = 1.2×)
+    table_v_stick: float = 0.03      # m/s, below this static friction can lock
+    table_on_ee: bool = False        # EE already has admittance ee_damping
     frame_dt: float = 1.0 / 60.0     # one action per visual frame
+    # Joint PD (RigidManager): 0 = none, 1 = velocity PD, 2 = torque PD.
+    # Reacher uses 2: action is joint-angle targets, internally converted to τ.
+    use_pd: int = 0
 
     # End-effector (circular "gripper")
     ee_radius: float = 0.1
@@ -120,6 +133,8 @@ class CollectConfig:
     mode_release: float = 0.10
     mode_hop: float = 0.10
     mode_pile: float = 0.35
+    mode_door: float = 0.0           # two-room: shove payload through the doorway
+    mode_spin: float = 0.0           # push-T: hit one end of the bar to rotate
 
 
 @dataclass
@@ -130,6 +145,7 @@ class TaskConfig:
     budget: int = 400                # sim frames
     goal_min: float = 0.10           # min |goal_x - target_x|; > tol so not already done
     goal_max: float = 0.30           # max requested push distance
+    ee_spawn: str = "default"        # push-T: default | support (EE 1–2 cm behind T)
 
 
 @dataclass

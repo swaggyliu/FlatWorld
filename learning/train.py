@@ -35,6 +35,7 @@ def _ckpt_dict(model, n_obj, args, epoch, seed, val=None):
         "normalizer": "normalizer.json",
         "epoch": epoch,
         "seed": seed,
+        "action_nodes": list(model.action_nodes) if getattr(model, "action_nodes", None) else None,
     }
     if val is not None:
         payload["val"] = {k: float(v) for k, v in val.items()}
@@ -46,7 +47,7 @@ def evaluate(model, loader, device):
     """Validation losses + latent statistics + long-horizon open-loop error."""
     model.eval()
     agg = {"dynamics": 0.0, "sigreg": 0.0,
-           "pair": 0.0, "ground": 0.0, "drift": 0.0}
+           "pair": 0.0, "ground": 0.0, "drift": 0.0, "weld": 0.0}
     z_std_sum, z_batches = 0.0, 0
     k_err = {10: [], 25: [], 50: []}
     n_win = 0
@@ -67,9 +68,11 @@ def evaluate(model, loader, device):
         geom = batch.get("obj_geom")
         T = batch["actions"].shape[1]
         prev_c = model.pair_prob(z)
+        rel = batch.get("rel_type")
         for t in range(T):
             z, h, prev_c = model.roll_step(
-                z, batch["actions"][:, t], h, geom, prev_c)
+                z, batch["actions"][:, t], h, geom, prev_c, rel_type=rel,
+                obj_types=batch.get("obj_types"))
             if (t + 1) in k_err:
                 err = torch.nn.functional.mse_loss(z, out["z_target"][:, t]).item()
                 k_err[t + 1].append(err)
@@ -86,7 +89,7 @@ def evaluate(model, loader, device):
 
 
 def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
-              log_file=None):
+              log_file=None, norm=None, action_nodes=None):
     torch.manual_seed(seed)
     np.random.seed(seed)
     model = StateLeWM(
@@ -94,6 +97,17 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
         n_mp=int(getattr(args, "n_mp", 3)),
         tactile_drop_prob=float(getattr(args, "tactile_drop_prob", 0.5)),
     ).to(device)
+    model.action_nodes = action_nodes
+    if action_nodes:
+        print(f"  action_nodes={action_nodes}")
+    if norm is not None:
+        gm = norm.stats.get("obj_geom")
+        model.set_state_norm(
+            norm.stats["obj_states"]["mean"],
+            norm.stats["obj_states"]["std"],
+            geom_mean=None if gm is None else gm["mean"],
+            geom_std=None if gm is None else gm["std"],
+        )
     init_dir = getattr(args, "init_dir", None)
     if init_dir:
         init_path = os.path.join(init_dir, out_name)
@@ -131,7 +145,7 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
     for epoch in range(1, args.epochs + 1):
         model.train()
         ep = {"total": 0.0, "dynamics": 0.0, "sigreg": 0.0,
-              "pair": 0.0, "drift": 0.0}
+              "pair": 0.0, "drift": 0.0, "weld": 0.0}
         n = 0
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -142,7 +156,9 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
                 w_ground=float(getattr(args, "w_ground", 0.5)),
                 w_drift=float(getattr(args, "w_drift", 0.3)),
                 w_xy=float(getattr(args, "w_xy", 0.5)),
-                w_vel=float(getattr(args, "w_vel", 0.5)))
+                w_th=float(getattr(args, "w_th", 0.5)),
+                w_vel=float(getattr(args, "w_vel", 0.5)),
+                w_weld=float(getattr(args, "w_weld", 0.5)))
             opt.zero_grad()
             losses["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -181,6 +197,7 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
             print(f"  [{epoch:3d}/{args.epochs}] total {ep['total']:.4f} "
                   f"dyn {ep['dynamics']:.4f} "
                   f"pair {ep.get('pair', 0):.4f} "
+                  f"weld {ep.get('weld', 0):.4f} "
                   f"drft {ep.get('drift', 0):.4f} | "
                   f"val dyn {val['dynamics']:.4f} "
                   f"ol {val.get('openloop_10', float('nan')):.3f}/"
@@ -238,8 +255,12 @@ def main():
                         help="zero-force drift penalty weight")
     parser.add_argument("--w-xy", type=float, default=0.5,
                         help="xy-head regression weight (CEM consumes xy)")
+    parser.add_argument("--w-th", type=float, default=0.5,
+                        help="wrapped theta readout weight (CEM consumes pose)")
     parser.add_argument("--w-vel", type=float, default=0.5,
                         help="velocity readout loss weight")
+    parser.add_argument("--w-weld", type=float, default=0.5,
+                        help="welded-pair relative-pose rigidity weight")
     parser.add_argument("--tactile-drop-prob", type=float, default=0.5,
                         help="train-time probability of a state-only encode "
                              "(tactile residual off); 0 = always inject tactile")
@@ -267,6 +288,11 @@ def main():
     full = PushWindowDataset(data_dirs[0], window=n_steps, normalizer=norm,
                              files=files, stride=args.stride)
     n_obj = full[0]["obj_types"].shape[0]
+    types0 = np.asarray(full[0]["obj_types"]).reshape(-1)
+    # No EE at node 0 → joint-controlled reacher: θ1 on link1, θ2 on link2.
+    action_nodes = (0, 2) if int(types0[0]) != 0 and n_obj >= 3 else None
+    if action_nodes:
+        print(f"action_nodes={action_nodes} (per-joint scatter)")
     train_ds, val_ds = train_val_split(full)
     train_ds.window = min(args.train_window, n_steps)
 
@@ -315,7 +341,8 @@ def main():
         name = f"ens_{i}.pt" if n_ens > 1 else "best.pt"
         print(f"=== ensemble member {i + 1}/{n_ens} (seed {seed}) ===")
         train_one(args, train_loader, val_loader, n_obj, device, seed, name,
-                  log_file=log_file if i == 0 else None)
+                  log_file=log_file if i == 0 else None, norm=norm,
+                  action_nodes=action_nodes)
 
     if log_file is not None:
         log_file.close()

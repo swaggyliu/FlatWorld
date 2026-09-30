@@ -17,6 +17,24 @@ import numpy as np
 from learning.configs.default import Config
 from learning.data.sane import rollout_is_physical
 from learning.env.flatworld_wrapper import PushSceneEnv
+from learning.env.lewm_scenes import make_scene_env
+from learning.models.relations import empty_rel
+
+
+def env_rel_type(env) -> np.ndarray:
+    """Static (N,N) joint-type matrix written into every rollout npz."""
+    if hasattr(env, "rel_type_mat"):
+        return np.asarray(env.rel_type_mat(), dtype=np.int64)
+    return empty_rel(int(getattr(env, "n_obj", 0)))
+
+
+def env_joint_pairs(env) -> np.ndarray:
+    """(M, 3) rows of (i, j, rel_type); empty if the scene has no joints."""
+    rel = getattr(env, "joint_rel", None) or {}
+    rows = [(int(i), int(j), int(t)) for (i, j), t in rel.items()]
+    if not rows:
+        return np.zeros((0, 3), dtype=np.int32)
+    return np.asarray(rows, dtype=np.int32)
 
 
 def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray,
@@ -201,11 +219,166 @@ def hop_action(obs: dict, rng: np.random.Generator, cfg: Config,
     return np.clip(a, -fmax, fmax).astype(np.float32)
 
 
-def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dict:
+def door_action(env, obs: dict, rng: np.random.Generator, cfg: Config) -> np.ndarray:
+    """Drive the EE through the y-aligned doorway into the other room."""
+    states, geom = obs["obj_states"], obs["obj_geom"]
+    door_x = float(getattr(env, "door_x", 1.10))
+    door_y = float(getattr(env, "door_y", 0.55))
+    ee = np.asarray(states[0, :2], dtype=np.float64)
+    fmax = float(cfg.collect.force_max)
+    spawn_left = bool(getattr(env, "spawn_left", float(ee[0]) < door_x))
+    go_right = spawn_left
+    if go_right:
+        through = float(ee[0]) >= door_x
+        side = 1.0
+    else:
+        through = float(ee[0]) <= door_x
+        side = -1.0
+    if not through:
+        if abs(float(ee[1]) - door_y) > 0.10 and abs(float(ee[0]) - door_x) > 0.16:
+            aim = np.array([door_x - side * 0.22, door_y], dtype=np.float64)
+        else:
+            aim = np.array([door_x + side * 0.28, door_y], dtype=np.float64)
+    else:
+        aim = np.array([door_x + side * 0.50, door_y], dtype=np.float64)
+    d = aim - ee
+    n = max(float(np.linalg.norm(d)), 1e-6)
+    mag = 0.80 * fmax if not through else 0.55 * fmax
+    a = (d / n) * mag
+    a = a + 0.25 * cfg.collect.ou_sigma * rng.standard_normal(2)
+    a = apply_barriers(a, cfg, ee, float(geom[0, 0]))
+    return _clip_action(a, cfg, env)
+
+
+def torque_action(rng: np.random.Generator, cfg: Config, prev: np.ndarray) -> np.ndarray:
+    """OU / piecewise joint-angle targets for the PD reacher."""
+    c = cfg.collect
+    tmax = float(c.force_max)
+    if rng.random() < 0.03:
+        return rng.uniform(-tmax, tmax, size=2).astype(np.float32)
+    a = c.ou_theta * prev + c.ou_sigma * rng.standard_normal(2)
+    return np.clip(a, -tmax, tmax).astype(np.float32)
+
+
+def push_t_action(obs: dict, rng: np.random.Generator, cfg: Config,
+                 mem: dict) -> np.ndarray:
+    """Dwell, then ease onto a T face, then push. No ramming through the COM."""
+    st, geom = obs["obj_states"], obs["obj_geom"]
+    ee = np.asarray(st[0, :2], dtype=np.float64)
+    ee_r = float(geom[0, 0])
+    fmax = float(cfg.collect.force_max)
+    if "u" not in mem:
+        mem["tgt"] = 1 if rng.random() < 0.55 else 2
+        mem["dwell"] = int(rng.integers(8, 16))
+        mem["t"] = 0
+        p0 = np.asarray(st[int(mem["tgt"]), :2], dtype=np.float64)
+        d0 = p0 - ee
+        n0 = max(float(np.linalg.norm(d0)), 1e-6)
+        mem["u"] = (d0 / n0).astype(np.float64)
+        mem["left"] = int(rng.integers(70, 140))
+    mem["t"] = int(mem["t"]) + 1
+    mem["left"] = int(mem["left"]) - 1
+    if mem["left"] <= 0:
+        mem.clear()
+        return push_t_action(obs, rng, cfg, mem)
+    if mem["t"] <= int(mem["dwell"]):
+        a = 0.05 * cfg.collect.ou_sigma * rng.standard_normal(2)
+        a = apply_barriers(a, cfg, ee, ee_r)
+        return np.clip(a, -fmax, fmax).astype(np.float32)
+    tgt = int(mem["tgt"])
+    p = np.asarray(st[tgt, :2], dtype=np.float64)
+    u = np.asarray(mem["u"], dtype=np.float64)
+    standoff = float(geom[tgt, 0]) + ee_r + 0.01
+    gap = float(np.dot(p - ee, u)) - standoff
+    # Far: light approach. At the face: push. Never jump to full force at spawn.
+    alpha = 1.0 / (1.0 + max(gap, 0.0) / 0.14)
+    mag = (0.20 + 0.70 * alpha) * fmax
+    a = u * mag + 0.10 * cfg.collect.ou_sigma * rng.standard_normal(2)
+    a = apply_barriers(a, cfg, ee, ee_r)
+    return np.clip(a, -fmax, fmax).astype(np.float32)
+
+
+def spin_action(obs: dict, rng: np.random.Generator, cfg: Config, mem: dict) -> np.ndarray:
+    """Hit one end of the T bar so collection covers rotation, not just slide."""
+    states, geom = obs["obj_states"], obs["obj_geom"]
+    bar = 2 if states.shape[0] > 2 else 1
+    if "side" not in mem:
+        mem["side"] = 1.0 if rng.random() < 0.5 else -1.0
+        mem["left"] = int(rng.integers(24, 50))
+    fmax = float(cfg.collect.force_max)
+    ee = states[0]
+    bx, by, bth = float(states[bar, 0]), float(states[bar, 1]), float(states[bar, 2])
+    hw = float(geom[bar, 0])
+    c, s = float(np.cos(bth)), float(np.sin(bth))
+    end = np.array([bx + mem["side"] * c * hw, by + mem["side"] * s * hw])
+    standoff = float(geom[bar, 1] + geom[0, 0]) + 0.02
+    aim = end + np.array([-mem["side"] * s, mem["side"] * c]) * standoff
+    d = aim - ee[:2]
+    n = max(float(np.hypot(d[0], d[1])), 1e-6)
+    mag = 0.75 * fmax
+    a = (d / n) * mag
+    mem["left"] -= 1
+    if mem["left"] <= 0:
+        mem.clear()
+    a = a + 0.2 * cfg.collect.ou_sigma * rng.standard_normal(2)
+    a = apply_barriers(a, cfg, ee[:2], float(geom[0, 0]))
+    return np.clip(a, -fmax, fmax).astype(np.float32)
+
+
+def run_torque_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dict:
+    """Random joint-command episode for Reacher (PD angles; no EE force modes)."""
     c = cfg.collect
     obs = env.reset(rng)
     for _ in range(7):
         if env.min_separating_gap() >= -0.002:
+            break
+        obs = env.reset(rng)
+    states = [obs["obj_states"]]
+    feats = [obs["contact_feat"]]
+    masks = [obs["contact_mask"]]
+    sums = [obs["tactile_summary"]]
+    pair0, ground0 = env.refresh_solver_contacts()
+    pairs = [pair0]
+    grounds = [ground0]
+    actions = []
+    if hasattr(env, "joint_angles"):
+        a = np.asarray(env.joint_angles(), dtype=np.float32)
+    else:
+        a = np.zeros(2, dtype=np.float32)
+    for _ in range(c.episode_len):
+        a = torque_action(rng, cfg, a)
+        obs = env.step(a)
+        actions.append(a)
+        states.append(obs["obj_states"])
+        feats.append(obs["contact_feat"])
+        masks.append(obs["contact_mask"])
+        sums.append(obs["tactile_summary"])
+        p, g = env.solver_contacts()
+        pairs.append(p)
+        grounds.append(g)
+    return {
+        "obj_types": obs["obj_types"],
+        "obj_geom": obs["obj_geom"],
+        "obj_states": np.stack(states),
+        "actions": np.stack(actions),
+        "contact_feat": np.stack(feats),
+        "contact_mask": np.stack(masks),
+        "tactile_summary": np.stack(sums),
+        "pair_contact": np.stack(pairs),
+        "ground_contact": np.stack(grounds),
+        "rel_type": env_rel_type(env),
+        "joint_pairs": env_joint_pairs(env),
+    }
+
+
+def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dict:
+    c = cfg.collect
+    if getattr(env, "torque_control", False):
+        return run_torque_rollout(env, rng, cfg)
+    obs = env.reset(rng)
+    gap_need = 0.06 if str(getattr(cfg.scene, "kind", "")) == "push_t" else -0.002
+    for _ in range(12):
+        if env.min_separating_gap() >= gap_need:
             break
         obs = env.reset(rng)
 
@@ -218,7 +391,11 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
     grounds = [ground0]
     actions = []
     attract_idx = 1 + int(rng.integers(0, obs["obj_states"].shape[0] - 1))
-    pile_target = 1 + int(rng.integers(0, obs["obj_states"].shape[0] - 1))
+    if hasattr(env, "attract_indices"):
+        choices = list(env.attract_indices())
+        if choices:
+            attract_idx = int(choices[int(rng.integers(0, len(choices)))])
+    pile_target = attract_idx
 
     u = rng.random()
     t_free = c.mode_free
@@ -226,6 +403,8 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
     t_push = t_attr + c.mode_push
     t_rel = t_push + c.mode_release
     t_hop = t_rel + c.mode_hop
+    t_pile = t_hop + c.mode_pile
+    t_door = t_pile + getattr(c, "mode_door", 0.0)
     if u < t_free:
         mode = "free"
     elif u < t_attr:
@@ -236,26 +415,52 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         mode = "release"
     elif u < t_hop:
         mode = "hop"
-    else:
+    elif u < t_pile:
         mode = "pile"
+    elif u < t_door:
+        mode = "door"
+    else:
+        mode = "spin"
     cmd = None
     phase_left = 0
     pushing = True
     hop_mem = {}
+    push_t_mem = {}
 
     a = np.zeros(2, dtype=np.float32)
     for _ in range(c.episode_len):
         env.force_cap_override = None
         ee_pos = obs["obj_states"][0, :2]
         obj_pos_all = obs["obj_states"][1:, :2]
+        if str(getattr(cfg.scene, "kind", "")) == "push_t":
+            a = push_t_action(obs, rng, cfg, push_t_mem)
+            obs = env.step(a)
+            actions.append(a)
+            states.append(obs["obj_states"])
+            feats.append(obs["contact_feat"])
+            masks.append(obs["contact_mask"])
+            sums.append(obs["tactile_summary"])
+            p, g = env.solver_contacts()
+            pairs.append(p)
+            grounds.append(g)
+            continue
         if rng.random() < 0.15:
-            attract_idx = 1 + int(rng.integers(0, obj_pos_all.shape[0]))
+            n_obj = obj_pos_all.shape[0]
+            if hasattr(env, "attract_indices"):
+                ch = list(env.attract_indices())
+                attract_idx = int(ch[int(rng.integers(0, len(ch)))]) if ch else attract_idx
+            else:
+                attract_idx = 1 + int(rng.integers(0, n_obj))
         attract_pos = obs["obj_states"][attract_idx, :2]
         nearest = obj_pos_all[np.argmin(
             np.linalg.norm(obj_pos_all - ee_pos, axis=1))]
         focus = attract_pos if mode in ("attract", "push", "release") else nearest
         if mode == "pile":
             a = pile_action(env, obs, pile_target, rng, cfg)
+        elif mode == "door":
+            a = door_action(env, obs, rng, cfg)
+        elif mode == "spin":
+            a = spin_action(obs, rng, cfg, hop_mem)
         elif mode == "hop":
             a = hop_action(obs, rng, cfg, hop_mem)
         else:
@@ -306,11 +511,28 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         "tactile_summary": np.stack(sums),                # (T+1, 4)
         "pair_contact": np.stack(pairs),                  # (T+1, N, N) solver
         "ground_contact": np.stack(grounds),              # (T+1, N) solver
+        "rel_type": env_rel_type(env),                    # (N, N) 0=contact 1=rev 2=weld 3=pris 4=none
+        "joint_pairs": env_joint_pairs(env),              # (M, 3) (i, j, type)
     }
+
+
+def _make_cfg(task: str) -> Config:
+    if task in ("two_room", "two-room"):
+        from learning.tasks.two_room import two_room_config
+        return two_room_config()
+    if task in ("push_t", "push-t"):
+        from learning.tasks.push_t import push_t_config
+        return push_t_config()
+    if task == "reacher":
+        from learning.tasks.reacher import reacher_config
+        return reacher_config()
+    return Config()
 
 
 def main():
     parser = argparse.ArgumentParser(description="StateLeWM Phase 1 data collection")
+    parser.add_argument("--task", type=str, default="push",
+                        help="push | two_room | push_t | reacher")
     parser.add_argument("--num-rollouts", type=int, default=None)
     parser.add_argument("--episode-len", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -320,7 +542,7 @@ def main():
                         help="first rollout index (resume after interruption)")
     args = parser.parse_args()
 
-    cfg = Config()
+    cfg = _make_cfg(args.task)
     if args.num_rollouts is not None:
         cfg.collect.num_rollouts = args.num_rollouts
     if args.episode_len is not None:
@@ -333,24 +555,40 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     rng = np.random.default_rng(cfg.collect.seed)
-    env = PushSceneEnv(cfg)
+    env = make_scene_env(cfg)
+    print(f"task={args.task}  n_obj={env.n_obj}  kinds={env.obj_types}  "
+          f"rollouts={cfg.collect.num_rollouts}  out={out_dir}")
 
     t_start = time.time()
     tot_frames = 0
     tot_contact_frames = 0
     for i in range(args.start_index, cfg.collect.num_rollouts):
         data = run_rollout(env, rng, cfg)
+        skip = getattr(env, "connected_pairs", None)
         for _ in range(5):
-            if rollout_is_physical(data["obj_states"], data["obj_geom"]):
+            if rollout_is_physical(data["obj_states"], data["obj_geom"],
+                                   skip_pairs=skip):
                 break
             data = run_rollout(env, rng, cfg)
+        skip_arr = np.zeros((0, 2), dtype=np.int32)
+        if skip:
+            skip_arr = np.array(list(skip), dtype=np.int32).reshape(-1, 2)
+        rel = data.get("rel_type")
+        if rel is None:
+            data["rel_type"] = env_rel_type(env)
+        if data.get("joint_pairs") is None:
+            data["joint_pairs"] = env_joint_pairs(env)
         path = os.path.join(out_dir, f"rollout_{i:04d}.npz")
         np.savez_compressed(
             path,
             **data,
+            skip_pairs=skip_arr,
             frame_dt=np.float32(cfg.scene.frame_dt),
             config_json=np.str_(cfg.dump()),
         )
+        if i == 0:
+            print("rel_type\n", data["rel_type"])
+            print("joint_pairs", data["joint_pairs"])
         contact_frames = int((data["contact_mask"].sum(axis=1) > 0).sum())
         tot_frames += data["contact_mask"].shape[0]
         tot_contact_frames += contact_frames

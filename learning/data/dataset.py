@@ -12,6 +12,7 @@ flags and types are left as-is:
     obj_geom         (N, 2)          float (normalized)
     pair_contact     (T_w+1, N, N)   float 0/1 (solver rigid–rigid)
     ground_contact   (T_w+1, N)      float 0/1 (solver body–plane)
+    rel_type         (N, N)          long (0=contact, 1=revolute, 2=weld, 3=prismatic, 4=none)
 
 Supervision: (s_t, a_t) -> s_{t+1} for t in [0, T_w).
 """
@@ -25,6 +26,7 @@ from torch.utils.data import Dataset
 
 from learning.data.normalizer import Normalizer
 from learning.data.sane import rollout_is_physical
+from learning.models.relations import infer_rel_type
 
 
 class PushWindowDataset(Dataset):
@@ -65,7 +67,12 @@ class PushWindowDataset(Dataset):
                 continue
             pair_c = d["pair_contact"].astype(np.float32)
             ground_c = d["ground_contact"].astype(np.float32)
-            if not rollout_is_physical(states, geom):
+            skip_pairs = d["skip_pairs"] if "skip_pairs" in d.files else None
+            if "rel_type" in d.files:
+                rel = d["rel_type"].astype(np.int64)
+            else:
+                rel = infer_rel_type(states.shape[1], skip_pairs)
+            if not rollout_is_physical(states, geom, skip_pairs=skip_pairs):
                 skipped += 1
                 continue
 
@@ -98,6 +105,7 @@ class PushWindowDataset(Dataset):
                 "obj_geom": torch.from_numpy(geom),
                 "pair_contact": torch.from_numpy(pair_c),
                 "ground_contact": torch.from_numpy(ground_c),
+                "rel_type": torch.from_numpy(rel),
             })
             kept_files.append(f)
         self.files = kept_files
@@ -123,6 +131,7 @@ class PushWindowDataset(Dataset):
             "obj_geom": r["obj_geom"],                                # (N, 2)
             "pair_contact": r["pair_contact"][t0:t1 + 1],             # (T_w+1, N, N)
             "ground_contact": r["ground_contact"][t0:t1 + 1],         # (T_w+1, N)
+            "rel_type": r["rel_type"],                                # (N, N)
         }
 
 

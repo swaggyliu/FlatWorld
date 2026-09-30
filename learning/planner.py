@@ -1,6 +1,6 @@
 """Latent-space CEM: sample actions, roll the world model, score a cost.
 
-Cost is residual-corrected ``xy_head`` plus the task's geometric terms.
+Cost is residual-corrected ``pose_head`` (x, y, θ) plus the task's geometric terms.
 """
 
 import numpy as np
@@ -41,6 +41,8 @@ class CEMPlanner:
             raise ValueError(f"tactile_mode={tactile_mode!r}")
         self.tactile_mode = tactile_mode
         self._pred_xy = None
+        self._rel = None
+        self._types = None
         self.mean = torch.zeros(horizon, 2, device=device)
         span = 2.0 * force_max
         self.std = torch.full((horizon, 2), 0.25 * span, device=device)
@@ -69,14 +71,37 @@ class CEMPlanner:
         self.mean = torch.zeros(self.H, 2, device=self.device)
         self.std = torch.full((self.H, 2), 0.25 * 2.0 * self.fmax, device=self.device)
         self._pred_xy = None
+        self._rel = None
+        self._types = None
+
+    def _rel_tensor(self, obs):
+        r = obs.get("rel_type")
+        if r is None:
+            return None
+        t = torch.as_tensor(r, device=self.device, dtype=torch.long)
+        return t.unsqueeze(0) if t.dim() == 2 else t
 
     def _normalize(self, key, x, model=None):
         mean, std = self._stats(model)
         return (x - mean[key]) / std[key]
 
-    def _denorm_xy(self, xy_n, model=None):
+    def _denorm_pose(self, pose_n, model=None):
         mean, std = self._stats(model)
-        return xy_n * std["obj_states"][:2] + mean["obj_states"][:2]
+        n = pose_n.shape[-1]
+        return pose_n * std["obj_states"][:n] + mean["obj_states"][:n]
+
+    def _denorm_xy(self, xy_n, model=None):
+        return self._denorm_pose(xy_n[..., :2], model)
+
+    @staticmethod
+    def _residual(pred, base, now):
+        """Zero-action residual; wrap θ so ±π does not jump."""
+        xy = pred[..., :2] - base[..., :2] + now[..., :2]
+        if pred.shape[-1] < 3 or now.shape[-1] < 3:
+            return xy
+        th = pred[..., 2] - base[..., 2] + now[..., 2]
+        th = torch.atan2(torch.sin(th), torch.cos(th))
+        return torch.cat([xy, th.unsqueeze(-1)], -1)
 
     def _norm_geom(self, geom, model=None):
         g = torch.as_tensor(geom, device=self.device, dtype=torch.float32)
@@ -122,10 +147,13 @@ class CEMPlanner:
                     if "obj_geom" in mean:
                         g = self._normalize("obj_geom", g, m)
                     geom_t = g.unsqueeze(0)
+                rel_t = self._rel_tensor(obs)
+                self._rel = rel_t
+                self._types = types.unsqueeze(0)
                 zs.append(m.encode(types.unsqueeze(0), states.unsqueeze(0),
                                    cfeat.unsqueeze(0), cmask.unsqueeze(0),
                                    tsum.unsqueeze(0), obj_geom=geom_t,
-                                   use_tactile=use_tactile))
+                                   use_tactile=use_tactile, rel_type=rel_t))
             return zs
 
     def _gate_tactile(self, obs: dict) -> bool:
@@ -133,7 +161,8 @@ class CEMPlanner:
         if self._pred_xy is None:
             return False
         real = np.asarray(obs["obj_states"])[:, :2]
-        err = float(np.linalg.norm(real - self._pred_xy, axis=-1).mean())
+        pred = np.asarray(self._pred_xy)[..., :2]
+        err = float(np.linalg.norm(real - pred, axis=-1).mean())
         return err > self.tactile_xy_tol
 
     def remember_first_step(self, z0, action: np.ndarray, geom: np.ndarray):
@@ -148,25 +177,38 @@ class CEMPlanner:
             m, z = self.models[0], z0s[0][:1]
             h = m.predictor.init_hidden(z)
             prev_c = m.pair_prob(z)
-            z, _, _ = m.roll_step(z, a, h, geom_n, prev_c)
-            self._pred_xy = self._denorm_xy(m.predictor.xy_head(z), m)[0].cpu().numpy()
+            z, _, _ = m.roll_step(z, a, h, geom_n, prev_c, rel_type=self._rel,
+                                  obj_types=self._types)
+            self._pred_xy = self._denorm_pose(
+                m.predictor.pose_head(z), m)[0, :, :2].cpu().numpy()
 
-    def _zero_xy(self, model, z0, geom_n, now_xy=None):
-        """Zero-action imagined xy (H, N, 2) in raw units."""
-        a0 = self._normalize("actions", torch.zeros(1, 2, device=self.device),
-                             model)
+    def _idle_tensor(self, idle_action=None):
+        if idle_action is None:
+            return torch.zeros(1, 2, device=self.device)
+        return torch.as_tensor(idle_action, device=self.device,
+                               dtype=torch.float32).view(1, 2)
+
+    def _zero_pose(self, model, z0, geom_n, now_xy=None, idle_action=None):
+        """Idle-action imagined pose (H, N, 3) in raw units.
+
+        For force-controlled EE, idle is zero force. For PD reacher, idle is
+        the current joint angles (hold), not θ=0 (which would drive home).
+        """
+        a0 = self._normalize("actions", self._idle_tensor(idle_action), model)
         z, h = z0[:1], model.predictor.init_hidden(z0[:1])
         prev_c = model.pair_prob(z)
         frames = []
         for _ in range(self.H):
-            z, h, prev_c = model.roll_step(z, a0, h, geom_n, prev_c)
-            frames.append(self._denorm_xy(model.predictor.xy_head(z), model)[0])
+            z, h, prev_c = model.roll_step(z, a0, h, geom_n, prev_c,
+                                          rel_type=self._rel,
+                                          obj_types=self._types)
+            frames.append(self._denorm_pose(model.predictor.pose_head(z), model)[0])
         return torch.stack(frames)
 
     def _roll(self, model, z0, a, geom_n, cost, base, now_xy):
         """Imagine ``a`` and accumulate ``cost.step`` / ``cost.terminal``.
 
-        Positions are residual-corrected against the zero-action baseline.
+        Pose is residual-corrected against the zero-action baseline.
         """
         z = z0.expand(self.P, *z0.shape[1:])
         h = model.predictor.init_hidden(z)
@@ -176,25 +218,44 @@ class CEMPlanner:
         prev = None
         for t in range(self.H):
             z, h, prev_c = model.roll_step(
-                z, self._normalize("actions", a[:, t], model), h, geom_n, prev_c)
-            pred = self._denorm_xy(model.predictor.xy_head(z), model)
-            pred = pred - base[t] + now_xy
+                z, self._normalize("actions", a[:, t], model), h, geom_n, prev_c,
+                rel_type=self._rel, obj_types=self._types)
+            pred = self._denorm_pose(model.predictor.pose_head(z), model)
+            pred = self._residual(pred, base[t], now_xy)
             total = total + cost.step(pred, a[:, t], prev)
             prev = pred
         return total + cost.terminal(pred)
 
-    def plan(self, z0, geom: np.ndarray, states_now: np.ndarray, cost):
+    def plan(self, z0, geom: np.ndarray, states_now: np.ndarray, cost,
+             idle_action=None):
         """Optimize an action sequence. Returns best first action (2,) in N."""
         z0s = [z0] if isinstance(z0, torch.Tensor) else list(z0)
-        now_xy = torch.as_tensor(states_now[:, :2], device=self.device,
+        now_xy = torch.as_tensor(states_now[:, :3], device=self.device,
                                  dtype=torch.float32)
+        idle_t = self._idle_tensor(idle_action)[0]
         with torch.inference_mode():
-            bases = [self._zero_xy(m, z, self._norm_geom(geom, m), now_xy)
+            bases = [self._zero_pose(m, z, self._norm_geom(geom, m), now_xy,
+                                     idle_action=idle_action)
                      for m, z in zip(self.models, z0s)]
+            mean = self.mean
+            hint_t = None
+            hint = getattr(cost, "hint_action", None)
+            if hint is not None:
+                hint_t = torch.as_tensor(
+                    np.asarray(hint, dtype=np.float32),
+                    device=self.device, dtype=self.mean.dtype).reshape(2)
+                hint_t = hint_t.clamp(self.low, self.high)
+                mean = 0.40 * self.mean + 0.60 * hint_t.unsqueeze(0)
             best_first = None
             for _ in range(self.iters):
                 noise = torch.randn(self.P, self.H, 2, device=self.device)
-                seqs = (self.mean + self.std * noise).clamp(self.low, self.high)
+                seqs = (mean + self.std * noise).clamp(self.low, self.high)
+                if hint_t is not None:
+                    seqs = seqs.clone()
+                    seqs[0] = hint_t.unsqueeze(0).expand(self.H, 2)
+                    if self.P > 2:
+                        seqs[1] = (0.65 * hint_t).unsqueeze(0).expand(
+                            self.H, 2).clamp(self.low, self.high)
                 costs = []
                 for m, z, b in zip(self.models, z0s, bases):
                     costs.append(self._roll(
@@ -208,11 +269,11 @@ class CEMPlanner:
                 if C.shape[0] > 1 and self.uncert_cost:
                     total = total + self.uncert_cost * C.std(0)
                 elite = seqs[total.topk(self.E, largest=False).indices]
-                self.mean = elite.mean(0).clone()
+                mean = elite.mean(0).clone()
                 self.std = elite.std(0).clamp_min(1e-3).clone()
                 best_first = elite[0, 0].clone()
-            rolled = torch.roll(self.mean, -1, 0)
-            rolled[-1] = 0
+            rolled = torch.roll(mean, -1, 0)
+            rolled[-1] = idle_t
             self.mean = rolled
             floor = (self.high - self.low) * 0.05
             self.std = torch.maximum(self.std * 0.9, floor).clone()

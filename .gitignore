@@ -69,9 +69,10 @@ depracted/
 results/*
 paper/*
 
-# Local research notes — keep on disk, never commit
+# Local files
 learning/improvement.md
 learning/qa.md
+scripts/*
 
 # learning module: generated data / checkpoints / logs / debug dumps
 learning/data/*.npz
