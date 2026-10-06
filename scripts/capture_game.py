@@ -41,7 +41,7 @@ def main():
     from game.session import GameSession
 
     OUT.mkdir(parents=True, exist_ok=True)
-    ckpt = str(ROOT / "learning" / "checkpoints")
+    ckpt = str(ROOT / "learning" / "checkpoints" / "push_game")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     rl.set_config_flags(rl.FLAG_MSAA_4X_HINT | rl.FLAG_WINDOW_HIGHDPI)
@@ -51,7 +51,7 @@ def main():
     cam = Camera(W, H)
 
     # Homepage shot should match the shipped checkpoint, not local extra .pt files.
-    label, detail = "best.pt", "learning/checkpoints"
+    label, detail = "best.pt", "learning/checkpoints/push_game"
 
     rl.begin_drawing()
     rl.clear_background(BG)

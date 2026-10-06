@@ -3,9 +3,10 @@
 Usage (repo root):
     python -m learning.train --data learning/data/rollouts_500 --epochs 80 --ensemble 1
 
-Outputs:
-    learning/checkpoints/ens_{i}.pt   best val checkpoint per ensemble member
-    learning/checkpoints/last.pt      last epoch of member 0
+Outputs (default `--out learning/checkpoints/push_game`):
+    best.pt                           best val checkpoint (K=1) or member-0 copy (K>1)
+    ens_{i}.pt                        per-member checkpoints (K>1)
+    normalizer.json                   per-dim stats used by eval
     learning/results/train_log.csv    member-0 metrics
 """
 
@@ -229,7 +230,7 @@ def main():
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--stride", type=int, default=5)
     parser.add_argument("--windows-per-rollout", type=int, default=16)
-    parser.add_argument("--out", type=str, default="learning/checkpoints")
+    parser.add_argument("--out", type=str, default="learning/checkpoints/push_game")
     parser.add_argument("--results", type=str, default="learning/results")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ensemble", type=int, default=5,

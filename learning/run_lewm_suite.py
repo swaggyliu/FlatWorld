@@ -1,4 +1,4 @@
-"""Collect, train, evaluate, and report the three StateLeWM scenes.
+"""Collect, train, evaluate, and report the StateLeWM scenes.
 
 Usage (repo root):
     python -m learning.run_lewm_suite --stage all
@@ -10,7 +10,19 @@ import os
 import subprocess
 import sys
 
-TASKS = ("two_room", "push_t", "reacher")
+TASKS = ("push", "two_room", "push_t", "reacher")
+
+# per-scene (data, checkpoint, results) dirs; push keeps its original names
+LAYOUT = {
+    "push":     ("learning/data/rollouts_500", "learning/checkpoints/push_game",
+                 "learning/results"),
+    "two_room": ("learning/data/two_room_500", "learning/checkpoints/two_room",
+                 "learning/results/two_room"),
+    "push_t":   ("learning/data/push_t_500",   "learning/checkpoints/push_t",
+                 "learning/results/push_t"),
+    "reacher":  ("learning/data/reacher_500",  "learning/checkpoints/reacher",
+                 "learning/results/reacher"),
+}
 
 
 def _run(args):
@@ -25,9 +37,7 @@ def collect(task, n, episode_len):
 
 
 def train(task, epochs, ensemble):
-    data = f"learning/data/{task}_500"
-    ckpt = f"learning/checkpoints/{task}"
-    res = f"learning/results/{task}"
+    data, ckpt, res = LAYOUT[task]
     _run([sys.executable, "-m", "learning.train",
           "--data", data, "--epochs", str(epochs),
           "--ensemble", str(ensemble),
@@ -35,8 +45,7 @@ def train(task, epochs, ensemble):
 
 
 def evaluate(task, episodes):
-    ckpt = f"learning/checkpoints/{task}"
-    res = f"learning/results/{task}"
+    _, ckpt, res = LAYOUT[task]
     _run([sys.executable, "-m", "learning.eval_task",
           "--task", task, "--checkpoint", ckpt,
           "--episodes", str(episodes), "--results", res,
@@ -52,7 +61,7 @@ def main():
     parser.add_argument("--stage", type=str, default="all",
                         choices=("collect", "train", "eval", "report", "all"))
     parser.add_argument("--task", type=str, default="all",
-                        help="all | two_room | push_t | reacher")
+                        help="all | push | two_room | push_t | reacher")
     parser.add_argument("--num-rollouts", type=int, default=500)
     parser.add_argument("--episode-len", type=int, default=200)
     parser.add_argument("--epochs", type=int, default=80)

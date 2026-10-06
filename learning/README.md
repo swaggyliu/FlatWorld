@@ -24,8 +24,8 @@ Default scene still has **N = 6** bodies: 1 circular EE + 3 boxes + 2 balls
 EE sits at a **random rank** and the five objects are shuffled each reset.
 Weights are **shared across bodies** (like a CNN over pixels): one encoder /
 predictor / contact+xy readout, applied to every object. `N` is not baked into
-parameter shapes. The shipped checkpoint is **318K parameters** (0.32M):
-encoder 89K, predictor 201K, pair head 25K, ground head 4K. There is **no
+parameter shapes. The shipped checkpoints are **320K parameters** (0.32M):
+encoder 89,872, predictor 201,877, pair head 24,705, ground head 4,161. There is **no
 full-state decoder**; CEM scores `xy_head`.
 
 The network is a **one-step predictor**: encode the current frame, apply a
@@ -262,16 +262,55 @@ model. Geometric terms shape the cost; they do not emit the force.
 
 Numbers below are PushToGoal with **ensemble=1**, CEM H=32, 50 episodes,
 seed 1000. The shipped model is trained on `learning/data/rollouts_500`
-(500 npz, seed 30000). Weights: `learning/checkpoints/best.pt`.
+(500 npz, seed 30000). Weights: `learning/checkpoints/push_game/best.pt`.
 
 | protocol  | success | mean final dist | mean settle |
 |-----------|---------|-----------------|-------------|
-| leftmost  | 47/50 = **94%** | 0.049 m | 159 |
-| rightmost | 46/50 = **92%** | 0.046 m | 201 |
-| random    | 41/50 = **82%** | 0.074 m | 180 |
+| leftmost  | 49/50 = **98%** | 0.037 m | 153 |
+| rightmost | 48/50 = **96%** | 0.037 m | 167 |
+| random    | 48/50 = **96%** | 0.056 m | 153 |
 
-JSON: `learning/results/task_eval_500_nofreeze_H32_{leftmost,rightmost,random}.json`.
-Failed episodes write MP4s under `learning/results/replays/500_H32_{mode}/`.
+JSON: `learning/results/task_eval_500v2_H32_{leftmost,rightmost,random}.json`.
+Failed episodes write MP4s under `learning/results/replays/500v2_H32_{mode}/`.
+
+### Other scenes (same architecture, per-scene checkpoint)
+
+| scene    | success | mean final dist | mean settle | tol / vel | weights |
+|----------|---------|-----------------|-------------|-----------|---------|
+| two-room | 49/50 = **98%** | 0.080 m | 139 | 0.10 m / 0.15 m/s | `learning/checkpoints/two_room` |
+| reacher  | 48/50 = **96%** | 0.043 m | 107 | 0.06 m / 0.18 m/s | `learning/checkpoints/reacher` |
+
+Both are 50 episodes, seed 1000, CEM H=32 (stride 5), ensemble=1. The
+reacher eval uses an **in-band hold**: once the link-2 centre is within
+`tol`, the executed action is the idle hold (current joint angles) and the
+PD controller dissipates the remaining velocity — the same idea as the
+push task's in-band zero force. JSON: `learning/results/reacher/task_eval.json`
+(reacher), `learning/results/task_eval_random.json` (two-room).
+
+These are the same two benchmark tasks (`Two-Room`, `Reacher`) used by the
+pixel-based latent world models, so success rates line up across methods:
+
+| method | Two-Room | Reacher | observation |
+|--------|----------|---------|-------------|
+| **StateLeWM** (this repo) | **98** | **96** | 6-d state + EE tactile |
+| solver-CEM (learning-free, engine rollouts) | 80 | 30 | — |
+| LeWM | 87 | 86 | pixels |
+| Fast-LeWM | 98 | 88 | pixels |
+| DINO-WM | 100 | 79 | pixels |
+| PLDM | 97 | 78 | pixels |
+
+Success %. StateLeWM / solver-CEM are measured here (50 / 10 episodes); the
+LeWM-family rows are published numbers on *their own* Two-Room / Reacher (LeWM:
+Maes et al., 2026; Fast-LeWM: Gao & Xu, 2026; DINO-WM: Zhou et al., 2025; PLDM:
+Sobal et al., 2025) with different episode counts, success thresholds, and pixel
+observations — a size anchor, not a controlled head-to-head.
+
+```bash
+python -m learning.eval_task --task two_room \
+    --checkpoint learning/checkpoints/two_room --episodes 50
+python -m learning.eval_task --task reacher \
+    --checkpoint learning/checkpoints/reacher --episodes 50
+```
 
 ## Pipeline
 
@@ -282,24 +321,25 @@ python -m learning.data.collect --num-rollouts 500 --episode-len 200 \
 
 # 2. train
 python -m learning.train --data learning/data/rollouts_500 --epochs 80 \
-    --ensemble 1 --out learning/checkpoints --results learning/results
+    --ensemble 1 --out learning/checkpoints/push_game --results learning/results
 
 # 3. evaluate
-python -m learning.eval_task --checkpoint learning/checkpoints \
-    --episodes 50 --target-mode leftmost --tag 500_H32_leftmost
-python -m learning.eval_task --checkpoint learning/checkpoints \
-    --episodes 50 --target-mode rightmost --tag 500_H32_rightmost
-python -m learning.eval_task --checkpoint learning/checkpoints \
-    --episodes 50 --target-mode random --tag 500_H32_random
+python -m learning.eval_task --checkpoint learning/checkpoints/push_game \
+    --episodes 50 --target-mode leftmost --tag 500v2_H32_leftmost
+python -m learning.eval_task --checkpoint learning/checkpoints/push_game \
+    --episodes 50 --target-mode rightmost --tag 500v2_H32_rightmost
+python -m learning.eval_task --checkpoint learning/checkpoints/push_game \
+    --episodes 50 --target-mode random --tag 500v2_H32_random
 
 # 4. report figures
 python -m learning.make_report --current-best
 
 # 5. playable prototype
-python -m game --checkpoint learning/checkpoints
+python -m game --checkpoint learning/checkpoints/push_game
 ```
 
-Outputs land in `learning/checkpoints/` (or `--out`) and
+Outputs land in `learning/checkpoints/<scene>/` (push defaults to
+`learning/checkpoints/push_game`; or pass `--out`) and
 `learning/results/` (`train_log.csv`, `task_eval_<tag>.json`, figures
 under `current_best/` after `--current-best`).
 

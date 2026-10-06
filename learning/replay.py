@@ -166,7 +166,7 @@ def _task_from_summary(summary: dict, device: str):
             target_mode=summary.get("mode") or summary.get("target_mode") or "leftmost",
             planner_kwargs=pk)
 
-    ckpt = summary.get("checkpoint") or "learning/checkpoints"
+    ckpt = summary.get("checkpoint") or "learning/checkpoints/push_game"
     model, norm, stride = load_ensemble(ckpt, device)
     cem = summary.get("cem") or {}
     pk = dict(horizon=int(cem.get("horizon") or 32),

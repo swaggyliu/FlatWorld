@@ -57,8 +57,7 @@ tmp/
 temp/
 scratch/
 depracted/
-*.npz
-!learning/data/rollouts_500/*.npz
+.miktex/
 *.png
 !docs/gallery/*.png
 !docs/game/*.png
@@ -73,12 +72,11 @@ paper/*
 learning/improvement.md
 learning/qa.md
 scripts/*
+debug_*
+_debug_*
 
 # learning module: generated data / checkpoints / logs / debug dumps
-learning/data/*.npz
-learning/checkpoints/*
-!learning/checkpoints/best.pt
-!learning/checkpoints/normalizer.json
+*_last.pt
 learning/results/*
 !learning/results/*.png
 !learning/results/*.csv

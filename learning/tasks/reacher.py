@@ -122,6 +122,12 @@ class ReacherTask(CEMWorldTask):
         p = np.asarray(obs["obj_states"][ReacherEnv.LINK2, :2], dtype=np.float64)
         return float(np.linalg.norm(p - np.asarray(goal)[:2]))
 
+    def _plan(self, cur, goal):
+        """settle down the arm when it's close to the goal"""
+        if self.metric(cur, goal) < self.tol:
+            return self._idle_action()
+        return super()._plan(cur, goal)
+
     def plan_action(self, cur, goal) -> np.ndarray:
         if self.metric(cur, goal) < self.tol:
             return self._idle_action()

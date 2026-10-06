@@ -66,9 +66,11 @@ Full write-up, architecture, losses, and eval numbers:
 [`learning/`](learning/README.md) is a lightweight **state + tactile
 conditioned latent world model** (StateLeWM) trained inside FlatWorld:
 random-push data collection, latent dynamics training, and CEM planning
-for PushToGoal. **318K** parameters. Current numbers (50 episodes, CEM H=32): leftmost
-**94%**, rightmost **92%**, random **82%**. Shipped weights:
-`learning/checkpoints/best.pt`.
+for PushToGoal. **320K** parameters. Current numbers (50 episodes, CEM H=32): leftmost
+**98%**, rightmost **96%**, random **96%**. The same recipe transfers to
+two-room traversal (**49/50 = 98%**) and a gravity two-link reacher
+(**48/50 = 96%**). Shipped weights:
+`learning/checkpoints/push_game/best.pt`.
 
 <p align="center">
   <img src="docs/statelewm_worldmodel.png" width="920" alt="StateLeWM one-step world model: current frame to predicted next frame" />
@@ -77,6 +79,41 @@ for PushToGoal. **318K** parameters. Current numbers (50 episodes, CEM H=32): le
 <p align="center">
   <img src="docs/statelewm_inference.png" width="920" alt="StateLeWM inference: observe, encode, latent, CEM imagination, act in FlatWorld" />
 </p>
+
+### Two more cases of the same recipe: Two-room and Reacher
+
+**Two-room** and **Reacher** are two further cases of the same LeWM recipe —
+learn a latent world model from goal-free interaction, then plan with CEM — not
+new architectures. They reuse the identical StateLeWM encoder/predictor/losses:
+only the *data* and a typed-edge + (x, y, θ) readout changed. Two-room is a
+walled arena with a ~0.40 m doorway; the goal always sits in the room the EE
+did **not** start in, so the planner has to find the door itself. Reacher is a
+gravity two-link arm whose actions are PD joint-angle targets.
+
+| scene | success (50 ep, seed 1000) | tol / vel | weights |
+|-------|----------------------------|-----------|---------|
+| PushToGoal (leftmost / rightmost / random) | 98 / 96 / 96 % | 0.08 m / 0.08 m/s | `learning/checkpoints/push_game` |
+| Two-room | **49/50 = 98%** | 0.10 m / 0.15 m/s | `learning/checkpoints/two_room` |
+| Reacher | **48/50 = 96%** | 0.06 m / 0.18 m/s | `learning/checkpoints/reacher` |
+
+Two-room and Reacher are exactly the two benchmark tasks used by the pixel-based
+LeWM line, so the task names line up and the success rates can be put side by side:
+
+| method | Two-Room | Reacher |
+|--------|----------|---------|
+| **StateLeWM** (this repo — state + EE tactile) | **98** | **96** |
+| solver-CEM (learning-free, engine rollouts) | 80 | 30 |
+| LeWM | 87 | 86 |
+| Fast-LeWM | 98 | 88 |
+| DINO-WM | 100 | 79 |
+| PLDM | 97 | 78 |
+
+Success %. The StateLeWM / solver-CEM rows are measured here (50 / 10 episodes);
+the LeWM-family rows are their published numbers on *their own* Two-Room / Reacher
+implementations (pixel observations, their own episode counts and success
+thresholds — LeWM: Maes et al., 2026; Fast-LeWM: Gao & Xu, 2026; DINO-WM: Zhou et
+al., 2025; PLDM: Sobal et al., 2025). Read it as a size anchor, not a controlled
+head-to-head.
 
 ## Spirit Push
 
@@ -87,7 +124,7 @@ Gauntlet, layouts **randomize** (seeded — retry is the same mix).
 
 ```bash
 python -m game
-# or: python -m game --checkpoint learning/checkpoints
+# or: python -m game --checkpoint learning/checkpoints/push_game
 ```
 
 Gold is the target, red is a one-hit hazard, the star is the goal.
@@ -222,7 +259,7 @@ pytest test2D -q
 
 完整说明（架构、损失、评测）：**[learning/README.md](learning/README.md)**。
 
-[`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。模型 **31.8 万参数**。当前成功率（50 局，CEM H=32）：最左 **94%** / 最右 **92%**，随机 **82%**。默认权重：`learning/checkpoints/best.pt`。
+[`learning/`](learning/README.md) 是在 FlatWorld 里训练的轻量 **状态 + 触觉条件潜变量世界模型**（StateLeWM）：随机推挤采集、潜变量动力学、CEM 规划 PushToGoal。模型 **32.1 万参数**。当前成功率（50 局，CEM H=32）：最左 **98%** / 最右 **96%**，随机 **96%**。默认权重：`learning/checkpoints/push_game/best.pt`。
 
 <p align="center">
   <img src="docs/statelewm_worldmodel.png" width="920" alt="StateLeWM 一步预测：当前帧到下一帧" />
@@ -231,6 +268,37 @@ pytest test2D -q
 <p align="center">
   <img src="docs/statelewm_inference.png" width="920" alt="StateLeWM 推理：观察、编码、潜变量、CEM 想象、在 FlatWorld 执行" />
 </p>
+
+### 同一套配方的另外两个案例：Two-room 与 Reacher
+
+**Two-room** 和 **Reacher** 是同一套 LeWM 配方（无目标交互里学一个潜变量世界模型，再用
+CEM 规划）的另外两个案例，不是新架构。它们复用完全相同的 StateLeWM 编码器 / 预测器 /
+损失，只有**数据**和 typed-edge + (x, y, θ) 读出变了。Two-room 是带 ~0.40 m 门洞
+的隔墙房间，目标永远在 EE 起始房间的另一侧，规划必须自己找到门；Reacher 是重力二连杆臂，
+动作为 PD 关节角目标。
+
+| 场景 | 成功率（50 局，seed 1000） | tol / vel | 权重 |
+|------|--------------------------|-----------|------|
+| PushToGoal（最左 / 最右 / 随机） | 98 / 96 / 96 % | 0.08 m / 0.08 m/s | `learning/checkpoints/push_game` |
+| Two-room | **49/50 = 98%** | 0.10 m / 0.15 m/s | `learning/checkpoints/two_room` |
+| Reacher | **48/50 = 96%** | 0.06 m / 0.18 m/s | `learning/checkpoints/reacher` |
+
+Two-room 与 Reacher 正是像素系 LeWM 一脉所用的同两个基准任务，任务名可对齐，因此成功率可以
+并排参考：
+
+| 方法 | Two-Room | Reacher |
+|------|----------|---------|
+| **StateLeWM**（本仓库，状态 + EE 触觉） | **98** | **96** |
+| solver-CEM（无学习，引擎 rollout） | 80 | 30 |
+| LeWM | 87 | 86 |
+| Fast-LeWM | 98 | 88 |
+| DINO-WM | 100 | 79 |
+| PLDM | 97 | 78 |
+
+数字为成功率（%）。StateLeWM / solver-CEM 两行是本仓库实测（50 局 / 10 局）；LeWM 系各行是它们
+**各自实现**的 Two-Room / Reacher（像素观测、各自的局数与成功阈值）的公开成绩（LeWM:
+Maes et al., 2026；Fast-LeWM: Gao & Xu, 2026；DINO-WM: Zhou et al., 2025；PLDM: Sobal et
+al., 2025）。这是量级参照，不是受控对比。
 
 ## Spirit Push 游戏
 

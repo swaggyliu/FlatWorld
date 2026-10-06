@@ -1,7 +1,7 @@
 """Evaluate PushToGoal with the shipped CEM controller.
 
 Usage (repo root):
-    python -m learning.eval_task --checkpoint learning/checkpoints \\
+    python -m learning.eval_task --checkpoint learning/checkpoints/push_game \\
         --episodes 50 --target-mode random
     python -m learning.eval_task --task push_t --solver-cem --episodes 10
 """
@@ -33,7 +33,7 @@ def _task_bundle(name: str):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", nargs="+", type=str,
-                        default=["learning/checkpoints"],
+                        default=["learning/checkpoints/push_game"],
                         help="checkpoint dir(s) or file(s); multiple = ensemble")
     parser.add_argument("--task", type=str, default="push",
                         help="push | two_room | push_t | reacher")
