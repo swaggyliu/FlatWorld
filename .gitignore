@@ -16,10 +16,6 @@ htmlcov/
 .tox/
 .nox/
 
-# Taichi offline cache
-ticache/
-**/ticache/
-
 # IDE
 .idea/
 .vscode/
@@ -65,7 +61,6 @@ depracted/
 !docs/statelewm_inference.svg
 !docs/statelewm_worldmodel.png
 !docs/statelewm_worldmodel.svg
-results/*
 paper/*
 
 # Local files

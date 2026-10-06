@@ -102,13 +102,12 @@ LeWM line, so the task names line up and the success rates can be put side by si
 | method | Two-Room | Reacher |
 |--------|----------|---------|
 | **StateLeWM** (this repo — state + EE tactile) | **98** | **96** |
-| solver-CEM (learning-free, engine rollouts) | 80 | 30 |
 | LeWM | 87 | 86 |
 | Fast-LeWM | 98 | 88 |
 | DINO-WM | 100 | 79 |
 | PLDM | 97 | 78 |
 
-Success %. The StateLeWM / solver-CEM rows are measured here (50 / 10 episodes);
+Success %. The StateLeWM row is measured here (50 / 10 episodes);
 the LeWM-family rows are their published numbers on *their own* Two-Room / Reacher
 implementations (pixel observations, their own episode counts and success
 thresholds — LeWM: Maes et al., 2026; Fast-LeWM: Gao & Xu, 2026; DINO-WM: Zhou et
@@ -289,13 +288,12 @@ Two-room 与 Reacher 正是像素系 LeWM 一脉所用的同两个基准任务�
 | 方法 | Two-Room | Reacher |
 |------|----------|---------|
 | **StateLeWM**（本仓库，状态 + EE 触觉） | **98** | **96** |
-| solver-CEM（无学习，引擎 rollout） | 80 | 30 |
 | LeWM | 87 | 86 |
 | Fast-LeWM | 98 | 88 |
 | DINO-WM | 100 | 79 |
 | PLDM | 97 | 78 |
 
-数字为成功率（%）。StateLeWM / solver-CEM 两行是本仓库实测（50 局 / 10 局）；LeWM 系各行是它们
+数字为成功率（%）。StateLeWM 是本仓库实测（50 局 / 10 局）；LeWM 系各行是它们
 **各自实现**的 Two-Room / Reacher（像素观测、各自的局数与成功阈值）的公开成绩（LeWM:
 Maes et al., 2026；Fast-LeWM: Gao & Xu, 2026；DINO-WM: Zhou et al., 2025；PLDM: Sobal et
 al., 2025）。这是量级参照，不是受控对比。

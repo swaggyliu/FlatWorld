@@ -293,13 +293,12 @@ pixel-based latent world models, so success rates line up across methods:
 | method | Two-Room | Reacher | observation |
 |--------|----------|---------|-------------|
 | **StateLeWM** (this repo) | **98** | **96** | 6-d state + EE tactile |
-| solver-CEM (learning-free, engine rollouts) | 80 | 30 | — |
 | LeWM | 87 | 86 | pixels |
 | Fast-LeWM | 98 | 88 | pixels |
 | DINO-WM | 100 | 79 | pixels |
 | PLDM | 97 | 78 | pixels |
 
-Success %. StateLeWM / solver-CEM are measured here (50 / 10 episodes); the
+Success %. StateLeWM is measured here (50 episodes); the
 LeWM-family rows are published numbers on *their own* Two-Room / Reacher (LeWM:
 Maes et al., 2026; Fast-LeWM: Gao & Xu, 2026; DINO-WM: Zhou et al., 2025; PLDM:
 Sobal et al., 2025) with different episode counts, success thresholds, and pixel
@@ -342,17 +341,6 @@ Outputs land in `learning/checkpoints/<scene>/` (push defaults to
 `learning/checkpoints/push_game`; or pass `--out`) and
 `learning/results/` (`train_log.csv`, `task_eval_<tag>.json`, figures
 under `current_best/` after `--current-best`).
-
-## Diagnostics
-
-| script | purpose |
-|--------|---------|
-| `learning.debug_force`   | ground-truth EE force response (F=ma sanity) |
-| `learning.debug_data`    | collected-data action balance / physics checks |
-| `learning.debug_cost`    | planner cost landscape for constant actions |
-| `learning.debug_contact` | in-contact imagination vs. ground truth |
-| `learning.debug_plan`    | closed-loop EE / target trajectory dump |
-| `learning.debug_imagined`| open-loop `xy_head` rollout vs. simulator |
 
 ## Validation criteria
 
