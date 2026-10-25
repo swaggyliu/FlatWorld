@@ -10,17 +10,12 @@ sys.path.append(parent_dir)
 import argparse
 from flatworld import (
     BallRigid,
-    BoxRigid,
-    EnforceRotAcc,
     EnforceRotVel,
     ExplicitLoop,
-    Fixed,
     FixedAll,
-    Force,
-    Gravity,
     RigidBodyDomain,
 )
-from flatworld.joints import RevoluteJoint, WeldJoint
+from flatworld.joints import RevoluteJoint
 from test_utils import create_gui_if_available, init_sim
 
 
@@ -29,12 +24,10 @@ def test_2Dsolar_system(headless=False):
     init_sim()
     sun_radius_vis = 0.06
 
-    earth_orbit_radius = 0.25
     earth_radius_vis = 0.02  # sun_radius_vis/100
     # orbital period in seconds (visual time)
     earth_period = 10.0
 
-    moon_orbit_radius = 0.06
     moon_radius_vis = 0.008  # earth_radius_vis/3.5
     moon_period = 2.5
 
@@ -56,23 +49,16 @@ def test_2Dsolar_system(headless=False):
     joint2 = RevoluteJoint(1, 2, pivot2, [0, 0], bcs=[EnforceRotVel([0], [10 * pi / moon_period], origin=pivot2)])
 
     frame_dt = 1.0 / 60.0
-    looper = ExplicitLoop(0.0, domains, joints=[joint1, joint2], useAdapativeDT=True)
+    looper = ExplicitLoop(0.0, domains, joints=[joint1, joint2], useAdapativeDT=True, pgs_iterations=200)
 
     gui = create_gui_if_available("2D Rigid Rotation BCs", res=(720, 720)) if not headless else None
     t = 0.0
-
-    color_box = 0x3333FF
 
     print("Rotating rigid demonstration:")
     print("  Sun (yellow): fixed at center")
     print("  Earth (blue): orbits Sun")
     print("  Moon (gray): orbits Earth")
 
-    # Initialize trajectory tracking
-    trail_length = 600  # Store up to 600 points (10 seconds at 60 fps)
-    trail_sun = []
-    trail_earth = []
-    trail_moon = []
 
     while (gui is None or gui.running) and t < 2.0:  # Run for 2 seconds
 
@@ -80,36 +66,6 @@ def test_2Dsolar_system(headless=False):
             frame_dt = 2.0 - t  # Adjust last step to end exactly at 2.0 seconds
         looper.advanceWithTime(frame_dt)
         t += frame_dt
-
-        # Get current positions from rigidManager
-        # mgr = looper.rigidManager
-        # params = mgr.rigidParams.numpy()
-        # pos_sun = params[0, 0, :2]      # rigiddomain1 (index 0)
-        # pos_earth = params[1, 0, :2]    # rigiddomain2 (index 1)
-        # pos_moon = params[2, 0, :2]     # rigiddomain3 (index 2)
-
-        # # Update trails (keep last trail_length points)
-        # trail_sun.append(pos_sun.copy())
-        # if len(trail_sun) > trail_length:
-        #     trail_sun.pop(0)
-
-        # trail_earth.append(pos_earth.copy())
-        # if len(trail_earth) > trail_length:
-        #     trail_earth.pop(0)
-
-        # trail_moon.append(pos_moon.copy())
-        # if len(trail_moon) > trail_length:
-        #     trail_moon.pop(0)
-
-        # gui.clear(0x222222)
-
-        # # Draw trails as small circles
-        # if len(trail_sun) > 1:
-        #     gui.circles(np.array(trail_sun), radius=1, color=0xFFCC33)
-        # if len(trail_earth) > 1:
-        #     gui.circles(np.array(trail_earth), radius=1, color=0x3399FF)
-        # if len(trail_moon) > 1:
-        #     gui.circles(np.array(trail_moon), radius=1, color=0xDDDDDD)
 
         # Display time
         if gui is not None:
