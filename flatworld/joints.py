@@ -159,7 +159,6 @@ class RevoluteJoint(JointBase):
         velocity_limit=1e10,
         effort_limit=1e10,
         position_bias=0.2,
-        pgs_iters=5,
         stiff=100.0,
         damping=1.0,
         name="",
@@ -194,7 +193,6 @@ class RevoluteJoint(JointBase):
         self.effort_limit = float(effort_limit)
 
         self.position_bias = position_bias
-        self.pgs_iters = pgs_iters
         self.stiff = stiff
         self.damping = damping
         self.motor_target_position = motor_target_position

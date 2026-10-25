@@ -82,6 +82,7 @@ class ExplicitLoop(MixedContact):
         use_pd=0,
         mass_scaling_dt=0.0,
         max_contact_velocity=50.0,
+        pgs_iterations=50
     ):
         """
         Args:
@@ -156,6 +157,7 @@ class ExplicitLoop(MixedContact):
                 skip_spatial_hash=skip_spatial_hash,
                 considerRigidRigidContact=considerRigidRigidContact,
                 use_pd=self.use_pd,
+                pgs_iterations=pgs_iterations,
             )
             self.stableTime = min(self.rigidManager.stableTime, self.stableTime)
             self.rigidManager.setGlobalAABB(self.aabb)

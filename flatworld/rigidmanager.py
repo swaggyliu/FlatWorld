@@ -2297,7 +2297,7 @@ def _compute_contact_forces_wp(
 
 
 class RigidManager:
-    def __init__(self, d, domains, joints, bvh=None, skip_spatial_hash=False, considerRigidRigidContact=True, use_pd=0):
+    def __init__(self, d, domains, joints, bvh=None, skip_spatial_hash=False, considerRigidRigidContact=True, use_pd=0, pgs_iterations=50):
         """Initialize RigidManager and allocate Warp arrays for rigids and state.
 
         Args:
@@ -2795,7 +2795,7 @@ class RigidManager:
         # tips as a unit.
         self.joint_pd_world_frame = wp.zeros(self.MAX_JOINTS, dtype=int)
 
-        self.pgs_iterations = 200
+        self.pgs_iterations = pgs_iterations
         self.pgs_tol = 1e-5
 
         self.MAX_CONSTRAINTS = 16 * self.MAX_CONTACTS * 3 + 7 * self.MAX_JOINTS  # 3 per contact and 7 per joints
