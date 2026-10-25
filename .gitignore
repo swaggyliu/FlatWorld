@@ -77,3 +77,9 @@ learning/results/*
 !learning/results/*.csv
 *.txt
 !requirements.txt
+
+# supermimic2d: scratch / resume artifacts (keep best.pt, baked refs, videos)
+supermimic2d/**/__pycache__/
+supermimic2d/**/last.pt
+supermimic2d/**/_diag*/
+supermimic2d/**/frames/
