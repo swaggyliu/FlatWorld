@@ -114,6 +114,27 @@ thresholds — LeWM: Maes et al., 2026; Fast-LeWM: Gao & Xu, 2026; DINO-WM: Zhou
 al., 2025; PLDM: Sobal et al., 2025). Read it as a size anchor, not a controlled
 head-to-head.
 
+## SuperMimic-2D
+
+A **2D recreation of [SuperMimic](https://supermimic.github.io/)** on FlatWorld:
+fit a shared rigid-body world model, then improve a goal-conditioned policy by
+**BPTT through short imagined rollouts** (walk / run / sprint / dance / jump /
+crouch / fight / fall-getup). Full write-up: **[supermimic2d/README.md](supermimic2d/README.md)**.
+
+<p align="center">
+  <a href="supermimic2d/runs/lafan2d/promo_supermimic.mp4"><strong>▶ Watch the promo (~33s)</strong></a>
+  ·
+  <a href="supermimic2d/runs/lafan2d/showcase_30s.mp4">30s showcase</a>
+  ·
+  <a href="supermimic2d/runs/dance/overlay_compare.mp4">dance overlay</a>
+</p>
+
+```bash
+python -m supermimic2d.bake_refs
+python -m supermimic2d.train --out supermimic2d/runs/lafan2d --library lafan2d --iters 80
+python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt
+```
+
 ## Spirit Push
 
 A raylib prototype that uses the world model as a **spirit**: you click
@@ -169,6 +190,7 @@ Regenerate locally: `python scripts/capture_gallery.py`
 ## Documentation
 
 - [Learning world models](learning/README.md)
+- [SuperMimic-2D](supermimic2d/README.md)
 - [Theory & implementation (中文)](docs/THEORY_AND_IMPLEMENTATION.md)
 - [Contributing](CONTRIBUTING.md)
 
@@ -183,6 +205,7 @@ FlatWorld/
 │   ├── rigidmanager.py # Rigid SAT / PGS / batched ground contact
 │   └── sat.py          # 2D box–box SAT
 ├── learning/           # StateLeWM world model + PushToGoal CEM
+├── supermimic2d/       # SuperMimic-style 2D motion imitation
 ├── game/               # raylib prototype (python -m game)
 ├── test2D/             # 2D examples & pytest suite
 └── docs/
@@ -298,6 +321,24 @@ Two-room 与 Reacher 正是像素系 LeWM 一脉所用的同两个基准任务�
 Maes et al., 2026；Fast-LeWM: Gao & Xu, 2026；DINO-WM: Zhou et al., 2025；PLDM: Sobal et
 al., 2025）。这是量级参照，不是受控对比。
 
+## SuperMimic-2D
+
+在 FlatWorld 上复现的 **2D [SuperMimic](https://supermimic.github.io/)**：先拟合共享刚体世界模型，再通过**短想象轨迹上的 BPTT** 改进目标条件策略（走 / 跑 / 冲刺 / 舞 / 跳 / 蹲 / 打 / 起身）。说明见 **[supermimic2d/README.md](supermimic2d/README.md)**。
+
+<p align="center">
+  <a href="supermimic2d/runs/lafan2d/promo_supermimic.mp4"><strong>▶ 观看宣传片（约 33 秒）</strong></a>
+  ·
+  <a href="supermimic2d/runs/lafan2d/showcase_30s.mp4">30 秒合集</a>
+  ·
+  <a href="supermimic2d/runs/dance/overlay_compare.mp4">dance 对比</a>
+</p>
+
+```bash
+python -m supermimic2d.bake_refs
+python -m supermimic2d.train --out supermimic2d/runs/lafan2d --library lafan2d --iters 80
+python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt
+```
+
 ## Spirit Push 游戏
 
 用世界模型当「精灵」的 raylib 原型：点要推的物体和落点，CEM 规划力。前五关是固定战役（1 个圆形末端执行器 + 3 箱 + 2 球）；第 6 关起按种子**随机出关**（重试同一关不变，跳过/过关是新布局）。
@@ -323,6 +364,7 @@ python -m game
 ## 文档
 
 - [学习世界模型](learning/README.md)
+- [SuperMimic-2D](supermimic2d/README.md)
 - [理论与实现](docs/THEORY_AND_IMPLEMENTATION.md)
 - [贡献指南](CONTRIBUTING.md)
 
