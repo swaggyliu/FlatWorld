@@ -45,6 +45,11 @@ jobs:
           echo "Then re-run this workflow (Actions → Pages → Re-run, or push to docs/)."
           exit 1
 
+      - name: Render markdown docs to HTML
+        run: |
+          python -m pip install --quiet markdown
+          python docs/_render_md.py
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs

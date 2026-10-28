@@ -14,10 +14,15 @@
   <div class="bar">
     <span id="score">YOU 0 — AI 0</span>
     <span id="status">connecting…</span>
-    <span id="backend"></span>
+    <span id="difficulty" class="difficulty">
+      <span>AI</span>
+      <button type="button" data-level="low">Low</button>
+      <button type="button" data-level="medium" class="active">Medium</button>
+      <button type="button" data-level="high">High</button>
+    </span>
   </div>
   <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
-  <p class="hint">WASD move · Space/R rematch · P pause · click canvas to focus</p>
+  <p class="hint">WASD move · 1/2/3 difficulty · Space/R rematch · P pause · click canvas to focus</p>
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>

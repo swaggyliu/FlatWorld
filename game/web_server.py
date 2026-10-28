@@ -11,6 +11,7 @@ Protocol (JSON text frames)::
     client -> {"type":"keys","down":["w","a"]}   # currently held keys
     client -> {"type":"rematch"}
     client -> {"type":"pause"}
+    client -> {"type":"difficulty","level":"low"|"medium"|"high"}
     server -> snapshot dict from PushTVersusSession.snapshot()
 """
 
@@ -110,6 +111,8 @@ def _build_app(wm: str, policy: str, hold: int, seed: int, hz: float) -> FastAPI
                             obj.next_episode()
                         elif typ == "pause":
                             obj.paused = not obj.paused
+                        elif typ == "difficulty":
+                            obj._set_difficulty(msg.get("level", "medium"))
                         elif typ == "hello":
                             pass
             except WebSocketDisconnect:

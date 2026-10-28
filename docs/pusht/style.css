@@ -49,3 +49,26 @@ h1 {
   touch-action: none;
 }
 .hint { color: var(--muted); font-size: 0.85rem; margin-top: 0.75rem; }
+.difficulty {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+.difficulty span { margin-right: 0.25rem; }
+.difficulty button {
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0.28rem 0.65rem;
+  border-radius: 7px;
+  border: 1px solid #3a4656;
+  background: #1a2430;
+  color: var(--muted);
+  cursor: pointer;
+}
+.difficulty button.active {
+  background: var(--accent, #0b6e4f);
+  border-color: var(--accent, #0b6e4f);
+  color: #fff;
+}
+.difficulty button:hover { color: var(--text); }

@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Theory & implementation — FlatWorld</title>
+  <link rel="stylesheet" href="doc.css" />
+</head>
+<body>
+  <nav class="doc-nav">
+    <a href="./">FlatWorld</a>
+    <a href="theory.html">Theory</a>
+    <a href="theory.zh.html">理论</a>
+    <a href="paradigms.html">Paradigms</a>
+    <a href="https://github.com/swaggyliu/FlatWorld">GitHub</a>
+  </nav>
+  <main class="doc-body">
+<h1 id="flat-world-physics-engine-theory-and-implementation">Flat World Physics Engine — Theory and Implementation</h1>
+<p><strong>English</strong> | <a href="theory.zh.html">中文</a></p>
+<blockquote>
+<p><strong>Flat World</strong> (FlatWorld) is a real-time multiphysics simulation platform built on <a href="https://nvidia.github.io/warp/">NVIDIA Warp</a>. It supports <strong>rigid-body dynamics</strong>, the <strong>finite element method (FEM)</strong>, <strong>spring–mass systems</strong>, and three static ground representations: <strong>analytical plane (Ground)</strong>, <strong>height field (HeightField)</strong>, and <strong>voxel grid (Voxel)</strong>.</p>
+</blockquote>
+<hr>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ol>
+<li><a href="#1-project-overview">Project Overview</a></li>
+<li><a href="#2-overall-architecture">Overall Architecture</a></li>
+<li><a href="#3-finite-element-method-fem">Finite Element Method (FEM)</a></li>
+<li><a href="#4-rigid-body-dynamics">Rigid-Body Dynamics</a></li>
+<li><a href="#5-ground-types">Ground Types</a></li>
+<li><a href="#6-contact-and-collision">Contact and Collision</a></li>
+<li><a href="#7-time-integration-and-adaptive-step-size">Time Integration and Adaptive Step Size</a></li>
+<li><a href="#8-test2d-test-cases">test2D Test Cases</a></li>
+<li><a href="#9-quick-start-examples">Quick-Start Examples</a></li>
+</ol>
+<hr>
+<h2 id="1-project-overview">1. Project Overview</h2>
+<h3 id="11-tech-stack">1.1 Tech Stack</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Language</td>
+<td>Python 3</td>
+</tr>
+<tr>
+<td>Compute backend</td>
+<td>NVIDIA Warp (GPU/CPU parallel kernels)</td>
+</tr>
+<tr>
+<td>Dependencies</td>
+<td>warp-lang, numpy, scipy, meshio, pytest</td>
+</tr>
+</tbody>
+</table>
+<h3 id="12-directory-structure">1.2 Directory Structure</h3>
+<pre><code>FlatWorld/
+├── flatworld/                  # Core engine
+│   ├── explicitloop.py         # Main simulation loop (ExplicitLoop)
+│   ├── femspringmanager.py     # Unified FEM / spring data management and integration
+│   ├── rigidmanager.py         # Rigid-body state, collision detection, PGS constraint solver
+│   ├── femdomain.py            # FEM domain wrapper
+│   ├── rigiddomain.py          # Rigid-body domain wrapper
+│   ├── grounddomain.py         # Analytical plane ground (GroundDomain)
+│   ├── heightfielddomain.py    # Height-field ground
+│   ├── voxeldomain.py          # Voxel-grid ground
+│   ├── femcontact.py           # Soft-body penalty contact
+│   ├── mesh.py                 # Mesh, shape functions, B matrix
+│   ├── contact_detection.py    # Point–edge, point–face contact detection
+│   ├── sat.py / gjk.py         # 2D SAT / GJK-EPA collision
+│   ├── bvh.py                  # Broad-phase collision detection
+│   ├── joints.py               # Joint definitions
+│   ├── bcs.py                  # Boundary conditions
+│   └── materials/              # Constitutive models
+└── test2D/                     # 2D tests and demos (51 files)
+</code></pre>
+<h3 id="13-domain-types-domaintype">1.3 Domain Types (DomainType)</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Constant</th>
+<th>Typical class</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Analytical plane</td>
+<td><code>ANALYTICAL</code></td>
+<td><code>GroundDomain</code></td>
+</tr>
+<tr>
+<td>Finite element</td>
+<td><code>FEM</code></td>
+<td><code>FemDomain</code></td>
+</tr>
+<tr>
+<td>Rigid body</td>
+<td><code>RIGID</code></td>
+<td><code>RigidBodyDomain</code></td>
+</tr>
+<tr>
+<td>Spring–mass</td>
+<td><code>SPRINGMASS</code></td>
+<td><code>SpringMassDomain</code></td>
+</tr>
+<tr>
+<td>Height field</td>
+<td><code>HEIGHTFIELD</code></td>
+<td><code>HeightFieldDomain</code></td>
+</tr>
+<tr>
+<td>Voxel map</td>
+<td><code>VOXELMAP</code></td>
+<td><code>VoxelGridDomain</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="2-overall-architecture">2. Overall Architecture</h2>
+<h3 id="21-simulation-pipeline">2.1 Simulation Pipeline</h3>
+<p><code>ExplicitLoop</code> is the simulation entry point and coordinates all subsystems:</p>
+<pre><code>┌─────────────────────────────────────────────────────────────┐
+│                      ExplicitLoop                           │
+│  advanceWithTime(frame_dt)                                  │
+│    └─ Adaptive substeps by stableTime                       │
+│         └─ advance()                                        │
+│              1. BVH broad phase → candidate collision pairs │
+│              2. Batched contact forces (FEM ↔ ground/rigid) │
+│              3. FemSpringManager.substep() → FEM integration│
+│              4. RigidManager.substep() → rigid + PGS        │
+└─────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="22-dual-manager-design">2.2 Dual-Manager Design</h3>
+<table>
+<thead>
+<tr>
+<th>Manager</th>
+<th>Domains</th>
+<th>Contact method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FemSpringManager</code></td>
+<td>FEM, SpringMass</td>
+<td><strong>Penalty forces</strong> (force level, added to <code>Fext</code>)</td>
+</tr>
+<tr>
+<td><code>RigidManager</code></td>
+<td>Rigid, Ground, HeightField, Voxel</td>
+<td><strong>Impulses + PGS</strong> (velocity-level constraints)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="23-contact-type-matrix">2.3 Contact-Type Matrix</h3>
+<table>
+<thead>
+<tr>
+<th>Contact pair</th>
+<th>Status</th>
+<th>Method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FEM ↔ analytical plane</td>
+<td>✅</td>
+<td>Penalty contact</td>
+</tr>
+<tr>
+<td>FEM ↔ height field</td>
+<td>✅</td>
+<td>Penalty contact</td>
+</tr>
+<tr>
+<td>FEM ↔ voxel</td>
+<td>✅</td>
+<td>Penalty contact</td>
+</tr>
+<tr>
+<td>FEM ↔ FEM</td>
+<td>✅</td>
+<td>Penalty contact</td>
+</tr>
+<tr>
+<td>FEM ↔ rigid</td>
+<td>✅</td>
+<td>Penalty contact</td>
+</tr>
+<tr>
+<td>Rigid ↔ analytical plane</td>
+<td>✅</td>
+<td>Impulse + PGS</td>
+</tr>
+<tr>
+<td>Rigid ↔ height field</td>
+<td>✅</td>
+<td>Impulse + PGS</td>
+</tr>
+<tr>
+<td>Rigid ↔ voxel</td>
+<td>✅</td>
+<td>Impulse + PGS</td>
+</tr>
+<tr>
+<td>Rigid ↔ rigid</td>
+<td>✅</td>
+<td>SAT/GJK + PGS</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="3-finite-element-method-fem">3. Finite Element Method (FEM)</h2>
+<h3 id="31-theoretical-background">3.1 Theoretical Background</h3>
+<p>The engine uses a hybrid of <strong>explicit dynamics</strong> and a <strong>Total Lagrangian</strong> formulation:</p>
+<h4 id="311-elements-and-shape-functions">3.1.1 Elements and Shape Functions</h4>
+<ul>
+<li><strong>2D</strong>: Linear triangular elements (3 nodes)</li>
+<li><strong>3D</strong>: Linear tetrahedral elements (4 nodes)</li>
+<li>Shape functions (2D triangle, barycentric coordinates):</li>
+</ul>
+<p>[
+N_1 = \psi,\quad N_2 = \eta,\quad N_3 = 1 - \psi - \eta
+]</p>
+<ul>
+<li>The Jacobian and B matrix are evaluated at the element centroid ((\psi = \eta = 0)) (constant strain / constant stress)</li>
+</ul>
+<h4 id="312-deformation-gradient">3.1.2 Deformation Gradient</h4>
+<p>The reference-configuration Jacobian (J_{\text{ref}}) is stored at initialization. In the current configuration:</p>
+<p>[
+J = \frac{\partial x}{\partial \xi},\quad F = J \cdot J_{\text{ref}}^{-1}
+]</p>
+<h4 id="313-strain-and-stress">3.1.3 Strain and Stress</h4>
+<p><strong>Green–Lagrange strain</strong> (Voigt form):</p>
+<p>[
+\varepsilon = \tfrac{1}{2}(F^T F - I)
+]</p>
+<p><strong>Constitutive relation</strong> (PK2 stress → stored as Cauchy stress):</p>
+<p>[
+\sigma_{\text{Cauchy}} = \frac{1}{J} F S F^T
+]</p>
+<h4 id="314-internal-force-assembly">3.1.4 Internal Force Assembly</h4>
+<p>[
+f_{\text{int}} = B^T \sigma \cdot V_{\text{elem}}
+]</p>
+<p>where (B) is the strain–displacement matrix and (V_{\text{elem}}) is the element volume (area in 2D).</p>
+<h4 id="315-time-integration">3.1.5 Time Integration</h4>
+<p>Explicit central-difference style:</p>
+<p>[
+a = \frac{F_{\text{ext}} - c \cdot v}{m},\quad v \leftarrow v + a \cdot \Delta t,\quad u \leftarrow u + v \cdot \Delta t
+]</p>
+<p>Implementation: <code>femspringmanager.py</code> → <code>femStep()</code> kernel.</p>
+<h4 id="316-stable-time-step">3.1.6 Stable Time Step</h4>
+<p>[
+\Delta t_{\text{stable}} \approx 0.4 \cdot \frac{L_{\text{char}}}{\sqrt{E/\rho}}
+]</p>
+<p>where (L_{\text{char}}) is the mesh minimum edge length, (E) is Young’s modulus, and (\rho) is density.</p>
+<p>Implementation: <code>femdomain.py</code>.</p>
+<h3 id="32-material-models">3.2 Material Models</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Enum</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linear elastic</td>
+<td><code>MaterialType.ELASTIC</code></td>
+<td>Lamé parameters (\lambda, \mu), Hooke’s law</td>
+</tr>
+<tr>
+<td>Neo-Hookean</td>
+<td><code>MaterialType.NEOHOOKEAN</code></td>
+<td>Compressible hyperelasticity</td>
+</tr>
+<tr>
+<td>J2 von Mises</td>
+<td><code>MaterialType.MISES</code></td>
+<td>Radial-return plasticity, isotropic hardening</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Linear elastic Lamé parameters</strong>:</p>
+<p>[
+\lambda = \frac{E\nu}{(1+\nu)(1-2\nu)},\quad \mu = \frac{E}{2(1+\nu)}
+]</p>
+<p><strong>J2 plasticity</strong>: Uses radial return mapping. When the von Mises equivalent stress exceeds the yield surface, the deviatoric stress is corrected and the plastic strain history is updated.</p>
+<p>Implementation: <code>materials/materialfunctions.py</code>.</p>
+<h3 id="33-implementation-notes">3.3 Implementation Notes</h3>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>File</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Domain wrapper</td>
+<td><code>femdomain.py</code></td>
+<td>Mesh, material, BCs, stable step size</td>
+</tr>
+<tr>
+<td>Unified manager</td>
+<td><code>femspringmanager.py</code></td>
+<td>Global node/element arrays, batched <code>femStep</code></td>
+</tr>
+<tr>
+<td>Mesh utilities</td>
+<td><code>mesh.py</code></td>
+<td>Shape functions, Jacobian, B matrix, boundary-edge extraction</td>
+</tr>
+<tr>
+<td>Mesh generation</td>
+<td><code>femesher.py</code></td>
+<td>Circle meshes, Gmsh/VTU import</td>
+</tr>
+<tr>
+<td>Boundary conditions</td>
+<td><code>bcs.py</code></td>
+<td>Gravity, forces, fixed, velocity/acceleration constraints</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Boundary-edge extraction</strong>: Traverse all element edges; edges that appear only once are boundary edges, used for contact detection.</p>
+<hr>
+<h2 id="4-rigid-body-dynamics">4. Rigid-Body Dynamics</h2>
+<h3 id="41-theoretical-background">4.1 Theoretical Background</h3>
+<p>Rigid bodies use <strong>semi-implicit Euler integration</strong> + <strong>impulse-based contact</strong> + a <strong>projected Gauss–Seidel (PGS)</strong> constraint solver.</p>
+<h4 id="411-state-variables-2d">4.1.1 State Variables (2D)</h4>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>U</code></td>
+<td>Reference-point position</td>
+</tr>
+<tr>
+<td><code>V</code></td>
+<td>Linear velocity</td>
+</tr>
+<tr>
+<td><code>quat</code></td>
+<td>Scalar rotation angle (2D about the z-axis)</td>
+</tr>
+<tr>
+<td><code>RotV</code></td>
+<td>Angular velocity</td>
+</tr>
+</tbody>
+</table>
+<h4 id="412-moment-of-inertia">4.1.2 Moment of Inertia</h4>
+<table>
+<thead>
+<tr>
+<th>Shape</th>
+<th>2D moment of inertia</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ball</td>
+<td>(I = \tfrac{1}{2} m r^2)</td>
+</tr>
+<tr>
+<td>Box</td>
+<td>(I = \tfrac{1}{12} m (w^2 + h^2))</td>
+</tr>
+</tbody>
+</table>
+<h4 id="413-contact-response">4.1.3 Contact Response</h4>
+<ul>
+<li><strong>Normal</strong>: Baumgarte ERP ((\text{ERP} = 0.2)) corrects penetration</li>
+<li><strong>Tangential</strong>: Coulomb friction cone</li>
+<li><strong>Restitution</strong>: Configurable restitution coefficient</li>
+</ul>
+<p>Constraints are solved in velocity space; PGS iterations update impulses.</p>
+<h4 id="414-joint-constraints">4.1.4 Joint Constraints</h4>
+<p>Supported joint types (<code>JointType</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Joint</th>
+<th>Constrained DOFs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Revolute</td>
+<td>Keeps 1 rotational DOF</td>
+</tr>
+<tr>
+<td>Weld</td>
+<td>Fully fixes relative pose</td>
+</tr>
+<tr>
+<td>Prismatic</td>
+<td>Keeps 1 translational DOF</td>
+</tr>
+<tr>
+<td>Spherical</td>
+<td>Keeps 3 rotational DOFs</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42-rigid-body-shapes">4.2 Rigid-Body Shapes</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Class</th>
+<th>Collision detection</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ball</td>
+<td><code>BallRigid</code></td>
+<td>Analytical SDF</td>
+</tr>
+<tr>
+<td>Box</td>
+<td><code>BoxRigid</code></td>
+<td>2D SAT</td>
+</tr>
+<tr>
+<td>Capsule</td>
+<td><code>CapsuleRigid</code></td>
+<td>Segment–point / ball</td>
+</tr>
+<tr>
+<td>Mesh</td>
+<td><code>MeshRigid</code></td>
+<td>Boundary edges + GJK-EPA</td>
+</tr>
+</tbody>
+</table>
+<p>Implementation: <code>rigid.py</code>, <code>rigiddomain.py</code>, <code>rigidmanager.py</code>.</p>
+<h3 id="43-rigid-contact-pipeline">4.3 Rigid Contact Pipeline</h3>
+<p>Each substep of <code>RigidManager.substep()</code> performs:</p>
+<ol>
+<li>Velocity integration (including damping)</li>
+<li><strong>Broad phase</strong>: BVH or spatial hashing</li>
+<li><strong>Narrow phase</strong>: Dispatch by pair type (ball–ball, box–box, mesh–mesh, etc.)</li>
+<li>Assemble contact rows + joint rows → PGS matrix</li>
+<li>Iterative solve via <code>solve_pgs(iterations)</code></li>
+<li>Position integration + AABB update</li>
+</ol>
+<h3 id="44-collision-filtering">4.4 Collision Filtering</h3>
+<p>Uses ODE-style category/collide bitmasks:</p>
+<pre><code>Pair (a, b) is valid ⟺ (collide_bits[a] &amp; category_bits[b]) ≠ 0
+                    and (collide_bits[b] &amp; category_bits[a]) ≠ 0
+</code></pre>
+<p>Predefined categories: <code>COLLISION_CATEGORY_GROUND</code>, <code>COLLISION_CATEGORY_FEM</code>, <code>COLLISION_CATEGORY_ORDINARY_RIGID</code>, etc.</p>
+<hr>
+<h2 id="5-ground-types">5. Ground Types</h2>
+<p>All three grounds are <strong>static obstacles</strong> with <code>category_bits = COLLISION_CATEGORY_GROUND</code>, but differ in geometric representation and contact detection.</p>
+<h3 id="51-grounddomain-analytical-plane">5.1 GroundDomain — Analytical Plane</h3>
+<p><strong>File</strong>: <code>grounddomain.py</code><br>
+<strong>Type</strong>: <code>DomainType.ANALYTICAL</code></p>
+<h4 id="theory">Theory</h4>
+<p>An infinite plane is defined by a reference point (\mathbf{p}) and a unit normal (\mathbf{n}):</p>
+<p>[
+(\mathbf{x} - \mathbf{p}) \cdot \mathbf{n} = 0
+]</p>
+<p>In 2D the tangent is ([ -n_y, n_x ]). The plane can translate/rotate via BCs bound through <code>RigidManager</code>.</p>
+<h4 id="contact-detection">Contact Detection</h4>
+<ul>
+<li><strong>Rigid</strong>: Signed distance from point to plane → impulse applied at the contact point</li>
+<li><strong>FEM</strong>: Boundary-node penetration check → penalty normal force</li>
+</ul>
+<h4 id="usage-example">Usage Example</h4>
+<pre><code class="language-python">from flatworld import GroundDomain
+
+# Horizontal ground: y=0.1, normal upward
+ground = GroundDomain(2, point=[0, 0.1], normal=[0, 1])
+</code></pre>
+<hr>
+<h3 id="52-heightfielddomain-height-field">5.2 HeightFieldDomain — Height Field</h3>
+<p><strong>File</strong>: <code>heightfielddomain.py</code><br>
+<strong>Type</strong>: <code>DomainType.HEIGHTFIELD</code></p>
+<h4 id="theory_1">Theory</h4>
+<ul>
+<li><strong>2D</strong>: Curve (z = h(x)), stored as a 1D array</li>
+<li><strong>3D</strong>: Surface (z = h(x, y)), stored as a 2D array</li>
+</ul>
+<p>Sampling uses <strong>linear interpolation</strong>; normals are computed from the height gradient:</p>
+<p>[
+\mathbf{n} = \text{normalize}([-dh/dx,\ 1]) \quad \text{(2D)}
+]</p>
+<h4 id="core-methods">Core Methods</h4>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Function</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sample_height_2d(x)</code></td>
+<td>Linearly interpolate height</td>
+</tr>
+<tr>
+<td><code>sample_normal_2d(x)</code></td>
+<td>Compute normal from (dh/dx)</td>
+</tr>
+<tr>
+<td><code>nearest_on_curve_2d(x, z)</code></td>
+<td>Nearest point, normal, and signed distance</td>
+</tr>
+</tbody>
+</table>
+<h4 id="typical-use-cases">Typical Use Cases</h4>
+<p>Smooth terrain: bowl-shaped grooves, sine waves, slopes, etc.</p>
+<h4 id="usage-example_1">Usage Example</h4>
+<pre><code class="language-python">from flatworld import HeightFieldDomain
+import numpy as np
+
+xs = np.linspace(0, 1, 100)
+heights = 0.2 + 0.1 * np.sin(2 * np.pi * xs)
+hf = HeightFieldDomain(2, heights, lb=[0.0, 0.0], ub=[1.0, 1.0])
+</code></pre>
+<hr>
+<h3 id="53-voxelgriddomain-voxel-grid">5.3 VoxelGridDomain — Voxel Grid</h3>
+<p><strong>File</strong>: <code>voxeldomain.py</code><br>
+<strong>Type</strong>: <code>DomainType.VOXELMAP</code></p>
+<h4 id="theory_2">Theory</h4>
+<p>An axis-aligned <strong>occupancy grid</strong> with <code>occ[i,j] = 1</code> for solid cells. At initialization, <strong>boundary edges</strong> (interfaces between solid and empty cells) are precomputed.</p>
+<h4 id="signed-distance">Signed Distance</h4>
+<ul>
+<li><strong>Interior</strong> (inside an occupied cell): Distance to the nearest face (negative for penetration)</li>
+<li><strong>Exterior</strong>: Traverse precomputed boundary edges to find the nearest edge and normal</li>
+</ul>
+<h4 id="typical-use-cases_1">Typical Use Cases</h4>
+<p>Concave static geometry: pits, steps, walls, complex obstacles.</p>
+<h4 id="usage-example_2">Usage Example</h4>
+<pre><code class="language-python">from flatworld import VoxelGridDomain
+import numpy as np
+
+occ = np.zeros((10, 10), dtype=np.int32)
+occ[:3, :] = 1  # Fill bottom 3 rows
+vox = VoxelGridDomain(2, nx=10, ny=10, lb=[0, 0], ub=[1, 1], occupancy_np=occ)
+</code></pre>
+<hr>
+<h3 id="54-comparison-of-the-three-ground-types">5.4 Comparison of the Three Ground Types</h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Ground</th>
+<th>HeightField</th>
+<th>Voxel</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Geometry</td>
+<td>Infinite plane</td>
+<td>Parametric curve/surface</td>
+<td>Occupancy grid</td>
+</tr>
+<tr>
+<td>Concave support</td>
+<td>❌</td>
+<td>Partial (single-valued function)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>Very low</td>
+<td>O(nx) or O(nx·ny)</td>
+<td>O(nx·ny)</td>
+</tr>
+<tr>
+<td>FEM contact</td>
+<td>Penalty force</td>
+<td>Penalty force</td>
+<td>Penalty force</td>
+</tr>
+<tr>
+<td>Rigid contact</td>
+<td>PGS impulse</td>
+<td>PGS impulse</td>
+<td>PGS impulse</td>
+</tr>
+<tr>
+<td>Movable</td>
+<td>✅ (BC-driven)</td>
+<td>❌ Static</td>
+<td>❌ Static</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="6-contact-and-collision">6. Contact and Collision</h2>
+<h3 id="61-soft-body-penalty-contact-fem-spring">6.1 Soft-Body Penalty Contact (FEM / Spring)</h3>
+<h4 id="penalty-stiffness-ls-dyna-style">Penalty Stiffness (LS-DYNA style)</h4>
+<p>[
+k = \text{slsfac} \cdot K \cdot \frac{A_{\text{seg}}^2}{V_{\text{elem}}}
+]</p>
+<p>where the bulk modulus is (K = E / [3(1-2\nu)]).</p>
+<p>2D triangle simplification: (k = 2 \cdot \text{slsfac} \cdot K).</p>
+<h4 id="stable-contact-step-size">Stable Contact Step Size</h4>
+<p>[
+\Delta t_{\text{contact}} = 0.9 \sqrt{\frac{m_{\text{node}}}{k}}
+]</p>
+<h4 id="contact-force">Contact Force</h4>
+<p>When penetration depth (d &gt; 0):</p>
+<p>[
+F_n = k \cdot d \cdot \mathbf{n}
+]</p>
+<p>Optional tangential damping: (F_t = -\mu k v_n \Delta t).</p>
+<p>Implementation: <code>femcontact.py</code>, batched kernels in <code>explicitloop.py</code>.</p>
+<h3 id="62-rigid-impulse-contact">6.2 Rigid Impulse Contact</h3>
+<p>Velocity-level constraints solved iteratively with PGS:</p>
+<p>[
+J \lambda = b
+]</p>
+<p>where (J) is the constraint Jacobian, (\lambda) is the impulse, and (b) includes Baumgarte correction terms.</p>
+<h3 id="63-broad-phase-narrow-phase">6.3 Broad Phase / Narrow Phase</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Method</th>
+<th>File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Broad phase</td>
+<td>BVH (LBVH)</td>
+<td><code>bvh.py</code></td>
+</tr>
+<tr>
+<td>Broad phase (alt.)</td>
+<td>Spatial hashing</td>
+<td><code>spatialmanager.py</code></td>
+</tr>
+<tr>
+<td>2D convex</td>
+<td>SAT</td>
+<td><code>sat.py</code></td>
+</tr>
+<tr>
+<td>3D convex mesh</td>
+<td>GJK-EPA</td>
+<td><code>gjk.py</code></td>
+</tr>
+<tr>
+<td>Point–edge</td>
+<td><code>pointToEdgeContact</code></td>
+<td><code>contact_detection.py</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7-time-integration-and-adaptive-step-size">7. Time Integration and Adaptive Step Size</h2>
+<h3 id="71-fixed-frame-rate-substepping">7.1 Fixed-Frame-Rate Substepping</h3>
+<p><code>ExplicitLoop.advanceWithTime(frame_dt)</code> splits each frame (default 1/60 s) into multiple substeps:</p>
+<pre><code class="language-python">while remaining &gt; 0:
+    sub_dt = min(stableTime, remaining)
+    advance()          # single substep
+    remaining -= sub_dt
+</code></pre>
+<h3 id="72-sources-of-the-stable-step-size">7.2 Sources of the Stable Step Size</h3>
+<p>Global <code>stableTime</code> is the minimum across domains:</p>
+<p>[
+\Delta t_{\text{global}} = \min(\Delta t_{\text{FEM}},\ \Delta t_{\text{contact}},\ \Delta t_{\text{rigid}})
+]</p>
+<h3 id="73-optional-mass-scaling">7.3 Optional Mass Scaling</h3>
+<p>When <code>mass_scaling_dt &gt; 0</code>, LS-DYNA-style selective mass scaling is enabled so that small elements meet the target time step.</p>
+<hr>
+<h2 id="8-test2d-test-cases">8. test2D Test Cases</h2>
+<p>Run all tests:</p>
+<pre><code class="language-bash">pytest test2D
+</code></pre>
+<h3 id="81-fem-soft-body">8.1 FEM / Soft Body</h3>
+<table>
+<thead>
+<tr>
+<th>Test file</th>
+<th>What it verifies</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Dfem_elastic.py</code></td>
+<td>2-triangle FEM block freefall, adaptive dt</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_elastic10000.py</code></td>
+<td>100×100 mesh (~20k elements) performance and stability</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_bcs.py</code></td>
+<td>FEM boundary conditions</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_force.py</code></td>
+<td>Applied force BCs</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_ics.py</code></td>
+<td>Initial velocities / conditions</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_contact.py</code></td>
+<td>FEM self-contact</td>
+</tr>
+<tr>
+<td><code>test_2Dfem2domain_elastic.py</code></td>
+<td>Two coexisting FEM domains</td>
+</tr>
+<tr>
+<td><code>test_2Dfemanalytic_contact.py</code></td>
+<td>FEM ↔ analytical plane contact</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_heightfield_contact.py</code></td>
+<td>FEM disk falling into a bowl height field</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_voxel_contact.py</code></td>
+<td>FEM disk falling into a concave voxel pit</td>
+</tr>
+<tr>
+<td><code>test_2dfemrigid_contact.py</code></td>
+<td>FEM contact with ball/box/mesh rigid bodies</td>
+</tr>
+<tr>
+<td><code>test_2Dfemcontact_types.py</code></td>
+<td>Contact types and penalty-stiffness unit tests</td>
+</tr>
+<tr>
+<td><code>test_2Dmaterial_functions.py</code></td>
+<td>Constitutive-model unit tests</td>
+</tr>
+</tbody>
+</table>
+<h3 id="82-rigid-body">8.2 Rigid Body</h3>
+<table>
+<thead>
+<tr>
+<th>Test file</th>
+<th>What it verifies</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Drigid_contact.py</code></td>
+<td>Two balls colliding head-on</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100.py</code></td>
+<td>25-ball grid + random gravity</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100_boxes.py</code></td>
+<td>100-box contact stress test</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100_capsules.py</code></td>
+<td>100-capsule contact</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100_mesh.py</code></td>
+<td>100 mesh-rigid contact</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_bcs.py</code></td>
+<td>Rigid BCs (fixed, velocity, acceleration, rotation)</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_rot.py</code></td>
+<td>Rigid rotational dynamics</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_rotation_benchmark.py</code></td>
+<td>Rotation BC benchmark</td>
+</tr>
+<tr>
+<td><code>test_2Drigidanalytic_contact.py</code></td>
+<td>Rigid ↔ analytical ground</td>
+</tr>
+<tr>
+<td><code>test_2Dbox_collision_response.py</code></td>
+<td>Box–box collision impulse response</td>
+</tr>
+<tr>
+<td><code>test_2Dbox_friction.py</code></td>
+<td>Coulomb friction (static/dynamic)</td>
+</tr>
+<tr>
+<td><code>test_2Dball_rolling_friction.py</code></td>
+<td>Disk rolling resistance (ground-contact dissipation)</td>
+</tr>
+<tr>
+<td><code>test_2Dmeshrigid.py</code></td>
+<td>Mesh rigid-body contact</td>
+</tr>
+<tr>
+<td><code>test_2Dcapsule_bbox.py</code></td>
+<td>Capsule AABB correctness</td>
+</tr>
+<tr>
+<td><code>test_2Ddomino.py</code></td>
+<td>Domino chain reaction</td>
+</tr>
+</tbody>
+</table>
+<h3 id="83-ground-types">8.3 Ground Types</h3>
+<table>
+<thead>
+<tr>
+<th>Test file</th>
+<th>What it verifies</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Danalyticaldomain.py</code></td>
+<td>Ground / HeightField / Voxel creation and ball landing</td>
+</tr>
+<tr>
+<td><code>test_2Danalytical_bcs.py</code></td>
+<td>Analytical ground + BCs</td>
+</tr>
+<tr>
+<td><code>test_2Danalytical_rotation_benchmark.py</code></td>
+<td>Rotating analytical plane</td>
+</tr>
+</tbody>
+</table>
+<h3 id="84-joints-mechanisms">8.4 Joints / Mechanisms</h3>
+<table>
+<thead>
+<tr>
+<th>Test file</th>
+<th>What it verifies</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Drevolute_joint.py</code></td>
+<td>Revolute joint</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_bcs.py</code></td>
+<td>Joint + rotation BC</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_bcs_pdvel.py</code></td>
+<td>PD velocity control</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_bcs_pdforce.py</code></td>
+<td>PD torque control</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_kernels_unit.py</code></td>
+<td>Joint kernel unit tests</td>
+</tr>
+<tr>
+<td><code>test_2Dpendulum_simple.py</code></td>
+<td>Multibody pendulum chain</td>
+</tr>
+<tr>
+<td><code>test_2Dlinkage.py</code></td>
+<td>Complex linkage mechanism</td>
+</tr>
+<tr>
+<td><code>test_2Drobot.py</code></td>
+<td>Multibody robot</td>
+</tr>
+<tr>
+<td><code>test_2Dsolar_system.py</code></td>
+<td>Nested revolute joints (Earth–Moon system)</td>
+</tr>
+<tr>
+<td><code>test_2D_wheel_rolling.py</code></td>
+<td>Wheel + friction</td>
+</tr>
+<tr>
+<td><code>test_2Dwheel_rolling_initials.py</code></td>
+<td>Wheel initial-condition variants</td>
+</tr>
+</tbody>
+</table>
+<h3 id="85-springmass">8.5 Spring–Mass</h3>
+<table>
+<thead>
+<tr>
+<th>Test file</th>
+<th>What it verifies</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Dspring_bcs.py</code></td>
+<td>Spring-network BCs</td>
+</tr>
+<tr>
+<td><code>test_2Dspring_10000.py</code></td>
+<td>100×100 spring lattice performance</td>
+</tr>
+</tbody>
+</table>
+<h3 id="86-collision-geometry-unit-tests">8.6 Collision / Geometry Unit Tests</h3>
+<table>
+<thead>
+<tr>
+<th>Test file</th>
+<th>What it verifies</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Dcontact_detection.py</code></td>
+<td>Point–plane, point–edge primitives</td>
+</tr>
+<tr>
+<td><code>test_2Dsat_collision.py</code></td>
+<td>2D SAT</td>
+</tr>
+<tr>
+<td><code>test_2Dgjk_collision.py</code></td>
+<td>GJK placeholder test</td>
+</tr>
+<tr>
+<td><code>test_2Dsegment_segment.py</code></td>
+<td>Segment–segment nearest point</td>
+</tr>
+<tr>
+<td><code>test_2Dbvh.py</code></td>
+<td>BVH broad phase</td>
+</tr>
+</tbody>
+</table>
+<h3 id="87-representative-case-notes">8.7 Representative Case Notes</h3>
+<h4 id="case-a-fem-freefall-test_2dfem_elasticpy">Case A: FEM Freefall (<code>test_2Dfem_elastic.py</code>)</h4>
+<ul>
+<li>Small square made of 2 triangles, gravity (g = -1)</li>
+<li>Verifies fall out of view after ~1 s ((y &lt; 0))</li>
+<li>Demonstrates <code>ExplicitLoop(useAdapativeDT=True)</code> adaptive step size</li>
+</ul>
+<h4 id="case-b-fem-into-bowl-height-field-test_2dfem_heightfield_contactpy">Case B: FEM into Bowl Height Field (<code>test_2Dfem_heightfield_contact.py</code>)</h4>
+<ul>
+<li>Disk FEM body generated with <code>FEMesher.createCircle</code></li>
+<li>Height field is a semicircle bowl: (h(x) = z_c - \sqrt{r^2 - (x-c_x)^2})</li>
+<li>Verifies nodes do not penetrate the bowl bottom ((y_{\min} &gt; 0.05))</li>
+</ul>
+<h4 id="case-c-fem-into-voxel-pit-test_2dfem_voxel_contactpy">Case C: FEM into Voxel Pit (<code>test_2Dfem_voxel_contact.py</code>)</h4>
+<ul>
+<li>Voxel occupancy forms a bowl-shaped pit</li>
+<li>FEM disk falls from above</li>
+<li>Verifies no penetration of the pit bottom ((y_{\min} &gt; 0.02))</li>
+</ul>
+<h4 id="case-d-femrigid-multi-type-contact-test_2dfemrigid_contactpy">Case D: FEM–Rigid Multi-Type Contact (<code>test_2dfemrigid_contact.py</code>)</h4>
+<ul>
+<li>Same simulation includes: FEM disk + BallRigid + BoxRigid + MeshRigid + Ground</li>
+<li>Demonstrates multiphysics coupling</li>
+</ul>
+<h4 id="case-e-three-ground-types-compared-test_2danalyticaldomainpy">Case E: Three Ground Types Compared (<code>test_2Danalyticaldomain.py</code>)</h4>
+<ul>
+<li>Separately tests GroundDomain, HeightFieldDomain, VoxelGridDomain</li>
+<li>Ball freefall; verifies no ground penetration</li>
+</ul>
+<hr>
+<h2 id="9-quick-start-examples">9. Quick-Start Examples</h2>
+<h3 id="91-fem-freefall">9.1 FEM Freefall</h3>
+<pre><code class="language-python">import numpy as np
+from flatworld import Mesh, FemDomain, SolidProp, Elastic, Gravity, ExplicitLoop
+from flatworld.wp_init import ensure_warp
+
+ensure_warp()
+
+conn = np.array([[0, 1, 3], [0, 3, 2]], dtype=np.int32)
+coords = np.array([[0.5, 0.5], [0.7, 0.5], [0.5, 0.7], [0.7, 0.7]], dtype=np.float32)
+mesh = Mesh(2, conn, coords)
+
+mat = Elastic(E=2e4, nu=0.2, rho=40.0)
+domain = FemDomain(mesh, SolidProp(mat), bcs=[Gravity([0, -1.0])])
+
+looper = ExplicitLoop(0.0, [domain], useAdapativeDT=True)
+for _ in range(60):
+    looper.advanceWithTime(1.0 / 60.0)
+</code></pre>
+<h3 id="92-rigid-body-analytical-ground">9.2 Rigid Body + Analytical Ground</h3>
+<pre><code class="language-python">from flatworld import BallRigid, RigidBodyDomain, GroundDomain, Gravity, ExplicitLoop
+
+rigid = BallRigid(2, [0.5, 0.5], 0.02, 1.0)
+domain = RigidBodyDomain(rigid, [Gravity([0, -9.8])])
+ground = GroundDomain(2, [0, 0.1], [0, 1])
+
+looper = ExplicitLoop(0.0, [domain, ground])
+for _ in range(120):
+    looper.advanceWithTime(1.0 / 60.0)
+</code></pre>
+<h3 id="93-fem-height-field-ground">9.3 FEM + Height-Field Ground</h3>
+<pre><code class="language-python">from flatworld import FEMesher, FemDomain, HeightFieldDomain, Elastic, SolidProp, Gravity, ExplicitLoop
+import numpy as np
+
+mesh = FEMesher(2).createCircle([0.5, 0.65], 0.1)
+fem = FemDomain(mesh, SolidProp(Elastic(E=2e4, nu=0.2, rho=40.0)), [Gravity([0, -10])])
+
+heights = np.ones(100, dtype=np.float32) * 0.2
+hf = HeightFieldDomain(2, heights, lb=[0, 0], ub=[1, 1])
+
+looper = ExplicitLoop(0.0, [hf, fem], useAdapativeDT=True)
+for _ in range(60):
+    looper.advanceWithTime(1.0 / 60.0)
+</code></pre>
+<hr>
+<h2 id="appendix-key-source-index">Appendix: Key Source Index</h2>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>File</th>
+<th>Key symbols</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Main loop</td>
+<td><code>explicitloop.py</code></td>
+<td><code>ExplicitLoop</code>, <code>advanceWithTime</code>, <code>advance</code></td>
+</tr>
+<tr>
+<td>FEM integration</td>
+<td><code>femspringmanager.py</code></td>
+<td><code>femStep</code>, <code>FemSpringManager</code></td>
+</tr>
+<tr>
+<td>Rigid solver</td>
+<td><code>rigidmanager.py</code></td>
+<td><code>substep</code>, <code>solve_pgs</code></td>
+</tr>
+<tr>
+<td>Shape functions / B matrix</td>
+<td><code>mesh.py</code></td>
+<td><code>getJacobian2D</code>, <code>getBMatrix2D</code></td>
+</tr>
+<tr>
+<td>Constitutive</td>
+<td><code>materials/materialfunctions.py</code></td>
+<td><code>getStress2D</code>, <code>misesReturnMap2D</code></td>
+</tr>
+<tr>
+<td>Penalty contact</td>
+<td><code>femcontact.py</code></td>
+<td><code>ContactFlexAnalytical</code>, <code>_segment_penalty</code></td>
+</tr>
+<tr>
+<td>Analytical ground</td>
+<td><code>grounddomain.py</code></td>
+<td><code>GroundDomain</code></td>
+</tr>
+<tr>
+<td>Height field</td>
+<td><code>heightfielddomain.py</code></td>
+<td><code>sample_height_2d</code>, <code>nearest_on_curve_2d</code></td>
+</tr>
+<tr>
+<td>Voxel</td>
+<td><code>voxeldomain.py</code></td>
+<td><code>signed_distance_to_edges_2d</code>, <code>build_edges</code></td>
+</tr>
+<tr>
+<td>Contact detection</td>
+<td><code>contact_detection.py</code></td>
+<td><code>pointToEdgeContact</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<p><em>This document is auto-generated from the current FlatWorld codebase and reflects functionality verified in test2D.</em></p>
+  </main>
+</body>
+</html>

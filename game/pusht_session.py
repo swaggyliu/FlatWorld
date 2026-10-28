@@ -105,6 +105,11 @@ class PushTVersusSession:
 
         self.wm, self.policy, self._train_env, self.hold, self._task_features = (
             _load_policy(wm_path, policy_path, device, hold))
+        # AI difficulty: stretch hold (rarer replans) + scale force.
+        # Prefer this over wall-clock sleep so the player side stays smooth.
+        self._base_hold = int(self.hold)
+        self.difficulty = "medium"
+        self.ai_force_scale = 1.0
 
         from learning.tasks.push_t import PushTTask, push_t_config
         cfg = push_t_config()
@@ -122,8 +127,8 @@ class PushTVersusSession:
         self.sg = self.left.task.stem_goal
         self.bg = self.left.task.bar_goal
         self.gth = self.left.task.goal_theta
+        self._set_difficulty("medium")
         self.reset()
-
     def reset(self):
         seed = self.seed + self.ep
         rng_l = np.random.default_rng(seed)
@@ -205,8 +210,29 @@ class PushTVersusSession:
         if isinstance(a, tuple):
             a = a[0]
         a = a.detach().float().cpu().numpy().reshape(-1)
-        return (np.clip(a, -1.0, 1.0) * self.fmax).astype(np.float32)
+        scale = float(self.fmax) * float(self.ai_force_scale)
+        return (np.clip(a, -1.0, 1.0) * scale).astype(np.float32)
 
+    # hold_mult: AI keeps an action longer → fewer policy evals (easier).
+    # force_scale: weaker pushes on easier modes.
+    _DIFFICULTY = {
+        "low": {"hold_mult": 4, "force_scale": 0.55},
+        "medium": {"hold_mult": 2, "force_scale": 0.78},
+        "high": {"hold_mult": 1, "force_scale": 1.0},
+    }
+
+    def _set_difficulty(self, level: str) -> str:
+        key = str(level or "medium").strip().lower()
+        if key not in self._DIFFICULTY:
+            key = "medium"
+        cfg = self._DIFFICULTY[key]
+        self.difficulty = key
+        self.ai_force_scale = float(cfg["force_scale"])
+        self.hold = max(1, int(self._base_hold) * int(cfg["hold_mult"]))
+        # Refresh hold countdown so the new cadence applies immediately.
+        if hasattr(self, "right") and self.right is not None:
+            self.right.hold_left = 0
+        return key
     def _step_side(self, side: _Side, action: np.ndarray, hold_every: bool):
         if side.done:
             return
@@ -314,6 +340,7 @@ class PushTVersusSession:
             "countdown": float(self.countdown_left),
             "winner": self.winner,
             "paused": bool(self.paused),
+            "difficulty": self.difficulty,
             "score": {
                 "you": int(self.player_wins),
                 "ai": int(self.ai_wins),

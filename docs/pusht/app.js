@@ -3,7 +3,7 @@
   const ctx = canvas.getContext("2d");
   const statusEl = document.getElementById("status");
   const scoreEl = document.getElementById("score");
-  const backendEl = document.getElementById("backend");
+  const diffEl = document.getElementById("difficulty");
 
   const params = new URLSearchParams(location.search);
   const endpoints = [
@@ -13,13 +13,13 @@
   ].filter(Boolean);
   let epIndex = 0;
   let wsUrl = endpoints[0] || "";
-  if (backendEl) backendEl.textContent = wsUrl;
 
   const keys = new Set();
   let state = null;
   let ws = null;
   let reconnectAt = 0;
   let everOpened = false;
+  let difficulty = "medium";
 
   function send(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -29,30 +29,41 @@
     send({ type: "keys", down: [...keys] });
   }
 
+  function setDifficulty(level, rematch) {
+    difficulty = level;
+    if (diffEl) {
+      for (const btn of diffEl.querySelectorAll("button")) {
+        btn.classList.toggle("active", btn.dataset.level === level);
+      }
+    }
+    send({ type: "difficulty", level });
+    if (rematch) send({ type: "rematch" });
+  }
+
   function connect() {
     if (!wsUrl) {
-      statusEl.textContent = "no backend configured";
+      statusEl.textContent = "offline";
       return;
     }
     statusEl.textContent = "connecting…";
-    if (backendEl) backendEl.textContent = wsUrl;
     try {
       ws = new WebSocket(wsUrl);
     } catch (_) {
-      statusEl.textContent = "bad websocket url";
+      statusEl.textContent = "offline";
       return;
     }
     ws.onopen = () => {
       everOpened = true;
       statusEl.textContent = "connected";
       send({ type: "hello" });
+      send({ type: "difficulty", level: difficulty });
       syncKeys();
     };
     ws.onclose = () => {
       if (!everOpened && epIndex + 1 < endpoints.length) {
         epIndex += 1;
         wsUrl = endpoints[epIndex];
-        statusEl.textContent = "trying fallback…";
+        statusEl.textContent = "reconnecting…";
         reconnectAt = performance.now() + 400;
         return;
       }
@@ -69,6 +80,14 @@
         }
         state = msg;
         if (msg.status) statusEl.textContent = msg.status;
+        if (msg.difficulty && msg.difficulty !== difficulty) {
+          difficulty = msg.difficulty;
+          if (diffEl) {
+            for (const btn of diffEl.querySelectorAll("button")) {
+              btn.classList.toggle("active", btn.dataset.level === difficulty);
+            }
+          }
+        }
         if (msg.score) {
           scoreEl.textContent =
             `YOU ${msg.score.you} — AI ${msg.score.ai}` +
@@ -76,6 +95,15 @@
         }
       } catch (_) {}
     };
+  }
+
+  if (diffEl) {
+    diffEl.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-level]");
+      if (!btn) return;
+      setDifficulty(btn.dataset.level, true);
+      canvas.focus();
+    });
   }
 
   window.addEventListener("keydown", (e) => {
@@ -92,6 +120,15 @@
     } else if (k === "p") {
       e.preventDefault();
       send({ type: "pause" });
+    } else if (k === "1") {
+      e.preventDefault();
+      setDifficulty("low", true);
+    } else if (k === "2") {
+      e.preventDefault();
+      setDifficulty("medium", true);
+    } else if (k === "3") {
+      e.preventDefault();
+      setDifficulty("high", true);
     }
   });
   window.addEventListener("keyup", (e) => {
@@ -100,7 +137,6 @@
   });
   canvas.addEventListener("pointerdown", () => canvas.focus());
 
-  // ---- draw helpers (top-down, same mapping as raylib game) ----
   const SCALE = 280;
   const PAD_Y = 100;
 
@@ -176,7 +212,6 @@
     const st = side.states;
     const geom = side.geom;
     if (goal) {
-      // translucent ghost T
       drawBox(panelX, panelW, goal.stem[0], goal.stem[1], goal.theta,
         geom[1][0], geom[1][1], "rgba(230,90,100,0.30)", "rgba(230,70,85,0.55)");
       drawBox(panelX, panelW, goal.bar[0], goal.bar[1], goal.theta,
@@ -199,7 +234,7 @@
     ctx.fillText(label, panelX + 16, canvas.height - 18);
   }
 
-  function frame(t) {
+  function frame() {
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       if (performance.now() >= reconnectAt) connect();
     }
@@ -235,6 +270,7 @@
     requestAnimationFrame(frame);
   }
 
+  if (diffEl) setDifficulty(difficulty, false);
   connect();
   requestAnimationFrame(frame);
 })();

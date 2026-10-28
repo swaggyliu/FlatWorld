@@ -1,5 +1,12 @@
-// Backend WebSocket. Override with ?ws=… or window.PUSHT_WS.
+// Endpoints are not shown in the UI. Optional override: ?ws=…
 (function () {
+  function dec(s) {
+    try {
+      return atob(s);
+    } catch (_) {
+      return "";
+    }
+  }
   const params = new URLSearchParams(location.search);
   if (params.get("ws")) {
     window.PUSHT_WS = params.get("ws");
@@ -7,23 +14,22 @@
   }
   if (window.PUSHT_WS) return;
 
-  // Same-origin when UI is served by game.web_server / local / CF tunnel.
+  const host = location.hostname;
   if (
     location.port === "8765" ||
-    location.hostname === "127.0.0.1" ||
-    location.hostname === "localhost" ||
-    location.hostname.endsWith(".trycloudflare.com") ||
-    location.hostname.endsWith(".sslip.io")
+    host === "127.0.0.1" ||
+    host === "localhost" ||
+    host.endsWith(".trycloudflare.com") ||
+    host.endsWith(".sslip.io")
   ) {
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     window.PUSHT_WS = proto + location.host + "/ws";
     return;
   }
 
-  // GitHub Pages is https → browser requires wss:// (plain ws:// is blocked).
-  // Primary: Aliyun system nginx + Let's Encrypt on :443 (sslip.io).
-  // Fallback: Cloudflare quick tunnel to the same :8765 (leave running).
-  window.PUSHT_WS = "wss://8.138.152.185.sslip.io/ws";
-  window.PUSHT_WS_FALLBACK =
-    "wss://immediate-pale-indicate-displayed.trycloudflare.com/ws";
+  // Primary + fallback (base64; not rendered in the page chrome).
+  window.PUSHT_WS = dec("d3NzOi8vOC4xMzguMTUyLjE4NS5zc2xpcC5pby93cw==");
+  window.PUSHT_WS_FALLBACK = dec(
+    "d3NzOi8vaW1tZWRpYXRlLXBhbGUtaW5kaWNhdGUtZGlzcGxheWVkLnRyeWNsb3VkZmxhcmUuY29tL3dz"
+  );
 })();

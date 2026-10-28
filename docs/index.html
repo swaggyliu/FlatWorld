@@ -88,6 +88,7 @@
       display: flex;
       flex-wrap: wrap;
       gap: 0.75rem;
+      align-items: center;
       margin: 0 0.35rem 0.55rem;
       font-size: 0.9rem;
       color: var(--muted);
@@ -104,13 +105,18 @@
       color: var(--muted);
       font-size: 0.88rem;
     }
-    section {
-      margin-top: 2.2rem;
+    .difficulty button {
+      border-color: var(--line);
+      background: #fff;
+      color: var(--muted);
     }
-    section h3 {
-      margin: 0 0 0.55rem;
-      font-size: 1.2rem;
+    .difficulty button.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
     }
+    section { margin-top: 2.2rem; }
+    section h3 { margin: 0 0 0.55rem; font-size: 1.2rem; }
     section p {
       color: var(--muted);
       line-height: 1.5;
@@ -166,8 +172,8 @@
       <h1 class="brand">FlatWorld</h1>
       <nav class="nav">
         <a class="primary" href="https://github.com/swaggyliu/FlatWorld">GitHub</a>
-        <a href="THEORY_AND_IMPLEMENTATION.md">Theory</a>
-        <a href="https://github.com/swaggyliu/FlatWorld/blob/main/docs/PARADIGMS.md">Paradigms</a>
+        <a href="theory.html">Theory</a>
+        <a href="paradigms.html">Paradigms</a>
         <a href="https://github.com/swaggyliu/FlatWorld/blob/main/README.md">README</a>
       </nav>
     </div>
@@ -175,7 +181,7 @@
       Warp-accelerated 2D physics with explicit FEM, impulse rigid bodies, and
       mixed-domain contact — plus StateLeWM, one latent world model with three
       controllers (CEM, BPTT, PPO). Play <strong>You vs AI</strong> below
-      (WASD left, frozen WM+PPO right). Backend runs on Aliyun.
+      (WASD left, frozen WM+PPO right).
     </p>
 
     <div class="play-shell">
@@ -186,10 +192,15 @@
       <div class="bar">
         <span id="score">YOU 0 — AI 0</span>
         <span id="status">connecting…</span>
-        <span id="backend"></span>
+        <span id="difficulty" class="difficulty">
+          <span>AI</span>
+          <button type="button" data-level="low">Low</button>
+          <button type="button" data-level="medium" class="active">Medium</button>
+          <button type="button" data-level="high">High</button>
+        </span>
       </div>
       <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
-      <p class="hint">WASD move · Space / R rematch · P pause · click canvas to focus</p>
+      <p class="hint">WASD move · 1/2/3 difficulty · Space / R rematch · P pause · click canvas to focus</p>
     </div>
 
     <section>
@@ -237,8 +248,8 @@
         <code>pip install -r requirements.txt && pip install -e .</code>
         · local game <code>python -m game --mode pusht</code>
         · docs:
-        <a href="THEORY_AND_IMPLEMENTATION.md">theory</a>,
-        <a href="https://github.com/swaggyliu/FlatWorld/blob/main/docs/PARADIGMS.md">paradigms</a>,
+        <a href="theory.html">theory</a>,
+        <a href="paradigms.html">paradigms</a>,
         <a href="https://github.com/swaggyliu/FlatWorld/blob/main/learning/README.md">learning</a>.
         Manuscript forthcoming on arXiv (<code>cs.RO</code>).
       </p>

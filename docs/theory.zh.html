@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>理论与实现 — FlatWorld</title>
+  <link rel="stylesheet" href="doc.css" />
+</head>
+<body>
+  <nav class="doc-nav">
+    <a href="./">FlatWorld</a>
+    <a href="theory.html">Theory</a>
+    <a href="theory.zh.html">理论</a>
+    <a href="paradigms.html">Paradigms</a>
+    <a href="https://github.com/swaggyliu/FlatWorld">GitHub</a>
+  </nav>
+  <main class="doc-body">
+<h1 id="flat-world">Flat World 物理引擎 — 理论与实现文档</h1>
+<p><a href="theory.html">English</a> | <strong>中文</strong></p>
+<blockquote>
+<p><strong>Flat World</strong>（FlatWorld）是基于 <a href="https://nvidia.github.io/warp/">NVIDIA Warp</a> 的实时多物理场仿真平台，支持 <strong>刚体动力学</strong>、<strong>有限元法（FEM）</strong>、<strong>弹簧-质量系统</strong>，以及三种静态地面表示：<strong>解析平面（Ground）</strong>、<strong>高度场（HeightField）</strong>、<strong>体素网格（Voxel）</strong>。</p>
+</blockquote>
+<hr>
+<h2 id="_1">目录</h2>
+<ol>
+<li><a href="#1-项目概览">项目概览</a></li>
+<li><a href="#2-整体架构">整体架构</a></li>
+<li><a href="#3-有限元法fem">有限元法（FEM）</a></li>
+<li><a href="#4-刚体动力学">刚体动力学</a></li>
+<li><a href="#5-地面类型">地面类型</a></li>
+<li><a href="#6-接触与碰撞">接触与碰撞</a></li>
+<li><a href="#7-时间积分与自适应步长">时间积分与自适应步长</a></li>
+<li><a href="#8-test2d-测试案例">test2D 测试案例</a></li>
+<li><a href="#9-快速入门示例">快速入门示例</a></li>
+</ol>
+<hr>
+<h2 id="1">1. 项目概览</h2>
+<h3 id="11">1.1 技术栈</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>语言</td>
+<td>Python 3</td>
+</tr>
+<tr>
+<td>计算后端</td>
+<td>NVIDIA Warp（GPU/CPU 并行内核）</td>
+</tr>
+<tr>
+<td>依赖</td>
+<td>warp-lang, numpy, scipy, meshio, pytest</td>
+</tr>
+</tbody>
+</table>
+<h3 id="12">1.2 目录结构</h3>
+<pre><code>FlatWorld/
+├── flatworld/                  # 核心引擎
+│   ├── explicitloop.py         # 主仿真循环（ExplicitLoop）
+│   ├── femspringmanager.py     # FEM / 弹簧统一数据管理与积分
+│   ├── rigidmanager.py         # 刚体状态、碰撞检测、PGS 约束求解
+│   ├── femdomain.py            # FEM 域封装
+│   ├── rigiddomain.py          # 刚体域封装
+│   ├── grounddomain.py         # 解析平面地面（GroundDomain）
+│   ├── heightfielddomain.py    # 高度场地面
+│   ├── voxeldomain.py          # 体素网格地面
+│   ├── femcontact.py           # 软体惩罚接触
+│   ├── mesh.py                 # 网格、形函数、B 矩阵
+│   ├── contact_detection.py    # 点-边、点-面接触检测
+│   ├── sat.py / gjk.py         # 2D SAT / GJK-EPA 碰撞
+│   ├── bvh.py                  # 宽相碰撞检测
+│   ├── joints.py               # 关节定义
+│   ├── bcs.py                  # 边界条件
+│   └── materials/              # 本构模型
+└── test2D/                     # 2D 测试与演示（51 个文件）
+</code></pre>
+<h3 id="13-domaintype">1.3 域类型（DomainType）</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>常量</th>
+<th>典型类</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>解析平面</td>
+<td><code>ANALYTICAL</code></td>
+<td><code>GroundDomain</code></td>
+</tr>
+<tr>
+<td>有限元</td>
+<td><code>FEM</code></td>
+<td><code>FemDomain</code></td>
+</tr>
+<tr>
+<td>刚体</td>
+<td><code>RIGID</code></td>
+<td><code>RigidBodyDomain</code></td>
+</tr>
+<tr>
+<td>弹簧-质量</td>
+<td><code>SPRINGMASS</code></td>
+<td><code>SpringMassDomain</code></td>
+</tr>
+<tr>
+<td>高度场</td>
+<td><code>HEIGHTFIELD</code></td>
+<td><code>HeightFieldDomain</code></td>
+</tr>
+<tr>
+<td>体素地图</td>
+<td><code>VOXELMAP</code></td>
+<td><code>VoxelGridDomain</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="2">2. 整体架构</h2>
+<h3 id="21">2.1 仿真流程</h3>
+<p><code>ExplicitLoop</code> 是仿真入口，负责协调各子系统：</p>
+<pre><code>┌─────────────────────────────────────────────────────────────┐
+│                      ExplicitLoop                           │
+│  advanceWithTime(frame_dt)                                  │
+│    └─ 按 stableTime 自适应子步进                             │
+│         └─ advance()                                        │
+│              1. BVH 宽相 → 候选碰撞对                        │
+│              2. 批处理接触力（FEM ↔ 地面/刚体）              │
+│              3. FemSpringManager.substep() → FEM 积分        │
+│              4. RigidManager.substep() → 刚体积分 + PGS      │
+└─────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="22">2.2 双管理器设计</h3>
+<table>
+<thead>
+<tr>
+<th>管理器</th>
+<th>负责域</th>
+<th>接触方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FemSpringManager</code></td>
+<td>FEM、SpringMass</td>
+<td><strong>惩罚力</strong>（力级，加入 <code>Fext</code>）</td>
+</tr>
+<tr>
+<td><code>RigidManager</code></td>
+<td>Rigid、Ground、HeightField、Voxel</td>
+<td><strong>冲量 + PGS</strong>（速度级约束）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="23">2.3 接触类型矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>接触对</th>
+<th>状态</th>
+<th>方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FEM ↔ 解析平面</td>
+<td>✅</td>
+<td>惩罚接触</td>
+</tr>
+<tr>
+<td>FEM ↔ 高度场</td>
+<td>✅</td>
+<td>惩罚接触</td>
+</tr>
+<tr>
+<td>FEM ↔ 体素</td>
+<td>✅</td>
+<td>惩罚接触</td>
+</tr>
+<tr>
+<td>FEM ↔ FEM</td>
+<td>✅</td>
+<td>惩罚接触</td>
+</tr>
+<tr>
+<td>FEM ↔ 刚体</td>
+<td>✅</td>
+<td>惩罚接触</td>
+</tr>
+<tr>
+<td>刚体 ↔ 解析平面</td>
+<td>✅</td>
+<td>冲量 + PGS</td>
+</tr>
+<tr>
+<td>刚体 ↔ 高度场</td>
+<td>✅</td>
+<td>冲量 + PGS</td>
+</tr>
+<tr>
+<td>刚体 ↔ 体素</td>
+<td>✅</td>
+<td>冲量 + PGS</td>
+</tr>
+<tr>
+<td>刚体 ↔ 刚体</td>
+<td>✅</td>
+<td>SAT/GJK + PGS</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="3-fem">3. 有限元法（FEM）</h2>
+<h3 id="31">3.1 理论基础</h3>
+<p>本引擎采用 <strong>显式动力学</strong> 与 <strong>Total Lagrangian</strong> 混合方案：</p>
+<h4 id="311">3.1.1 单元与形函数</h4>
+<ul>
+<li><strong>2D</strong>：线性三角形单元（3 节点）</li>
+<li><strong>3D</strong>：线性四面体单元（4 节点）</li>
+<li>形函数（2D 三角形，重心坐标）：</li>
+</ul>
+<p>[
+N_1 = \psi,\quad N_2 = \eta,\quad N_3 = 1 - \psi - \eta
+]</p>
+<ul>
+<li>在单元形心（(\psi = \eta = 0)）处计算 Jacobian 与 B 矩阵（常应变/常应力）</li>
+</ul>
+<h4 id="312">3.1.2 变形梯度</h4>
+<p>参考构形 Jacobian (J_{\text{ref}}) 在初始化时存储，当前构形：</p>
+<p>[
+J = \frac{\partial x}{\partial \xi},\quad F = J \cdot J_{\text{ref}}^{-1}
+]</p>
+<h4 id="313">3.1.3 应变与应力</h4>
+<p><strong>Green-Lagrange 应变</strong>（Voigt 形式）：</p>
+<p>[
+\varepsilon = \tfrac{1}{2}(F^T F - I)
+]</p>
+<p><strong>本构关系</strong>（PK2 应力 → Cauchy 应力存储）：</p>
+<p>[
+\sigma_{\text{Cauchy}} = \frac{1}{J} F S F^T
+]</p>
+<h4 id="314">3.1.4 内力组装</h4>
+<p>[
+f_{\text{int}} = B^T \sigma \cdot V_{\text{elem}}
+]</p>
+<p>其中 (B) 为应变-位移矩阵，(V_{\text{elem}}) 为单元体积（2D 为面积）。</p>
+<h4 id="315">3.1.5 时间积分</h4>
+<p>显式中心差分风格：</p>
+<p>[
+a = \frac{F_{\text{ext}} - c \cdot v}{m},\quad v \leftarrow v + a \cdot \Delta t,\quad u \leftarrow u + v \cdot \Delta t
+]</p>
+<p>实现位置：<code>femspringmanager.py</code> → <code>femStep()</code> 内核。</p>
+<h4 id="316">3.1.6 稳定时间步</h4>
+<p>[
+\Delta t_{\text{stable}} \approx 0.4 \cdot \frac{L_{\text{char}}}{\sqrt{E/\rho}}
+]</p>
+<p>其中 (L_{\text{char}}) 为网格最小边长，(E) 为杨氏模量，(\rho) 为密度。</p>
+<p>实现位置：<code>femdomain.py</code>。</p>
+<h3 id="32">3.2 材料模型</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>枚举</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>线性弹性</td>
+<td><code>MaterialType.ELASTIC</code></td>
+<td>Lamé 参数 (\lambda, \mu)，Hooke 定律</td>
+</tr>
+<tr>
+<td>Neo-Hookean</td>
+<td><code>MaterialType.NEOHOOKEAN</code></td>
+<td>可压缩超弹性</td>
+</tr>
+<tr>
+<td>J2 von Mises</td>
+<td><code>MaterialType.MISES</code></td>
+<td>径向回归塑性，各向同性硬化</td>
+</tr>
+</tbody>
+</table>
+<p><strong>线性弹性 Lamé 参数</strong>：</p>
+<p>[
+\lambda = \frac{E\nu}{(1+\nu)(1-2\nu)},\quad \mu = \frac{E}{2(1+\nu)}
+]</p>
+<p><strong>J2 塑性</strong>：采用径向回归映射（radial return mapping），当 von Mises 等效应力超过屈服面时修正偏应力并更新塑性应变历史。</p>
+<p>实现位置：<code>materials/materialfunctions.py</code>。</p>
+<h3 id="33">3.3 实现要点</h3>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>域封装</td>
+<td><code>femdomain.py</code></td>
+<td>网格、材料、BC、稳定步长</td>
+</tr>
+<tr>
+<td>统一管理</td>
+<td><code>femspringmanager.py</code></td>
+<td>全局节点/单元数组，批处理 <code>femStep</code></td>
+</tr>
+<tr>
+<td>网格工具</td>
+<td><code>mesh.py</code></td>
+<td>形函数、Jacobian、B 矩阵、边界边提取</td>
+</tr>
+<tr>
+<td>网格生成</td>
+<td><code>femesher.py</code></td>
+<td>圆形网格、Gmsh/VTU 导入</td>
+</tr>
+<tr>
+<td>边界条件</td>
+<td><code>bcs.py</code></td>
+<td>重力、力、固定、速度/加速度约束</td>
+</tr>
+</tbody>
+</table>
+<p><strong>边界边提取</strong>：遍历所有单元边，仅出现一次的边为边界边，用于接触检测。</p>
+<hr>
+<h2 id="4">4. 刚体动力学</h2>
+<h3 id="41">4.1 理论基础</h3>
+<p>刚体采用 <strong>半隐式 Euler 积分</strong> + <strong>冲量法接触</strong> + <strong>投影 Gauss-Seidel（PGS）</strong> 约束求解。</p>
+<h4 id="411-2d">4.1.1 状态变量（2D）</h4>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>U</code></td>
+<td>参考点位置</td>
+</tr>
+<tr>
+<td><code>V</code></td>
+<td>线速度</td>
+</tr>
+<tr>
+<td><code>quat</code></td>
+<td>标量转角（2D 绕 z 轴）</td>
+</tr>
+<tr>
+<td><code>RotV</code></td>
+<td>角速度</td>
+</tr>
+</tbody>
+</table>
+<h4 id="412">4.1.2 转动惯量</h4>
+<table>
+<thead>
+<tr>
+<th>形状</th>
+<th>2D 转动惯量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>球（Ball）</td>
+<td>(I = \tfrac{1}{2} m r^2)</td>
+</tr>
+<tr>
+<td>矩形（Box）</td>
+<td>(I = \tfrac{1}{12} m (w^2 + h^2))</td>
+</tr>
+</tbody>
+</table>
+<h4 id="413">4.1.3 接触响应</h4>
+<ul>
+<li><strong>法向</strong>：Baumgarte ERP（( \text{ERP} = 0.2 )）修正穿透</li>
+<li><strong>切向</strong>：Coulomb 摩擦锥</li>
+<li><strong>恢复系数</strong>：可配置 restitution</li>
+</ul>
+<p>约束在速度空间求解，PGS 迭代更新冲量。</p>
+<h4 id="414">4.1.4 关节约束</h4>
+<p>支持的关节类型（<code>JointType</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>关节</th>
+<th>约束自由度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Revolute（转动）</td>
+<td>保留 1 个转动 DOF</td>
+</tr>
+<tr>
+<td>Weld（焊接）</td>
+<td>完全固定相对位姿</td>
+</tr>
+<tr>
+<td>Prismatic（滑动）</td>
+<td>保留 1 个平移 DOF</td>
+</tr>
+<tr>
+<td>Spherical（球铰）</td>
+<td>保留 3 个转动 DOF</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42">4.2 刚体形状</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>类</th>
+<th>碰撞检测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>球</td>
+<td><code>BallRigid</code></td>
+<td>解析 SDF</td>
+</tr>
+<tr>
+<td>矩形</td>
+<td><code>BoxRigid</code></td>
+<td>2D SAT</td>
+</tr>
+<tr>
+<td>胶囊</td>
+<td><code>CapsuleRigid</code></td>
+<td>线段-点/球</td>
+</tr>
+<tr>
+<td>网格</td>
+<td><code>MeshRigid</code></td>
+<td>边界边 + GJK-EPA</td>
+</tr>
+</tbody>
+</table>
+<p>实现位置：<code>rigid.py</code>、<code>rigiddomain.py</code>、<code>rigidmanager.py</code>。</p>
+<h3 id="43">4.3 刚体接触流水线</h3>
+<p><code>RigidManager.substep()</code> 每子步执行：</p>
+<ol>
+<li>速度积分（含阻尼）</li>
+<li><strong>宽相</strong>：BVH 或空间哈希</li>
+<li><strong>窄相</strong>：按对类型分发（ball-ball、box-box、mesh-mesh 等）</li>
+<li>组装接触行 + 关节行 → PGS 矩阵</li>
+<li><code>solve_pgs(iterations)</code> 迭代求解</li>
+<li>位置积分 + AABB 更新</li>
+</ol>
+<h3 id="44">4.4 碰撞过滤</h3>
+<p>采用 ODE 风格的 category/collide 位掩码：</p>
+<pre><code>配对 (a, b) 有效 ⟺ (collide_bits[a] &amp; category_bits[b]) ≠ 0
+              且 (collide_bits[b] &amp; category_bits[a]) ≠ 0
+</code></pre>
+<p>预定义类别：<code>COLLISION_CATEGORY_GROUND</code>、<code>COLLISION_CATEGORY_FEM</code>、<code>COLLISION_CATEGORY_ORDINARY_RIGID</code> 等。</p>
+<hr>
+<h2 id="5">5. 地面类型</h2>
+<p>三种地面均为 <strong>静态障碍物</strong>，<code>category_bits = COLLISION_CATEGORY_GROUND</code>，但几何表示与接触检测方式不同。</p>
+<h3 id="51-grounddomain">5.1 GroundDomain — 解析平面</h3>
+<p><strong>文件</strong>：<code>grounddomain.py</code><br>
+<strong>类型</strong>：<code>DomainType.ANALYTICAL</code></p>
+<h4 id="_2">理论</h4>
+<p>无限平面由参考点 (\mathbf{p}) 和单位法向 (\mathbf{n}) 定义：</p>
+<p>[
+(\mathbf{x} - \mathbf{p}) \cdot \mathbf{n} = 0
+]</p>
+<p>2D 中切向量为 ([ -n_y, n_x ])。平面可通过 <code>RigidManager</code> 绑定 BC 实现平移/旋转。</p>
+<h4 id="_3">接触检测</h4>
+<ul>
+<li><strong>刚体</strong>：点到平面有符号距离 → 冲量施加于接触点</li>
+<li><strong>FEM</strong>：边界节点穿透检测 → 惩罚法向力</li>
+</ul>
+<h4 id="_4">使用示例</h4>
+<pre><code class="language-python">from flatworld import GroundDomain
+
+# 水平地面：y=0.1，法向朝上
+ground = GroundDomain(2, point=[0, 0.1], normal=[0, 1])
+</code></pre>
+<hr>
+<h3 id="52-heightfielddomain">5.2 HeightFieldDomain — 高度场</h3>
+<p><strong>文件</strong>：<code>heightfielddomain.py</code><br>
+<strong>类型</strong>：<code>DomainType.HEIGHTFIELD</code></p>
+<h4 id="_5">理论</h4>
+<ul>
+<li><strong>2D</strong>：曲线 (z = h(x))，存储为 1D 数组</li>
+<li><strong>3D</strong>：曲面 (z = h(x, y))，存储为 2D 数组</li>
+</ul>
+<p>采样采用 <strong>线性插值</strong>，法向由高度梯度计算：</p>
+<p>[
+\mathbf{n} = \text{normalize}([-dh/dx,\ 1]) \quad \text{(2D)}
+]</p>
+<h4 id="_6">核心方法</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>功能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sample_height_2d(x)</code></td>
+<td>线性插值采样高度</td>
+</tr>
+<tr>
+<td><code>sample_normal_2d(x)</code></td>
+<td>由 (dh/dx) 计算法向</td>
+</tr>
+<tr>
+<td><code>nearest_on_curve_2d(x, z)</code></td>
+<td>最近点、法向、有符号距离</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_7">适用场景</h4>
+<p>平滑地形：碗形凹槽、正弦波、斜坡等。</p>
+<h4 id="_8">使用示例</h4>
+<pre><code class="language-python">from flatworld import HeightFieldDomain
+import numpy as np
+
+xs = np.linspace(0, 1, 100)
+heights = 0.2 + 0.1 * np.sin(2 * np.pi * xs)
+hf = HeightFieldDomain(2, heights, lb=[0.0, 0.0], ub=[1.0, 1.0])
+</code></pre>
+<hr>
+<h3 id="53-voxelgriddomain">5.3 VoxelGridDomain — 体素网格</h3>
+<p><strong>文件</strong>：<code>voxeldomain.py</code><br>
+<strong>类型</strong>：<code>DomainType.VOXELMAP</code></p>
+<h4 id="_9">理论</h4>
+<p>轴对齐 <strong>占据网格</strong> <code>occ[i,j] = 1</code> 表示固体单元。初始化时预计算 <strong>边界边</strong>（固体与空单元交界处）。</p>
+<h4 id="_10">有符号距离</h4>
+<ul>
+<li><strong>内部</strong>（占据单元内）：到最近面的距离（负值表示穿透）</li>
+<li><strong>外部</strong>：遍历预计算边界边，求最近边及法向</li>
+</ul>
+<h4 id="_11">适用场景</h4>
+<p>凹形静态几何：坑洞、台阶、墙体、复杂障碍。</p>
+<h4 id="_12">使用示例</h4>
+<pre><code class="language-python">from flatworld import VoxelGridDomain
+import numpy as np
+
+occ = np.zeros((10, 10), dtype=np.int32)
+occ[:3, :] = 1  # 底部 3 行填充
+vox = VoxelGridDomain(2, nx=10, ny=10, lb=[0, 0], ub=[1, 1], occupancy_np=occ)
+</code></pre>
+<hr>
+<h3 id="54">5.4 三种地面对比</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>Ground</th>
+<th>HeightField</th>
+<th>Voxel</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>几何</td>
+<td>无限平面</td>
+<td>参数曲线/曲面</td>
+<td>占据网格</td>
+</tr>
+<tr>
+<td>凹形支持</td>
+<td>❌</td>
+<td>部分（单值函数）</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>内存</td>
+<td>极低</td>
+<td>O(nx) 或 O(nx·ny)</td>
+<td>O(nx·ny)</td>
+</tr>
+<tr>
+<td>FEM 接触</td>
+<td>惩罚力</td>
+<td>惩罚力</td>
+<td>惩罚力</td>
+</tr>
+<tr>
+<td>刚体接触</td>
+<td>PGS 冲量</td>
+<td>PGS 冲量</td>
+<td>PGS 冲量</td>
+</tr>
+<tr>
+<td>可运动</td>
+<td>✅（BC 驱动）</td>
+<td>❌ 静态</td>
+<td>❌ 静态</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="6">6. 接触与碰撞</h2>
+<h3 id="61-fem-spring">6.1 软体惩罚接触（FEM / Spring）</h3>
+<h4 id="ls-dyna">惩罚刚度（LS-DYNA 风格）</h4>
+<p>[
+k = \text{slsfac} \cdot K \cdot \frac{A_{\text{seg}}^2}{V_{\text{elem}}}
+]</p>
+<p>其中体积模量 (K = E / [3(1-2\nu)])。</p>
+<p>2D 三角形简化：(k = 2 \cdot \text{slsfac} \cdot K)。</p>
+<h4 id="_13">稳定接触步长</h4>
+<p>[
+\Delta t_{\text{contact}} = 0.9 \sqrt{\frac{m_{\text{node}}}{k}}
+]</p>
+<h4 id="_14">接触力</h4>
+<p>穿透深度 (d &gt; 0) 时：</p>
+<p>[
+F_n = k \cdot d \cdot \mathbf{n}
+]</p>
+<p>可选切向阻尼：(F_t = -\mu k v_n \Delta t)。</p>
+<p>实现位置：<code>femcontact.py</code>、<code>explicitloop.py</code> 批处理内核。</p>
+<h3 id="62">6.2 刚体冲量接触</h3>
+<p>速度级约束，PGS 迭代求解：</p>
+<p>[
+J \lambda = b
+]</p>
+<p>其中 (J) 为约束 Jacobian，(\lambda) 为冲量，(b) 含 Baumgarte 修正项。</p>
+<h3 id="63">6.3 宽相 / 窄相</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>方法</th>
+<th>文件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>宽相</td>
+<td>BVH（LBVH）</td>
+<td><code>bvh.py</code></td>
+</tr>
+<tr>
+<td>宽相（备选）</td>
+<td>空间哈希</td>
+<td><code>spatialmanager.py</code></td>
+</tr>
+<tr>
+<td>2D 凸体</td>
+<td>SAT</td>
+<td><code>sat.py</code></td>
+</tr>
+<tr>
+<td>3D 凸网格</td>
+<td>GJK-EPA</td>
+<td><code>gjk.py</code></td>
+</tr>
+<tr>
+<td>点-边</td>
+<td><code>pointToEdgeContact</code></td>
+<td><code>contact_detection.py</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7">7. 时间积分与自适应步长</h2>
+<h3 id="71">7.1 固定帧率子步进</h3>
+<p><code>ExplicitLoop.advanceWithTime(frame_dt)</code> 将每帧（默认 1/60 s）拆分为多个子步：</p>
+<pre><code class="language-python">while remaining &gt; 0:
+    sub_dt = min(stableTime, remaining)
+    advance()          # 单个子步
+    remaining -= sub_dt
+</code></pre>
+<h3 id="72">7.2 稳定步长来源</h3>
+<p>全局 <code>stableTime</code> 取各域最小值：</p>
+<p>[
+\Delta t_{\text{global}} = \min(\Delta t_{\text{FEM}},\ \Delta t_{\text{contact}},\ \Delta t_{\text{rigid}})
+]</p>
+<h3 id="73">7.3 可选质量缩放</h3>
+<p><code>mass_scaling_dt &gt; 0</code> 时启用 LS-DYNA 风格选择性质量缩放，使小单元满足目标时间步。</p>
+<hr>
+<h2 id="8-test2d">8. test2D 测试案例</h2>
+<p>运行全部测试：</p>
+<pre><code class="language-bash">pytest test2D
+</code></pre>
+<h3 id="81-fem">8.1 FEM / 软体</h3>
+<table>
+<thead>
+<tr>
+<th>测试文件</th>
+<th>验证内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Dfem_elastic.py</code></td>
+<td>2 三角形 FEM 块自由落体，自适应 dt</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_elastic10000.py</code></td>
+<td>100×100 网格（~2 万元）性能与稳定性</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_bcs.py</code></td>
+<td>FEM 边界条件</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_force.py</code></td>
+<td>施加力 BC</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_ics.py</code></td>
+<td>初始速度/条件</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_contact.py</code></td>
+<td>FEM 自接触</td>
+</tr>
+<tr>
+<td><code>test_2Dfem2domain_elastic.py</code></td>
+<td>双 FEM 域共存</td>
+</tr>
+<tr>
+<td><code>test_2Dfemanalytic_contact.py</code></td>
+<td>FEM ↔ 解析平面接触</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_heightfield_contact.py</code></td>
+<td>FEM 圆盘落入碗形高度场</td>
+</tr>
+<tr>
+<td><code>test_2Dfem_voxel_contact.py</code></td>
+<td>FEM 圆盘落入凹形体素坑</td>
+</tr>
+<tr>
+<td><code>test_2dfemrigid_contact.py</code></td>
+<td>FEM 与球/盒/网格刚体接触</td>
+</tr>
+<tr>
+<td><code>test_2Dfemcontact_types.py</code></td>
+<td>接触类型与惩罚刚度单元测试</td>
+</tr>
+<tr>
+<td><code>test_2Dmaterial_functions.py</code></td>
+<td>本构模型单元测试</td>
+</tr>
+</tbody>
+</table>
+<h3 id="82">8.2 刚体</h3>
+<table>
+<thead>
+<tr>
+<th>测试文件</th>
+<th>验证内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Drigid_contact.py</code></td>
+<td>两球相向碰撞</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100.py</code></td>
+<td>25 球网格 + 随机重力</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100_boxes.py</code></td>
+<td>100 盒体接触压力测试</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100_capsules.py</code></td>
+<td>100 胶囊接触</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_contact100_mesh.py</code></td>
+<td>100 网格刚体接触</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_bcs.py</code></td>
+<td>刚体 BC（固定、速度、加速度、旋转）</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_rot.py</code></td>
+<td>刚体旋转动力学</td>
+</tr>
+<tr>
+<td><code>test_2Drigid_rotation_benchmark.py</code></td>
+<td>旋转 BC 基准</td>
+</tr>
+<tr>
+<td><code>test_2Drigidanalytic_contact.py</code></td>
+<td>刚体 ↔ 解析地面</td>
+</tr>
+<tr>
+<td><code>test_2Dbox_collision_response.py</code></td>
+<td>盒-盒碰撞冲量响应</td>
+</tr>
+<tr>
+<td><code>test_2Dbox_friction.py</code></td>
+<td>Coulomb 摩擦（静/动摩擦）</td>
+</tr>
+<tr>
+<td><code>test_2Dball_rolling_friction.py</code></td>
+<td>圆盘滚动阻力（地面接触耗散）</td>
+</tr>
+<tr>
+<td><code>test_2Dmeshrigid.py</code></td>
+<td>网格刚体接触</td>
+</tr>
+<tr>
+<td><code>test_2Dcapsule_bbox.py</code></td>
+<td>胶囊 AABB 正确性</td>
+</tr>
+<tr>
+<td><code>test_2Ddomino.py</code></td>
+<td>多米诺骨牌连锁</td>
+</tr>
+</tbody>
+</table>
+<h3 id="83">8.3 地面类型</h3>
+<table>
+<thead>
+<tr>
+<th>测试文件</th>
+<th>验证内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Danalyticaldomain.py</code></td>
+<td>Ground / HeightField / Voxel 创建与球体落地</td>
+</tr>
+<tr>
+<td><code>test_2Danalytical_bcs.py</code></td>
+<td>解析地面 + BC</td>
+</tr>
+<tr>
+<td><code>test_2Danalytical_rotation_benchmark.py</code></td>
+<td>旋转解析平面</td>
+</tr>
+</tbody>
+</table>
+<h3 id="84">8.4 关节 / 机构</h3>
+<table>
+<thead>
+<tr>
+<th>测试文件</th>
+<th>验证内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Drevolute_joint.py</code></td>
+<td>转动关节</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_bcs.py</code></td>
+<td>关节 + 旋转 BC</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_bcs_pdvel.py</code></td>
+<td>PD 速度控制</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_bcs_pdforce.py</code></td>
+<td>PD 力矩控制</td>
+</tr>
+<tr>
+<td><code>test_2Djoint_kernels_unit.py</code></td>
+<td>关节内核单元测试</td>
+</tr>
+<tr>
+<td><code>test_2Dpendulum_simple.py</code></td>
+<td>多体摆链</td>
+</tr>
+<tr>
+<td><code>test_2Dlinkage.py</code></td>
+<td>复杂连杆机构</td>
+</tr>
+<tr>
+<td><code>test_2Drobot.py</code></td>
+<td>多体机器人</td>
+</tr>
+<tr>
+<td><code>test_2Dsolar_system.py</code></td>
+<td>嵌套转动关节（地月系统）</td>
+</tr>
+<tr>
+<td><code>test_2D_wheel_rolling.py</code></td>
+<td>滚轮 + 摩擦</td>
+</tr>
+<tr>
+<td><code>test_2Dwheel_rolling_initials.py</code></td>
+<td>滚轮初始条件变体</td>
+</tr>
+</tbody>
+</table>
+<h3 id="85-">8.5 弹簧-质量</h3>
+<table>
+<thead>
+<tr>
+<th>测试文件</th>
+<th>验证内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Dspring_bcs.py</code></td>
+<td>弹簧网络 BC</td>
+</tr>
+<tr>
+<td><code>test_2Dspring_10000.py</code></td>
+<td>100×100 弹簧格点性能</td>
+</tr>
+</tbody>
+</table>
+<h3 id="86">8.6 碰撞 / 几何单元测试</h3>
+<table>
+<thead>
+<tr>
+<th>测试文件</th>
+<th>验证内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_2Dcontact_detection.py</code></td>
+<td>点-平面、点-边原语</td>
+</tr>
+<tr>
+<td><code>test_2Dsat_collision.py</code></td>
+<td>2D SAT</td>
+</tr>
+<tr>
+<td><code>test_2Dgjk_collision.py</code></td>
+<td>GJK 占位测试</td>
+</tr>
+<tr>
+<td><code>test_2Dsegment_segment.py</code></td>
+<td>线段-线段最近点</td>
+</tr>
+<tr>
+<td><code>test_2Dbvh.py</code></td>
+<td>BVH 宽相</td>
+</tr>
+</tbody>
+</table>
+<h3 id="87">8.7 代表性案例说明</h3>
+<h4 id="afem-test_2dfem_elasticpy">案例 A：FEM 自由落体（<code>test_2Dfem_elastic.py</code>）</h4>
+<ul>
+<li>2 个三角形组成的小方块，重力 (g = -1)</li>
+<li>验证约 1 s 后落出视野（(y &lt; 0)）</li>
+<li>演示 <code>ExplicitLoop(useAdapativeDT=True)</code> 自适应步长</li>
+</ul>
+<h4 id="bfem-test_2dfem_heightfield_contactpy">案例 B：FEM 落入碗形高度场（<code>test_2Dfem_heightfield_contact.py</code>）</h4>
+<ul>
+<li>用 <code>FEMesher.createCircle</code> 生成圆盘 FEM 体</li>
+<li>高度场为半圆碗：(h(x) = z_c - \sqrt{r^2 - (x-c_x)^2})</li>
+<li>验证节点未穿透碗底（(y_{\min} &gt; 0.05)）</li>
+</ul>
+<h4 id="cfem-test_2dfem_voxel_contactpy">案例 C：FEM 落入体素坑（<code>test_2Dfem_voxel_contact.py</code>）</h4>
+<ul>
+<li>体素占据场形成碗状凹坑</li>
+<li>FEM 圆盘从上方落下</li>
+<li>验证未穿透坑底（(y_{\min} &gt; 0.02)）</li>
+</ul>
+<h4 id="dfem-test_2dfemrigid_contactpy">案例 D：FEM-刚体多类型接触（<code>test_2dfemrigid_contact.py</code>）</h4>
+<ul>
+<li>同一仿真中包含：FEM 圆盘 + BallRigid + BoxRigid + MeshRigid + Ground</li>
+<li>演示多物理场耦合</li>
+</ul>
+<h4 id="etest_2danalyticaldomainpy">案例 E：三种地面对比（<code>test_2Danalyticaldomain.py</code>）</h4>
+<ul>
+<li>分别测试 GroundDomain、HeightFieldDomain、VoxelGridDomain</li>
+<li>球体自由落体，验证未穿透地面</li>
+</ul>
+<hr>
+<h2 id="9">9. 快速入门示例</h2>
+<h3 id="91-fem">9.1 FEM 自由落体</h3>
+<pre><code class="language-python">import numpy as np
+from flatworld import Mesh, FemDomain, SolidProp, Elastic, Gravity, ExplicitLoop
+from flatworld.wp_init import ensure_warp
+
+ensure_warp()
+
+conn = np.array([[0, 1, 3], [0, 3, 2]], dtype=np.int32)
+coords = np.array([[0.5, 0.5], [0.7, 0.5], [0.5, 0.7], [0.7, 0.7]], dtype=np.float32)
+mesh = Mesh(2, conn, coords)
+
+mat = Elastic(E=2e4, nu=0.2, rho=40.0)
+domain = FemDomain(mesh, SolidProp(mat), bcs=[Gravity([0, -1.0])])
+
+looper = ExplicitLoop(0.0, [domain], useAdapativeDT=True)
+for _ in range(60):
+    looper.advanceWithTime(1.0 / 60.0)
+</code></pre>
+<h3 id="92">9.2 刚体 + 解析地面</h3>
+<pre><code class="language-python">from flatworld import BallRigid, RigidBodyDomain, GroundDomain, Gravity, ExplicitLoop
+
+rigid = BallRigid(2, [0.5, 0.5], 0.02, 1.0)
+domain = RigidBodyDomain(rigid, [Gravity([0, -9.8])])
+ground = GroundDomain(2, [0, 0.1], [0, 1])
+
+looper = ExplicitLoop(0.0, [domain, ground])
+for _ in range(120):
+    looper.advanceWithTime(1.0 / 60.0)
+</code></pre>
+<h3 id="93-fem">9.3 FEM + 高度场地面</h3>
+<pre><code class="language-python">from flatworld import FEMesher, FemDomain, HeightFieldDomain, Elastic, SolidProp, Gravity, ExplicitLoop
+import numpy as np
+
+mesh = FEMesher(2).createCircle([0.5, 0.65], 0.1)
+fem = FemDomain(mesh, SolidProp(Elastic(E=2e4, nu=0.2, rho=40.0)), [Gravity([0, -10])])
+
+heights = np.ones(100, dtype=np.float32) * 0.2
+hf = HeightFieldDomain(2, heights, lb=[0, 0], ub=[1, 1])
+
+looper = ExplicitLoop(0.0, [hf, fem], useAdapativeDT=True)
+for _ in range(60):
+    looper.advanceWithTime(1.0 / 60.0)
+</code></pre>
+<hr>
+<h2 id="_15">附录：关键源码索引</h2>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>文件</th>
+<th>关键符号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主循环</td>
+<td><code>explicitloop.py</code></td>
+<td><code>ExplicitLoop</code>, <code>advanceWithTime</code>, <code>advance</code></td>
+</tr>
+<tr>
+<td>FEM 积分</td>
+<td><code>femspringmanager.py</code></td>
+<td><code>femStep</code>, <code>FemSpringManager</code></td>
+</tr>
+<tr>
+<td>刚体求解</td>
+<td><code>rigidmanager.py</code></td>
+<td><code>substep</code>, <code>solve_pgs</code></td>
+</tr>
+<tr>
+<td>形函数/B 矩阵</td>
+<td><code>mesh.py</code></td>
+<td><code>getJacobian2D</code>, <code>getBMatrix2D</code></td>
+</tr>
+<tr>
+<td>本构</td>
+<td><code>materials/materialfunctions.py</code></td>
+<td><code>getStress2D</code>, <code>misesReturnMap2D</code></td>
+</tr>
+<tr>
+<td>惩罚接触</td>
+<td><code>femcontact.py</code></td>
+<td><code>ContactFlexAnalytical</code>, <code>_segment_penalty</code></td>
+</tr>
+<tr>
+<td>解析地面</td>
+<td><code>grounddomain.py</code></td>
+<td><code>GroundDomain</code></td>
+</tr>
+<tr>
+<td>高度场</td>
+<td><code>heightfielddomain.py</code></td>
+<td><code>sample_height_2d</code>, <code>nearest_on_curve_2d</code></td>
+</tr>
+<tr>
+<td>体素</td>
+<td><code>voxeldomain.py</code></td>
+<td><code>signed_distance_to_edges_2d</code>, <code>build_edges</code></td>
+</tr>
+<tr>
+<td>接触检测</td>
+<td><code>contact_detection.py</code></td>
+<td><code>pointToEdgeContact</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<p><em>文档基于 FlatWorld 当前代码库自动生成，反映 test2D 中已验证的功能。</em></p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Control paradigms — FlatWorld</title>
+  <link rel="stylesheet" href="doc.css" />
+</head>
+<body>
+  <nav class="doc-nav">
+    <a href="./">FlatWorld</a>
+    <a href="theory.html">Theory</a>
+    <a href="theory.zh.html">理论</a>
+    <a href="paradigms.html">Paradigms</a>
+    <a href="https://github.com/swaggyliu/FlatWorld">GitHub</a>
+  </nav>
+  <main class="doc-body">
+<p>﻿# Control paradigms on StateLeWM</p>
+<p>FlatWorld uses <strong>one</strong> state + tactile latent world model (StateLeWM), then
+plugs in three different <strong>controllers</strong>. Same engine, same latent dynamics
+idea; different when you <em>plan online</em>, <em>imitate through imagination</em>, or
+<em>explore with RL</em>.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Paradigm</th>
+<th>Flagship tasks</th>
+<th>Decision time</th>
+<th>Needs demos?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><strong>WM + CEM</strong></td>
+<td>PushToGoal, Two-room, Reacher</td>
+<td>online planning</td>
+<td>no</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>WM + BPTT</strong></td>
+<td>SuperMimic-2D (LAFAN-like skills)</td>
+<td>offline improve π</td>
+<td>yes (refs)</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>WM + PPO</strong></td>
+<td>Push-T</td>
+<td>offline train π</td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<pre><code>                 ┌── CEM / MPC ──► act in FlatWorld     (1)
+ observe ─► WM ──┤
+                 ├── BPTT through imag. ─► policy π     (2)
+                 └── encode z ─► PPO in sim ─► policy π (3)
+</code></pre>
+<hr>
+<h2 id="1-wm-cem-reacher-push-two-room">1. WM + CEM (reacher · push · two-room)</h2>
+<p><strong>Idea.</strong> Freeze a goal-free world model. At every replan, sample force /
+joint-target sequences in latent space, score a task cost on <code>xy_head</code>
+(and typed readouts), execute the first action, repeat.</p>
+<p><strong>Traits</strong></p>
+<ul>
+<li>No policy network; <strong>zero RL</strong> once the WM is trained.</li>
+<li>Cost is cheap geometry in latent readout space (target–goal, reach face).</li>
+<li>Imagination is <strong>batched on GPU</strong> (~400–1300× vs serial solver CEM).</li>
+<li>Works when short-horizon latent rollouts stay calibrated and the cost
+  landscape is not too multimodal from contact underactuation.</li>
+</ul>
+<p><strong>When to use</strong></p>
+<ul>
+<li>Sparse goal reaching with a clear metric in <code>(x, y)</code> / tip pose.</li>
+<li>Navigation-through-contact (doorway) where the WM learns walls for free.</li>
+<li>Interactive tools (Spirit Push game) that need <strong>replan every few frames</strong>.</li>
+</ul>
+<p><strong>Generalizes to</strong></p>
+<ul>
+<li>Multi-object rearrange with typed edges.</li>
+<li>Tool-use / bank shots if contact data covers them.</li>
+<li>Soft-body or height-field goals if the same state schema exists.</li>
+</ul>
+<p><strong>Weak when</strong></p>
+<ul>
+<li>Long-horizon underactuated contact (Push-T-style T alignment).</li>
+<li>Cost needs a skilled prior; pure CEM explores poorly in non-convex contact.</li>
+</ul>
+<p><strong>Entry points</strong></p>
+<pre><code class="language-bash">python -m learning.data.collect --out learning/data/rollouts_500 ...
+python -m learning.train --data learning/data/rollouts_500 --out learning/checkpoints/push_game
+python -m learning.eval_task --checkpoint learning/checkpoints/push_game --target-mode random
+python -m game --checkpoint learning/checkpoints/push_game
+</code></pre>
+<p>Weights: <code>learning/checkpoints/{push_game,two_room,reacher}</code>.</p>
+<hr>
+<h2 id="2-wm-bptt-supermimic-2d">2. WM + BPTT (SuperMimic-2D)</h2>
+<p><strong>Idea.</strong> Fit a shared rigid-body WM from on-policy (or mixed) rollouts.
+Improve a goal-conditioned policy by <strong>backprop through short imagined
+horizons</strong> with a mimic reward / critic — SuperMimic-style, not model-free
+PPO in the physics loop for the improve step.</p>
+<p><strong>Traits</strong></p>
+<ul>
+<li>Dense tracking reward from reference motions.</li>
+<li>Gradients flow through the frozen (or slowly fit) WM.</li>
+<li>High-DoF continuous control (8 PD joints, 10-body humanoid).</li>
+<li>Skills share one dynamics model; policy is goal / skill conditioned.</li>
+</ul>
+<p><strong>When to use</strong></p>
+<ul>
+<li>Motion imitation, animation, loco-manipulation with mocap / baked refs.</li>
+<li>When demos exist and you want sample-efficient policy improvement.</li>
+<li>When pure CEM cannot express stylistic tracking objectives.</li>
+</ul>
+<p><strong>Generalizes to</strong></p>
+<ul>
+<li>More LAFAN / custom clips, multi-character.</li>
+<li>Dexterous or multi-limb tracking once the state schema is fixed.</li>
+<li>Residual policies on top of PD / IK.</li>
+</ul>
+<p><strong>Weak when</strong></p>
+<ul>
+<li>No reference / no dense reward — BPTT needs a shaped objective.</li>
+<li>WM bias can lock the policy into imagined dynamics that diverge from sim
+  (diagnose with <code>supermimic2d.diagnose_wm</code>).</li>
+</ul>
+<p><strong>Entry points</strong></p>
+<pre><code class="language-bash">python -m supermimic2d.bake_refs
+python -m supermimic2d.train --out supermimic2d/runs/lafan2d --library lafan2d --iters 80
+python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt
+</code></pre>
+<hr>
+<h2 id="3-wm-ppo-push-t">3. WM + PPO (Push-T)</h2>
+<p><strong>Idea.</strong> Train a frozen StateLeWM on goal-free Push-T contact data.
+Policy observations are <strong><code>z ‖ task_features</code></strong> (WM encode + pose features);
+<strong>rewards and transitions stay on real FlatWorld physics</strong>. PPO via
+<code>rsl-rl</code> on a vectorized env (multiprocess workers).</p>
+<p><strong>Traits</strong></p>
+<ul>
+<li>Progress reward <code>Φ_prev − Φ</code> (pose + EE–T coupling); no fail-dones that
+  encourage suicide resets.</li>
+<li>Parallel envs (e.g. 128) with compact RigidManagers + env_id isolation.</li>
+<li>Hits <strong>≥90%</strong> sim success where pure latent-imagination RL and CEM struggled.</li>
+<li>Ablation: raw-state PPO also reaches 90% — WM-obs matches that bar while
+  keeping a transferable latent front-end.</li>
+</ul>
+<p><strong>When to use</strong></p>
+<ul>
+<li>Contact-rich, underactuated pushing / alignment.</li>
+<li>When CEM cost landscapes are non-convex and short imagination drifts.</li>
+<li>When you need a reactive policy, not a multi-second replan.</li>
+</ul>
+<p><strong>Generalizes to</strong></p>
+<ul>
+<li>Peg-in-slot / keyhole-lite in 2D, multi-contact fixture assembly.</li>
+<li>Soft or frictional Push-T variants with the same progress Φ.</li>
+<li>Hybrid: CEM warm-start or residual on a PPO policy.</li>
+</ul>
+<p><strong>Weak when</strong></p>
+<ul>
+<li>Pure imagination PPO (roll dynamics in WM only) — Push-T WM drift made
+  that path ~8% in early ablations; keep physics in the loop for RL.</li>
+<li>Tasks that only need a sparse xy cost — CEM is simpler.</li>
+</ul>
+<p><strong>Entry points</strong></p>
+<pre><code class="language-bash"># WM
+python -m learning.data.collect ... --out learning/data/push_t_500
+python -m learning.train --data learning/data/push_t_500 learning/data/push_t_contact500 \
+    --out learning/checkpoints/push_t ...
+
+# WM-obs PPO (tune --num-workers to machine memory / Warp stability)
+python -m learning.train_rsl_wm_push_t \
+    --wm learning/checkpoints/push_t \
+    --out learning/checkpoints/push_t_wm_rsl \
+    --num-envs 128 --num-workers 6 --target-rate 0.9
+
+# report eval
+python -m learning.eval_rl_push_t_report \
+    --policy learning/checkpoints/push_t_wm_rsl/best.pt \
+    --wm learning/checkpoints/push_t \
+    --out learning/results/wm_rl --tag wm_rsl
+</code></pre>
+<p>Result (40 ep, seed 1000): <strong>36/40 = 90%</strong>, mean settle ~127 frames.
+Weights: <code>learning/checkpoints/push_t</code>, <code>learning/checkpoints/push_t_wm_rsl</code>.</p>
+<hr>
+<h2 id="choosing-a-stack">Choosing a stack</h2>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Prefer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Interactive / replan online, clear xy cost?</td>
+<td><strong>WM + CEM</strong></td>
+</tr>
+<tr>
+<td>Have mocap / style refs, high DoF?</td>
+<td><strong>WM + BPTT</strong></td>
+</tr>
+<tr>
+<td>Underactuated contact, CEM fails, need exploration?</td>
+<td><strong>WM + PPO</strong></td>
+</tr>
+<tr>
+<td>Want one latent front-end for several controllers?</td>
+<td>Train StateLeWM once; swap (1)–(3)</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="roadmap">Roadmap</h2>
+<ol>
+<li><strong>Unify task API</strong> — <strong>done.</strong> <code>learning/tasks/base.py</code> (<code>FlatWorldTask</code>:
+   observe / sample_goal / potential Φ / metric / succeeded) +
+   <code>adapters.py</code> (CEM / PPO / Mimic helpers). CEM tasks via <code>CEMWorldTask</code> /
+   <code>PushToGoalTask</code>; Push-T overrides <code>potential</code> to match RL progress reward.</li>
+<li><strong>Push-T follow-ups</strong> — multi-goal T, friction / soft T, CEM residual on PPO; revisit imagination RL only with calibrated long-horizon WM losses.</li>
+<li><strong>New CEM scenes</strong> — variable-N rearrange, height-field / soft push with the same recipe.</li>
+<li><strong>SuperMimic breadth</strong> — more clips, contact-rich fight / getup stress tests, WM–sim gap dashboards.</li>
+<li><strong>Productization</strong> — <strong>done.</strong> Push-T <strong>You vs AI</strong> split-screen
+   (<code>python -m game --mode pusht</code>: WASD left, WM+PPO right, 3s countdown,
+   first to seat the T wins). Promo helper:
+   <code>python -m learning.render_pusht_promo</code>. Paradigm write-up = this file;
+   full manuscript is local-only (arXiv cs.RO by author).</li>
+<li><strong>Engine</strong> — <strong>done (isolation)</strong> / <strong>open (mesh).</strong> Parallel env +
+   <code>env_id</code> documented in <a href="ENGINE_PARALLEL.md"><code>ENGINE_PARALLEL.md</code></a> with
+   <code>test2D/test_env_id_isolation.py</code>. Mesh contact batching remains on the
+   backlog in <a href="../improvement.md"><code>improvement.md</code></a>.</li>
+</ol>
+<p><strong>Cleanup note.</strong> Failed imagination-PPO experiment entrypoints were removed
+from <code>learning/</code>; the takeaway stays here: pure imagination RL on Push-T
+drifted (~8%), so shipped Push-T uses <strong>physics-loop PPO</strong> with a frozen WM
+encoder.</p>
+<h2 id="content-backlog-p5">Content backlog (P5)</h2>
+<table>
+<thead>
+<tr>
+<th>track</th>
+<th>next demos</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Push-T variants</td>
+<td>multi-goal T pose, friction / soft-T, CEM residual on PPO</td>
+</tr>
+<tr>
+<td>New CEM scenes</td>
+<td>variable-N rearrange; height-field / soft push with the same StateLeWM recipe</td>
+</tr>
+<tr>
+<td>SuperMimic</td>
+<td>more clips; contact-rich fight / getup stress; WM–sim gap dashboards</td>
+</tr>
+</tbody>
+</table>
+<p>These do not block shipping; track progress in this file.</p>
+  </main>
+</body>
+</html>

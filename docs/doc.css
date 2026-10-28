@@ -1,0 +1,86 @@
+:root {
+  --ink: #152018;
+  --muted: #5a6b60;
+  --accent: #0b6e4f;
+  --line: #d5e0d8;
+  --code-bg: #eef3f0;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  line-height: 1.55;
+  background:
+    radial-gradient(900px 420px at 0% -10%, #cfe8dc 0%, transparent 55%),
+    linear-gradient(180deg, #e8f0ec, #f7faf8);
+  min-height: 100vh;
+}
+.doc-nav {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  padding: 0.75rem 1.1rem;
+  background: rgba(247, 250, 248, 0.92);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+}
+.doc-nav a {
+  color: var(--ink);
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 0.92rem;
+  padding: 0.3rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.doc-nav a:hover { border-color: var(--accent); color: var(--accent); }
+.doc-body {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 1.5rem 1.15rem 3.5rem;
+}
+.doc-body h1 { font-size: clamp(1.7rem, 4vw, 2.3rem); letter-spacing: -0.02em; }
+.doc-body h2 { margin-top: 2rem; border-bottom: 1px solid var(--line); padding-bottom: 0.25rem; }
+.doc-body h3 { margin-top: 1.4rem; }
+.doc-body a { color: var(--accent); }
+.doc-body code {
+  font-size: 0.92em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.doc-body pre {
+  background: #152018;
+  color: #e8eee9;
+  padding: 0.9rem 1rem;
+  border-radius: 10px;
+  overflow-x: auto;
+}
+.doc-body pre code { background: transparent; color: inherit; padding: 0; }
+.doc-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+  background: rgba(255,255,255,0.75);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.doc-body th, .doc-body td {
+  text-align: left;
+  padding: 0.65rem 0.8rem;
+  border-bottom: 1px solid #e2e8e4;
+}
+.doc-body th { background: rgba(11,110,79,0.08); }
+.doc-body blockquote {
+  margin: 1rem 0;
+  padding: 0.2rem 0.9rem;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+  background: rgba(255,255,255,0.55);
+}
+.doc-body img { max-width: 100%; height: auto; border-radius: 8px; }
