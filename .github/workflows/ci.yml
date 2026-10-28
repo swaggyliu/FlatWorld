@@ -35,7 +35,7 @@ jobs:
 
       - name: Web game security regressions
         run: |
-          pip install -e ".[web]"
+          pip install -e ".[web,dev]"
           python -m pytest tests/game -q --tb=short --timeout=30
           node --test tests/game/web_client.test.cjs
 

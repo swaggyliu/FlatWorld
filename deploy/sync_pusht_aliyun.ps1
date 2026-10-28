@@ -34,8 +34,15 @@ scp -i $Key -o BatchMode=yes -o IdentitiesOnly=yes $Tar "${HostUser}:/tmp/_pusht
 ssh -i $Key -o BatchMode=yes -o IdentitiesOnly=yes $HostUser "mkdir -p $Remote && tar -xzf /tmp/_pusht_sync.tgz -C $Remote && rm /tmp/_pusht_sync.tgz"
 
 Write-Host "== remote reuse venv / restart (optional) =="
-scp -i $Key -o BatchMode=yes -o IdentitiesOnly=yes `
-  (Join-Path $PSScriptRoot "remote_reuse_venv.sh") "${HostUser}:/tmp/remote_reuse_venv.sh"
+# Bash on Linux rejects CRLF (`set: pipefail\r: invalid option name`).
+$ReuseSh = Join-Path $PSScriptRoot "remote_reuse_venv.sh"
+$ReuseLf = Join-Path $env:TEMP "remote_reuse_venv_lf.sh"
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[IO.File]::WriteAllText(
+  $ReuseLf,
+  (([IO.File]::ReadAllText($ReuseSh) -replace "`r`n", "`n") -replace "`r", "`n"),
+  $utf8)
+scp -i $Key -o BatchMode=yes -o IdentitiesOnly=yes $ReuseLf "${HostUser}:/tmp/remote_reuse_venv.sh"
 ssh -i $Key -o BatchMode=yes -o IdentitiesOnly=yes $HostUser "bash /tmp/remote_reuse_venv.sh"
 
 Write-Host "== done. Check health on your TLS host (see local.env PUSHT_TLS_HOST). =="

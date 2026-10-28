@@ -46,8 +46,12 @@ learning = [
 game = [
     "raylib>=5.0",
 ]
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
 all = [
-    "flat-world-model[dev,learning,game]",
+    "flat-world-model[dev,learning,game,web]",
 ]
 
 [project.urls]
