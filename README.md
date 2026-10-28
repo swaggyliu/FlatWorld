@@ -83,6 +83,15 @@ Manuscript: arXiv forthcoming (**cs.RO**, no PDF in-repo).
   <a href="https://swaggyliu.github.io/FlatWorld/media.html#pusht"><strong>▶ Push-T / You vs AI</strong></a>
   ·
   <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>SuperMimic promo</strong></a>
+  ·
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#dance"><strong>dance overlay</strong></a>
+</p>
+
+<p align="center">
+  <video src="https://swaggyliu.github.io/FlatWorld/media/pusht_promo.mp4" width="680" controls playsinline preload="metadata"></video>
+</p>
+<p align="center">
+  <video src="https://swaggyliu.github.io/FlatWorld/media/promo_supermimic.mp4" width="680" controls playsinline preload="metadata"></video>
 </p>
 
 <p align="center">
@@ -134,6 +143,11 @@ fall-getup). Write-up: **[supermimic2d/README.md](supermimic2d/README.md)**.
   ·
   <a href="https://swaggyliu.github.io/FlatWorld/media.html#dance">dance overlay</a>
 </p>
+<p align="center">
+  <video src="https://swaggyliu.github.io/FlatWorld/media/promo_supermimic.mp4" width="640" controls playsinline preload="metadata"></video>
+  &nbsp;
+  <video src="https://swaggyliu.github.io/FlatWorld/media/dance_overlay.mp4" width="640" controls playsinline preload="metadata"></video>
+</p>
 
 ```bash
 python -m supermimic2d.bake_refs
@@ -151,11 +165,6 @@ Underactuated T-block alignment where CEM alone is weak. Freeze Push-T StateLeWM
 
 <p align="center">
   <img src="docs/push_t_success.png" width="680" alt="Push-T WM-obs PPO success summary 90%" />
-</p>
-<p align="center">
-  <img src="docs/push_t_train_curve.png" width="480" alt="Push-T train curve" />
-  &nbsp;
-  <img src="docs/push_t_scenes.png" width="480" alt="Push-T scene rollouts" />
 </p>
 
 ```bash

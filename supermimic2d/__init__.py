@@ -7,4 +7,4 @@ Training loop mirrors SuperMimic (CoRL 2026):
 """
 
 __all__ = ["__version__"]
-__version__ = "0.1.0"
+__version__ = "0.20.0"

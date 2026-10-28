@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flatworld"
-version = "0.1.0"
+version = "0.20.0"
 description = "Warp-based 2D/3D physics engine with FEM, rigid bodies, and mixed contact"
 readme = "README.md"
 license = { text = "Apache-2.0" }

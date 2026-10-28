@@ -1,6 +1,8 @@
 import os
 import sys
 
+__version__ = "0.20.0"
+
 package_dir = os.path.dirname(os.path.abspath(__file__))
 if package_dir in sys.path:
     sys.path.remove(package_dir)
