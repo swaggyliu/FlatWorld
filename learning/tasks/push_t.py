@@ -40,7 +40,7 @@ def push_t_config() -> Config:
     cfg.collect.mode_pile = 0.0
     cfg.collect.mode_door = 0.0
     cfg.collect.mode_spin = 0.0
-    cfg.task.tol = 0.12
+    cfg.task.tol = 0.05
     cfg.task.vel_tol = 0.20
     cfg.task.budget = 1100
     cfg.task.goal_x = 1.50

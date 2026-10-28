@@ -9,6 +9,13 @@ Usage:
     --wm learning/checkpoints/push_t \\
     --num-envs 128 --num-workers 6 \\
     --out learning/checkpoints/push_t_wm_rsl --target-rate 0.9
+
+  # Continue with tighter pose tol (preserves prior out dir if --out differs):
+  python -m learning.train_rsl_wm_push_t \\
+    --wm learning/checkpoints/push_t \\
+    --resume learning/checkpoints/push_t_wm_rsl/best.pt \\
+    --out learning/checkpoints/push_t_wm_rsl_tol005 \\
+    --tol 0.05 --target-rate 0.9
 """
 
 from __future__ import annotations
@@ -118,13 +125,16 @@ class WMObsVecEnv:
 
 
 @torch.no_grad()
-def eval_policy(wm, policy, n_eps: int, seed: int = 1000, hold: int = 5):
+def eval_policy(wm, policy, n_eps: int, seed: int = 1000, hold: int = 5,
+                tol: float | None = None):
     from learning.tasks.push_t import PushTTask, push_t_config
     from learning.rl.imagine import task_features
     from tensordict import TensorDict
 
     device = wm.device
     cfg = push_t_config()
+    if tol is not None:
+        cfg.task.tol = float(tol)
     task = PushTTask(cfg, planner_kwargs=dict(use_servo=True), ee_spawn="support")
     fmax = float(cfg.collect.force_max)
     sg, bg, gth = task.stem_goal, task.bar_goal, task.goal_theta
@@ -170,6 +180,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wm", default="learning/checkpoints/push_t")
     ap.add_argument("--out", default="learning/checkpoints/push_t_wm_rsl")
+    ap.add_argument("--resume", default=None,
+                    help="Load rsl-rl checkpoint (best.pt/last.pt) before training")
+    ap.add_argument("--tol", type=float, default=None,
+                    help="Pose success tolerance (m); default from push_t_config")
     ap.add_argument("--num-envs", type=int, default=128)
     ap.add_argument("--num-workers", type=int, default=6)
     ap.add_argument("--hold", type=int, default=5)
@@ -191,13 +205,15 @@ def main():
     log_dir = os.path.join(args.out, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
+    from learning.tasks.push_t import push_t_config
     from learning.tasks.push_to_goal import load_ensemble
     from learning.rl.imagine import WMBundle
     from learning.rl.push_t_vec_env import PushTVecEnv
     from rsl_rl.runners import OnPolicyRunner
 
+    tol = float(args.tol) if args.tol is not None else float(push_t_config().task.tol)
     print(f"WM-obs rsl-rl PPO  wm={args.wm} envs={args.num_envs} "
-          f"workers={args.num_workers} device={device}", flush=True)
+          f"workers={args.num_workers} device={device} tol={tol}", flush=True)
     models, norm, stride = load_ensemble(args.wm, device)
     wm = WMBundle(models[0], norm, device, stride=stride)
     for p in wm.model.parameters():
@@ -206,7 +222,7 @@ def main():
 
     base = PushTVecEnv(
         num_envs=args.num_envs, hold=args.hold, device="cpu", seed=args.seed,
-        num_workers=args.num_workers, max_ee_t_dist=None)
+        num_workers=args.num_workers, max_ee_t_dist=None, tol=tol)
     env = WMObsVecEnv(base, wm, device=device)
     print(f"obs_dim={env._obs_dim} (z={env.z_dim}+feat={env.feat_dim}) "
           f"stride={stride}", flush=True)
@@ -214,6 +230,18 @@ def main():
     cfg = make_train_cfg(args)
     cfg["run_name"] = "push_t_wm_rsl"
     runner = OnPolicyRunner(env, cfg, log_dir=log_dir, device=device)
+
+    resume_path = args.resume
+    if resume_path is None:
+        # Continue from last/best in --out when present (safe if out is new).
+        for cand in ("last.pt", "best.pt"):
+            p = os.path.join(args.out, cand)
+            if os.path.exists(p):
+                resume_path = p
+                break
+    if resume_path:
+        print(f"resuming from {resume_path}", flush=True)
+        runner.load(resume_path)
 
     best_rate = -1.0
     history = []
@@ -229,13 +257,14 @@ def main():
 
         policy = runner.get_inference_policy(device=device)
         rate, mdist, n_ok, n_ep = eval_policy(
-            wm, policy, args.eval_eps, seed=1000, hold=args.hold)
+            wm, policy, args.eval_eps, seed=1000, hold=args.hold, tol=tol)
         print(f"  eval@{done_iters}: {n_ok}/{n_ep} = {100 * rate:.1f}% "
-              f"mean_dist={mdist:.3f}", flush=True)
+              f"mean_dist={mdist:.3f} (tol={tol})", flush=True)
         history.append({
             "iter": done_iters,
             "success_rate": rate,
             "mean_dist": mdist,
+            "tol": tol,
             "elapsed_s": time.time() - t0,
         })
         runner.save(os.path.join(args.out, "last.pt"))
@@ -248,6 +277,8 @@ def main():
             json.dump({
                 "method": "rsl_rl_ppo_wm_obs",
                 "wm": args.wm,
+                "tol": tol,
+                "resume": resume_path,
                 "best_rate": best_rate,
                 "history": history,
                 "num_envs": args.num_envs,
@@ -259,17 +290,19 @@ def main():
 
     policy = runner.get_inference_policy(device=device)
     rate, mdist, n_ok, n_ep = eval_policy(
-        wm, policy, args.final_eval_eps, seed=1000, hold=args.hold)
+        wm, policy, args.final_eval_eps, seed=1000, hold=args.hold, tol=tol)
     best_path = os.path.join(args.out, "best.pt")
     if os.path.exists(best_path) and best_rate >= rate:
         runner.load(best_path)
         policy = runner.get_inference_policy(device=device)
         rate, mdist, n_ok, n_ep = eval_policy(
-            wm, policy, args.final_eval_eps, seed=1000, hold=args.hold)
+            wm, policy, args.final_eval_eps, seed=1000, hold=args.hold, tol=tol)
 
     summary = {
         "method": "rsl_rl_ppo_wm_obs",
         "wm": args.wm,
+        "tol": tol,
+        "resume": resume_path,
         "final_success_rate": rate,
         "final_n_success": n_ok,
         "final_episodes": n_ep,

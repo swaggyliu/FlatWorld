@@ -269,6 +269,9 @@ class PushTVecEnv(VecEnv):
         workspace_xy: tuple = (-0.2, 2.4, -0.2, 1.6),
         fail_penalty: float = 2.0,
         ee_scale: float = 1.0,
+        tol: float | None = None,
+        ang_tol: float | None = None,
+        vel_tol: float | None = None,
     ):
         from learning.tasks.push_t import push_t_config
         from learning.rl.imagine import FEAT_DIM
@@ -288,6 +291,15 @@ class PushTVecEnv(VecEnv):
         self._obs_dim = 18 + FEAT_DIM
 
         cfg = push_t_config()
+        if tol is not None:
+            cfg.task.tol = float(tol)
+        if ang_tol is not None:
+            cfg.task.ang_tol = float(ang_tol)
+        if vel_tol is not None:
+            cfg.task.vel_tol = float(vel_tol)
+        self.tol = float(cfg.task.tol)
+        self.ang_tol = float(getattr(cfg.task, "ang_tol", 0.25))
+        self.vel_tol = float(cfg.task.vel_tol)
         self.fmax = float(cfg.collect.force_max)
         budget = int(cfg.task.budget)
         self.max_episode_length = int(
@@ -338,9 +350,9 @@ class PushTVecEnv(VecEnv):
                 "fmax": self.fmax,
                 "ee_spawn": ee_spawn,
                 "ee_scale": float(ee_scale),
-                "tol": float(cfg.task.tol),
-                "ang_tol": float(getattr(cfg.task, "ang_tol", 0.25)),
-                "vel_tol": float(cfg.task.vel_tol),
+                "tol": self.tol,
+                "ang_tol": self.ang_tol,
+                "vel_tol": self.vel_tol,
                 "budget": budget,
                 "seed": int(seed) + 10007 * w,
                 "quiet": True,

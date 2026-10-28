@@ -147,7 +147,7 @@ def _reach(pose):
 
 def push_t_reward(pose, stem_goal, bar_goal, goal_theta: float,
                   a_raw=None, prev_pose=None, *,
-                  tol: float = 0.12, ang_tol: float = 0.25,
+                  tol: float = 0.05, ang_tol: float = 0.25,
                   ang_w: float = 0.5, reach_w: float = 0.5,
                   success_bonus: float = 1.0, **_unused):
     """Push-T reward.

@@ -172,6 +172,8 @@ def main():
     ap.add_argument("--episodes", type=int, default=40)
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--hold", type=int, default=5)
+    ap.add_argument("--tol", type=float, default=None,
+                    help="Pose success tolerance (m); default from push_t_config")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default="learning/results/wm_rl")
     ap.add_argument("--tag", default="wm_rsl")
@@ -190,9 +192,12 @@ def main():
     hold = max(int(args.hold), int(stride), 1)
 
     cfg = push_t_config()
+    if args.tol is not None:
+        cfg.task.tol = float(args.tol)
     task = PushTTask(cfg, planner_kwargs=dict(use_servo=True), ee_spawn="support")
     t0 = time.time()
-    print(f"eval {args.episodes} eps seed={args.seed} hold={hold} ...", flush=True)
+    print(f"eval {args.episodes} eps seed={args.seed} hold={hold} "
+          f"tol={task.tol} ...", flush=True)
     records, traj, rate, mdist, n_ok = eval_and_record(
         task, wm, policy, args.episodes, seed=args.seed, hold=hold)
 
