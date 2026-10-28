@@ -1,4 +1,4 @@
-# Flat World
+﻿# Flat World
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -72,7 +72,7 @@ Manuscript: arXiv forthcoming (**cs.RO**, no PDF in-repo).
 |----------|-------|--------|---------|
 | **WM + CEM** | PushToGoal · Two-room · Reacher | 96–98% (50 ep) | `learning/checkpoints/{push_game,two_room,reacher}` |
 | **WM + BPTT** | SuperMimic-2D skills | multi-skill tracking | `supermimic2d/runs/lafan2d` |
-| **WM + PPO** | Push-T | **36/40 = 90%** | `learning/checkpoints/push_t_wm_rsl` (+ WM `push_t_v4`) |
+| **WM + PPO** | Push-T | **36/40 = 90%** | `learning/checkpoints/push_t_wm_rsl` (+ WM `push_t`) |
 
 <p align="center">
   <a href="learning/results/wm_rl/pusht_promo.mp4"><strong>▶ Push-T promo / You vs AI</strong></a>
@@ -135,7 +135,7 @@ python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt
 ### 3. WM + PPO — Push-T
 
 Underactuated T-block alignment where CEM alone is weak. Freeze Push-T StateLeWM
-(`push_t_v4`), train **rsl-rl PPO** with policy obs = WM latents ‖ task features,
+(`push_t`), train **rsl-rl PPO** with policy obs = WM latents ‖ task features,
 **rewards / dynamics on real FlatWorld**, vectorized envs. Sim eval **36/40 = 90%**.
 
 <p align="center">
@@ -149,12 +149,12 @@ Underactuated T-block alignment where CEM alone is weak. Freeze Push-T StateLeWM
 
 ```bash
 python -m learning.train_rsl_wm_push_t \
-  --wm learning/checkpoints/push_t_v4 \
+  --wm learning/checkpoints/push_t \
   --out learning/checkpoints/push_t_wm_rsl \
   --num-envs 128 --num-workers 6 --target-rate 0.9
 python -m learning.eval_rl_push_t_report \
   --policy learning/checkpoints/push_t_wm_rsl/best.pt \
-  --wm learning/checkpoints/push_t_v4 \
+  --wm learning/checkpoints/push_t \
   --out learning/results/wm_rl --tag wm_rsl
 ```
 
@@ -316,7 +316,7 @@ pytest test2D -q
 |------|------|------|------|
 | **WM + CEM** | PushToGoal · Two-room · Reacher | 96–98%（50 局） | `learning/checkpoints/{push_game,two_room,reacher}` |
 | **WM + BPTT** | SuperMimic-2D 技能 | 多技能跟踪 | `supermimic2d/runs/lafan2d` |
-| **WM + PPO** | Push-T | **36/40 = 90%** | `learning/checkpoints/push_t_wm_rsl`（WM：`push_t_v4`） |
+| **WM + PPO** | Push-T | **36/40 = 90%** | `learning/checkpoints/push_t_wm_rsl`（WM：`push_t`） |
 
 <p align="center">
   <img src="docs/statelewm_worldmodel.png" width="920" alt="StateLeWM 一步预测：当前帧到下一帧" />
@@ -364,7 +364,7 @@ python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt
 
 ### 3. WM + PPO — Push-T
 
-欠驱动 T 块对齐（CEM 单独不够用）。冻结 Push-T StateLeWM（`push_t_v4`），用
+欠驱动 T 块对齐（CEM 单独不够用）。冻结 Push-T StateLeWM（`push_t`），用
 **rsl-rl PPO**：策略观测 = WM 潜变量 ‖ 任务特征，**奖励与转移在真实 FlatWorld**，
 向量化并行环境。仿真评测 **36/40 = 90%**。
 
@@ -374,12 +374,12 @@ python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt
 
 ```bash
 python -m learning.train_rsl_wm_push_t \
-  --wm learning/checkpoints/push_t_v4 \
+  --wm learning/checkpoints/push_t \
   --out learning/checkpoints/push_t_wm_rsl \
   --num-envs 128 --num-workers 6 --target-rate 0.9
 python -m learning.eval_rl_push_t_report \
   --policy learning/checkpoints/push_t_wm_rsl/best.pt \
-  --wm learning/checkpoints/push_t_v4 \
+  --wm learning/checkpoints/push_t \
   --out learning/results/wm_rl --tag wm_rsl
 ```
 ## Spirit Push 游戏
@@ -388,7 +388,7 @@ python -m learning.eval_rl_push_t_report \
 
 ```bash
 python -m game
-python -m game --mode pusht   # Push-T：左右分屏「你能玩过 AI 吗」（WASD vs PPO）
+python -m game --mode pusht   # Push-T：You vs AI split-screen (WASD vs PPO)
 ```
 
 金色是目标，红色碰一次就重来，星星是终点。右侧滑条改弹性 / 摩擦力 / 尺寸。

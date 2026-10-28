@@ -1,4 +1,4 @@
-# StateLeWM — Learning World Models over Physics States in FlatWorld
+﻿# StateLeWM — Learning World Models over Physics States in FlatWorld
 
 A lightweight **state + tactile conditioned latent world model** on top of
 the FlatWorld physics engine. No vision: the model consumes structured
@@ -338,10 +338,11 @@ rotate/translate the T onto a pose goal. Short-horizon CEM on the same WM
 family is a weak fit (non-convex contact, long horizon). The working stack:
 
 1. Collect goal-free Push-T + contact-rich rollouts; train StateLeWM
-   (`learning/checkpoints/push_t_v4`).
+   (`learning/checkpoints/push_t`). Datasets shipped in-repo:
+   `learning/data/push_t_500` and `learning/data/push_t_contact500`.
 2. Freeze the WM. Policy obs = flatten(`z`) ‖ task features (pose / EE–T).
 3. PPO (`rsl-rl`) in **real** FlatWorld with progress reward
-   `Φ_prev − Φ`, vectorized envs (128 envs / ≤6 Windows workers).
+   `Φ_prev − Φ`, vectorized envs (128 envs; tune workers to memory / Warp).
 4. Eval in sim until ≥90% success.
 
 | run | success | notes |
@@ -350,18 +351,24 @@ family is a weak fit (non-convex contact, long horizon). The working stack:
 | raw-state rsl-rl ablation (`push_t_rsl`) | 90% train-eval | confirms task is learnable without WM |
 
 ```bash
+# World model (needs the two Push-T datasets above)
+python -m learning.train \
+    --data learning/data/push_t_500 learning/data/push_t_contact500 \
+    --out learning/checkpoints/push_t --results learning/results/push_t
+
+# WM-obs PPO (online physics; no offline rollouts)
 python -m learning.train_rsl_wm_push_t \
-    --wm learning/checkpoints/push_t_v4 \
+    --wm learning/checkpoints/push_t \
     --out learning/checkpoints/push_t_wm_rsl \
     --num-envs 128 --num-workers 6 --target-rate 0.9
 python -m learning.eval_rl_push_t_report \
     --policy learning/checkpoints/push_t_wm_rsl/best.pt \
-    --wm learning/checkpoints/push_t_v4 \
+    --wm learning/checkpoints/push_t \
     --out learning/results/wm_rl --tag wm_rsl
 ```
 
 Figures: `learning/results/wm_rl/` and `docs/push_t_*.png`.
-Playable duel: `python -m game --mode pusht` (WASD vs this policy).
+Playable duel: `python -m game --mode pusht` (**You vs AI**, WASD vs this policy).
 Why CEM vs BPTT vs PPO: **[docs/PARADIGMS.md](../docs/PARADIGMS.md)**.
 
 Early pure-imagination PPO on Push-T drifted (~8%); that path was removed.

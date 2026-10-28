@@ -1,8 +1,8 @@
-"""Render a short WM+PPO Push-T promo clip (title → rollouts → end card).
+﻿"""Render a short WM+PPO Push-T promo clip (title → rollouts → end card).
 
   python -m learning.render_pusht_promo \\
     --policy learning/checkpoints/push_t_wm_rsl/best.pt \\
-    --wm learning/checkpoints/push_t_v4 \\
+    --wm learning/checkpoints/push_t \\
     --out learning/results/wm_rl/pusht_promo.mp4 \\
     --episodes 4 --seconds 20
 """
@@ -92,7 +92,7 @@ def _card(lines, w=960, h=540, bg="#1d3557"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wm", default="learning/checkpoints/push_t_v4")
+    ap.add_argument("--wm", default="learning/checkpoints/push_t")
     ap.add_argument("--policy",
                     default="learning/checkpoints/push_t_wm_rsl/best.pt")
     ap.add_argument("--out", default="learning/results/wm_rl/pusht_promo.mp4")

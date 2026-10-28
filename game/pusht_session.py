@@ -1,4 +1,4 @@
-"""Spirit Push-T: split-screen You vs AI.
+﻿"""Spirit Push-T: split-screen You vs AI.
 
 Left  — player WASD force on the spirit, push T to the goal.
 Right — frozen WM-obs PPO.
@@ -31,7 +31,7 @@ def _load_policy(wm_path: str, policy_path: str, device: str, hold: int):
         raise FileNotFoundError(
             f"Push-T policy not found: {policy_path}\n"
             "Train with: python -m learning.train_rsl_wm_push_t "
-            "--wm learning/checkpoints/push_t_v4 "
+            "--wm learning/checkpoints/push_t "
             "--out learning/checkpoints/push_t_wm_rsl --target-rate 0.9")
 
     models, norm, stride = load_ensemble(wm_path, device)
@@ -81,7 +81,7 @@ class PushTVersusSession:
 
     def __init__(
         self,
-        wm_path: str = "learning/checkpoints/push_t_v4",
+        wm_path: str = "learning/checkpoints/push_t",
         policy_path: str = "learning/checkpoints/push_t_wm_rsl/best.pt",
         device: str | None = None,
         hold: int = 5,

@@ -1,4 +1,4 @@
-"""Python + raylib prototype: Spirit Push (CEM) and Push-T You-vs-AI.
+﻿"""Python + raylib prototype: Spirit Push (CEM) and Push-T You-vs-AI.
 
 Usage (repo root):
     python -m game
@@ -173,7 +173,7 @@ def _run_pusht(args, device: str):
     from .pusht_session import PushTVersusSession
 
     rl.set_config_flags(rl.FLAG_MSAA_4X_HINT | rl.FLAG_WINDOW_HIGHDPI)
-    rl.init_window(args.width, args.height, "FlatWorld — 你能玩过 AI 吗？")
+    rl.init_window(args.width, args.height, "FlatWorld — You vs AI")
     rl.set_target_fps(60)
     load_ui_font()
 
@@ -212,7 +212,7 @@ def _run_pusht(args, device: str):
                 {"obj_states": np.zeros((3, 6)), "obj_geom": np.ones((3, 2)) * 0.05},
                 {"obj_states": np.zeros((3, 6)), "obj_geom": np.ones((3, 2)) * 0.05},
                 [], [], None, None,
-                title="你能玩过 AI 吗？",
+                title="You vs AI",
                 subtitle=f"load failed: {error}",
                 hint="train push_t_wm_rsl then retry")
         else:
@@ -220,6 +220,8 @@ def _run_pusht(args, device: str):
             if session.phase == "countdown":
                 n = max(1, int(np.ceil(session.countdown_left)))
                 cd = str(n) if session.countdown_left > 0 else "GO!"
+            # Large overlay only after the race ends (not during countdown/race).
+            overlay = session.status if session.phase == "over" else ""
             left_a = session.left.action if session.phase == "race" else None
             right_a = session.right.action if session.phase == "race" else None
             draw_pusht_versus(
@@ -230,14 +232,15 @@ def _run_pusht(args, device: str):
                 session.sg, session.bg,
                 left_action=left_a, right_action=right_a,
                 left_happy=session.left.ok, right_happy=session.right.ok,
-                title="你能玩过 AI 吗？",
-                subtitle=session.status,
+                title="You vs AI",
+                subtitle=overlay,
                 countdown=cd,
                 score_line=(
                     f"YOU {session.player_wins}   —   AI {session.ai_wins}"
                     f"   (draw {session.draws})"),
                 hint=("WASD move   Space/R rematch   P pause   Esc quit"
-                      + ("   · PAUSED" if session.paused else "")))
+                      + ("   · PAUSED" if session.paused else "")),
+                goal_theta=float(session.gth))
         rl.end_drawing()
 
     if session is not None:
@@ -253,7 +256,7 @@ def main():
     parser.add_argument("--checkpoint", type=str,
                         default="learning/checkpoints/push_game")
     parser.add_argument("--wm", type=str,
-                        default="learning/checkpoints/push_t_v4")
+                        default="learning/checkpoints/push_t")
     parser.add_argument("--policy", type=str,
                         default="learning/checkpoints/push_t_wm_rsl/best.pt")
     parser.add_argument("--hold", type=int, default=5)

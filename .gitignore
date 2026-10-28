@@ -19,6 +19,7 @@ htmlcov/
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -82,8 +83,8 @@ learning/results/*
 !learning/results/*.csv
 !learning/results/wm_rl/
 !learning/results/wm_rl/**
-!learning/results/push_t_v4/
-!learning/results/push_t_v4/**
+!learning/results/push_t/
+!learning/results/push_t/**
 !learning/results/reacher/
 !learning/results/reacher/**
 !learning/results/two_room/
@@ -94,8 +95,13 @@ learning/checkpoints/**/logs/
 learning/checkpoints/**/_eval_logs/
 learning/checkpoints/**/_game_logs/
 learning/checkpoints/**/_promo_logs/
-# Raw collect rollouts stay local (weights + reports are enough to reproduce).
+learning/checkpoints/**/_smoke/
+# Raw collect rollouts stay local except the Push-T WM train set.
 learning/data/push_t_*/
+!learning/data/push_t_500/
+!learning/data/push_t_500/**
+!learning/data/push_t_contact500/
+!learning/data/push_t_contact500/**
 learning/data/reacher_*/
 learning/data/two_room_*/
 learning/data/rollouts_*/
@@ -105,5 +111,3 @@ supermimic2d/**/__pycache__/
 supermimic2d/**/last.pt
 supermimic2d/**/_diag*/
 supermimic2d/**/frames/
-
-learning/checkpoints/**/_smoke/

@@ -1,4 +1,4 @@
-# Spirit Push / Push-T duel
+﻿# Spirit Push / Push-T duel
 
 ```bash
 # WM+CEM click-to-push campaign
@@ -6,7 +6,7 @@ python -m game
 
 # You vs AI on Push-T (WASD left, WM-obs PPO right)
 python -m game --mode pusht \
-  --wm learning/checkpoints/push_t_v4 \
+  --wm learning/checkpoints/push_t \
   --policy learning/checkpoints/push_t_wm_rsl/best.pt
 ```
 

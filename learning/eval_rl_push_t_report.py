@@ -1,8 +1,8 @@
-"""Evaluate WM-obs rsl-rl Push-T policy in sim and write report figures.
+﻿"""Evaluate WM-obs rsl-rl Push-T policy in sim and write report figures.
 
   python -m learning.eval_rl_push_t_report \\
     --policy learning/checkpoints/push_t_wm_rsl/best.pt \\
-    --wm learning/checkpoints/push_t_v4 \\
+    --wm learning/checkpoints/push_t \\
     --episodes 40 --seed 1000
 """
 
@@ -168,7 +168,7 @@ def _load_rsl_wm_policy(policy_path, wm_path, device, hold=5):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--policy", default="learning/checkpoints/push_t_wm_rsl/best.pt")
-    ap.add_argument("--wm", default="learning/checkpoints/push_t_v4")
+    ap.add_argument("--wm", default="learning/checkpoints/push_t")
     ap.add_argument("--episodes", type=int, default=40)
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--hold", type=int, default=5)

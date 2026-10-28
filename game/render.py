@@ -675,21 +675,31 @@ def draw_start_menu(width: int, height: int, model_label: str, model_detail: str
     return prev, nxt, start
 
 
+# Light-red ghost T at the goal pose (under live bodies).
+_GHOST_FILL = rl.Color(230, 90, 100, 78)
+_GHOST_OUTLINE = rl.Color(230, 70, 85, 140)
+
+
 def _draw_pusht_world(cam: Camera, states: np.ndarray, geom: np.ndarray,
                       stem_goal, bar_goal, trail, action=None,
-                      happy: bool = False, restitution: float = 0.35):
-    """Draw Push-T bodies (no ground / horizon)."""
+                      happy: bool = False, restitution: float = 0.35,
+                      goal_theta: float = 0.0):
+    """Draw Push-T bodies (no ground / horizon) with translucent ghost-T goal."""
     if trail:
         for i in range(1, len(trail)):
             a = cam.to_screen(*trail[i - 1])
             b = cam.to_screen(*trail[i])
             rl.draw_line_ex(a, b, 2.5, TRAIL)
-    if stem_goal is not None:
-        draw_star(cam, float(stem_goal[0]), float(stem_goal[1]), 0.04, GOAL)
-    if bar_goal is not None:
-        p = cam.to_screen(float(bar_goal[0]), float(bar_goal[1]))
-        rl.draw_circle(int(p.x), int(p.y), 5, GOAL)
     n = len(states)
+    # Ghost T at goal pose (stem=1, bar=2) — translucent light red.
+    if stem_goal is not None and n > 1:
+        hw, hh = float(geom[1, 0]), float(geom[1, 1])
+        _box(cam, float(stem_goal[0]), float(stem_goal[1]), float(goal_theta),
+             hw, hh, _GHOST_FILL, outline=_GHOST_OUTLINE)
+    if bar_goal is not None and n > 2:
+        hw, hh = float(geom[2, 0]), float(geom[2, 1])
+        _box(cam, float(bar_goal[0]), float(bar_goal[1]), float(goal_theta),
+             hw, hh, _GHOST_FILL, outline=_GHOST_OUTLINE)
     for i in range(1, n):
         x, y, th = float(states[i, 0]), float(states[i, 1]), float(states[i, 2])
         hw, hh = float(geom[i, 0]), float(geom[i, 1])
@@ -709,11 +719,11 @@ def _draw_pusht_world(cam: Camera, states: np.ndarray, geom: np.ndarray,
 
 def draw_pusht_scene(cam: Camera, states: np.ndarray, geom: np.ndarray,
                      stem_goal, bar_goal, trail, action=None,
-                     happy: bool = False):
+                     happy: bool = False, goal_theta: float = 0.0):
     """Single-panel Push-T without horizon."""
     rl.draw_rectangle(0, 0, cam.width, cam.height, BG)
     _draw_pusht_world(cam, states, geom, stem_goal, bar_goal, trail,
-                      action=action, happy=happy)
+                      action=action, happy=happy, goal_theta=goal_theta)
 
 
 def draw_pusht_versus(width: int, height: int,
@@ -722,11 +732,12 @@ def draw_pusht_versus(width: int, height: int,
                       stem_goal, bar_goal,
                       left_action=None, right_action=None,
                       left_happy: bool = False, right_happy: bool = False,
-                      title: str = "你能玩过 AI 吗？",
+                      title: str = "You vs AI",
                       subtitle: str = "",
                       countdown: str | None = None,
                       score_line: str = "",
-                      hint: str = ""):
+                      hint: str = "",
+                      goal_theta: float = 0.0):
     """Split-screen You vs AI — no ground horizon."""
     mid = width // 2
     rl.draw_rectangle(0, 0, width, height, BG)
@@ -745,7 +756,8 @@ def draw_pusht_versus(width: int, height: int,
     _draw_pusht_world(
         cam_l, left_obs["obj_states"], left_obs["obj_geom"],
         stem_goal, bar_goal, left_trail,
-        action=left_action, happy=left_happy, restitution=0.45)
+        action=left_action, happy=left_happy, restitution=0.45,
+        goal_theta=goal_theta)
     text("YOU  ·  WASD", 24, height - 36, 16, HP_OK)
     rl.end_scissor_mode()
 
@@ -754,26 +766,37 @@ def draw_pusht_versus(width: int, height: int,
     _draw_pusht_world(
         cam_r, right_obs["obj_states"], right_obs["obj_geom"],
         stem_goal, bar_goal, right_trail,
-        action=right_action, happy=right_happy, restitution=0.45)
+        action=right_action, happy=right_happy, restitution=0.45,
+        goal_theta=goal_theta)
     text("AI  ·  WM+PPO", mid + 24, height - 36, 16, BRAIN)
     rl.end_scissor_mode()
 
     rl.draw_rectangle(mid - 2, 0, 4, height, rl.Color(60, 80, 100, 255))
 
-    banner = rl.Rectangle(width * 0.5 - 280, 12, 560, 78)
+    banner = rl.Rectangle(width * 0.5 - 280, 12, 560, 64)
     rl.draw_rectangle_rounded(banner, 0.18, 8, PANEL)
-    tw = text_width(title, 22)
-    text(title, (width - tw) * 0.5, 20, 22, TEXT)
-    if subtitle:
-        sw = text_width(subtitle, 14)
-        col = HP_OK if ("YOU" in subtitle.upper() or "WIN" in subtitle.upper()) else TEXT
-        text(subtitle, (width - sw) * 0.5, 48, 14, col)
+    tw = text_width(title, 24)
+    text(title, (width - tw) * 0.5, 22, 24, TEXT)
     if score_line:
-        lw = text_width(score_line, 13)
-        text(score_line, (width - lw) * 0.5, 68, 13, MUTED)
+        lw = text_width(score_line, 14)
+        text(score_line, (width - lw) * 0.5, 50, 14, MUTED)
     if countdown:
         cw = text_width(countdown, 72)
         text(countdown, (width - cw) * 0.5, height * 0.40, 72, TARGET)
+    # Large win / draw overlay (readable English-only glyphs).
+    if subtitle:
+        su = subtitle.upper()
+        if "YOU WIN" in su:
+            col = HP_OK
+        elif "AI WIN" in su:
+            col = BRAIN
+        elif "DRAW" in su:
+            col = TARGET
+        else:
+            col = TEXT
+        size = 64 if ("WIN" in su or "DRAW" in su) else 18
+        sw = text_width(subtitle, size)
+        text(subtitle, (width - sw) * 0.5, height * 0.38, size, col)
     if hint:
         hw = text_width(hint, 14)
         text(hint, (width - hw) * 0.5, height - 22, 14, MUTED)

@@ -1,4 +1,4 @@
-# Control paradigms on StateLeWM
+﻿# Control paradigms on StateLeWM
 
 FlatWorld uses **one** state + tactile latent world model (StateLeWM), then
 plugs in three different **controllers**. Same engine, same latent dynamics
@@ -146,23 +146,23 @@ Policy observations are **`z ‖ task_features`** (WM encode + pose features);
 # WM
 python -m learning.data.collect ... --out learning/data/push_t_500
 python -m learning.train --data learning/data/push_t_500 learning/data/push_t_contact500 \
-    --out learning/checkpoints/push_t_v4 ...
+    --out learning/checkpoints/push_t ...
 
 # WM-obs PPO (tune --num-workers to machine memory / Warp stability)
 python -m learning.train_rsl_wm_push_t \
-    --wm learning/checkpoints/push_t_v4 \
+    --wm learning/checkpoints/push_t \
     --out learning/checkpoints/push_t_wm_rsl \
     --num-envs 128 --num-workers 6 --target-rate 0.9
 
 # report eval
 python -m learning.eval_rl_push_t_report \
     --policy learning/checkpoints/push_t_wm_rsl/best.pt \
-    --wm learning/checkpoints/push_t_v4 \
+    --wm learning/checkpoints/push_t \
     --out learning/results/wm_rl --tag wm_rsl
 ```
 
 Result (40 ep, seed 1000): **36/40 = 90%**, mean settle ~127 frames.
-Weights: `learning/checkpoints/push_t_v4`, `learning/checkpoints/push_t_wm_rsl`.
+Weights: `learning/checkpoints/push_t`, `learning/checkpoints/push_t_wm_rsl`.
 
 ---
 

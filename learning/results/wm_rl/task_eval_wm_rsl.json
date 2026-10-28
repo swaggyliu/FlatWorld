@@ -1,8 +1,8 @@
-{
+﻿{
   "summary": {
     "task": "PushT",
     "policy": "learning/checkpoints/push_t_wm_rsl/best.pt",
-    "wm": "learning/checkpoints/push_t_v4",
+    "wm": "learning/checkpoints/push_t",
     "episodes": 40,
     "n_success": 36,
     "success_rate": 0.9,

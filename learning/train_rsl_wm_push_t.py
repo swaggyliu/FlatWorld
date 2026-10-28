@@ -1,4 +1,4 @@
-"""Push-T PPO with frozen WM latents + real FlatWorld physics (rsl-rl).
+﻿"""Push-T PPO with frozen WM latents + real FlatWorld physics (rsl-rl).
 
 World model only encodes observations; dynamics/reward stay on the real
 simulator — the recipe that already hit 90% on raw-state PPO, but the
@@ -6,7 +6,7 @@ policy now conditions on WM ``z`` + task features.
 
 Usage:
   python -m learning.train_rsl_wm_push_t \\
-    --wm learning/checkpoints/push_t_v4 \\
+    --wm learning/checkpoints/push_t \\
     --num-envs 128 --num-workers 6 \\
     --out learning/checkpoints/push_t_wm_rsl --target-rate 0.9
 """
@@ -168,7 +168,7 @@ def eval_policy(wm, policy, n_eps: int, seed: int = 1000, hold: int = 5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wm", default="learning/checkpoints/push_t_v4")
+    ap.add_argument("--wm", default="learning/checkpoints/push_t")
     ap.add_argument("--out", default="learning/checkpoints/push_t_wm_rsl")
     ap.add_argument("--num-envs", type=int, default=128)
     ap.add_argument("--num-workers", type=int, default=6)

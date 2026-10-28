@@ -1,6 +1,6 @@
-{
+﻿{
   "method": "rsl_rl_ppo_wm_obs",
-  "wm": "learning/checkpoints/push_t_v4",
+  "wm": "learning/checkpoints/push_t",
   "final_success_rate": 0.9,
   "final_n_success": 36,
   "final_episodes": 40,
