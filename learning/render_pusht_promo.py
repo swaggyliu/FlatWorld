@@ -167,6 +167,103 @@ def _card(lines, w=960, h=540, bg="#1d3557"):
     return buf
 
 
+def _goals_from_stem(stem_xy, geom, gth: float = 0.0):
+    """Recover (stem_goal, bar_goal, theta) from saved stem goal + geom."""
+    sg = np.asarray(stem_xy[:2], dtype=np.float64)
+    stem_hh = float(geom[1, 1])
+    bar_hh = float(geom[2, 1])
+    c, s = np.cos(gth), np.sin(gth)
+    # Matches PushTEnv._t_local: bar_l - stem_l = (0, stem_hh + bar_hh).
+    offset = np.array([0.0, stem_hh + bar_hh], dtype=np.float64)
+    bg = sg + np.array([c * offset[0] - s * offset[1],
+                        s * offset[0] + c * offset[1]])
+    return (sg.astype(np.float32), bg.astype(np.float32), float(gth))
+
+
+def _frames_from_traj(states, geom, sg, bg, gth, lines, fps, settle_s=0.8):
+    """Matplotlib-only frames from a saved (T, bodies, 6) trajectory."""
+    frames = []
+    trail = []
+    arr = np.asarray(states, dtype=np.float32)
+    geom = np.asarray(geom, dtype=np.float32)
+    for t, st in enumerate(arr):
+        trail.append((float(st[0, 0]), float(st[0, 1])))
+        if t % 2 == 0:
+            frames.append(_frame(
+                st, geom, sg, bg, gth, trail, lines, status=f"t={t}"))
+    if len(arr):
+        for _ in range(int(fps * settle_s)):
+            frames.append(_frame(
+                arr[-1], geom, sg, bg, gth, trail, lines, status="SUCCESS"))
+    return frames
+
+
+def _write_promo(success_clips, args):
+    frames = []
+    title = _card([
+        "FlatWorld  ·  StateLeWM",
+        "WM + PPO  ·  Push-T",
+        "position random · unrestricted · simple reward",
+        f"tol={float(args.tol):.2f} m  ·  ghost-T goal",
+    ])
+    for _ in range(int(args.fps * 1.8)):
+        frames.append(title)
+    for i, (_path, clip_frames, seed) in enumerate(success_clips):
+        bridge = _card([
+            f"Success {i + 1}/{len(success_clips)}",
+            f"seed={seed}",
+            "position random · unrestricted · simple reward",
+        ], bg="#142033")
+        for _ in range(int(args.fps * 0.7)):
+            frames.append(bridge)
+        frames.extend(clip_frames)
+    end = _card([
+        f"Push-T  ·  {len(success_clips)} success rollouts",
+        "WM+PPO on real physics  ·  frozen encoder",
+        "github.com/swaggyliu/FlatWorld",
+    ])
+    for _ in range(int(args.fps * 2.0)):
+        frames.append(end)
+    imageio.mimsave(args.out, frames, fps=args.fps)
+    print(f"wrote promo {args.out}  ({len(frames)} frames @ {args.fps} fps)",
+          flush=True)
+
+
+def _render_from_npz(args):
+    """Offline path: matplotlib-only re-render of saved eval trajectories."""
+    _pick_font()
+    os.makedirs(args.out_dir or ".", exist_ok=True)
+    if not args.no_promo:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    z = np.load(args.from_npz, allow_pickle=True)
+    ok_idx = np.where(np.asarray(z["success"]))[0]
+    print(f"from-npz {args.from_npz}: {len(ok_idx)} successes "
+          f"(need {args.need_ok})", flush=True)
+    lines = _setup_lines(float(args.tol), bilingual=not args.en_only)
+    success_clips = []
+    n_ok = 0
+    for i in ok_idx:
+        if n_ok >= int(args.need_ok):
+            break
+        states = z["states"][i]
+        geom = np.asarray(z["geom"][i], dtype=np.float32)
+        sg, bg, gth = _goals_from_stem(z["goal"][i], geom, gth=0.0)
+        ep = int(z["episode_idx"][i]) if "episode_idx" in z.files else int(i)
+        seed = int(args.seed) + ep
+        print(f"render ep{ep} seed={seed} T={len(states)} …", flush=True)
+        frames = _frames_from_traj(
+            states, geom, sg, bg, gth, lines, args.fps)
+        n_ok += 1
+        clip_path = os.path.join(
+            args.out_dir, f"pusht_success_{n_ok:02d}.mp4")
+        imageio.mimsave(clip_path, frames, fps=args.fps)
+        print(f"  wrote {clip_path}", flush=True)
+        success_clips.append((clip_path, frames, seed))
+    if not args.no_promo and success_clips:
+        _write_promo(success_clips, args)
+    print(f"done: {n_ok} success clip(s) in {args.out_dir}", flush=True)
+
+
 def _rollout_episode(task, wm, policy, hold, seed, lines, fps,
                      settle_s=0.8, max_t=None):
     """Run one episode; return (ok, frames, settle_t)."""
@@ -249,7 +346,14 @@ def main():
                     help="English-only overlay (skip Chinese labels)")
     ap.add_argument("--no-promo", action="store_true",
                     help="Skip combined promo; only write per-success clips")
+    ap.add_argument(
+        "--from-npz", default=None,
+        help="Re-render from saved task_trajectories_*.npz (no torch import)")
     args = ap.parse_args()
+
+    if args.from_npz:
+        _render_from_npz(args)
+        return
 
     import torch
     from learning.tasks.push_to_goal import load_ensemble
@@ -296,7 +400,8 @@ def main():
     log_dir = os.path.join(os.path.dirname(policy_path), "_promo_logs")
     os.makedirs(log_dir, exist_ok=True)
     runner = OnPolicyRunner(env, cfg, log_dir=log_dir, device=device)
-    runner.load(policy_path)
+    # Checkpoints are often CUDA tensors; map explicitly for CPU-only hosts.
+    runner.load(policy_path, map_location=device)
     policy = runner.get_inference_policy(device=device)
 
     task_cfg = push_t_config()
