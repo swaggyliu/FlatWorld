@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlatWorld — 2D physics + StateLeWM</title>
+  <style>
+    :root {
+      --ink: #1a1f24;
+      --muted: #5a6570;
+      --accent: #0b6e4f;
+      --bg0: #e8f0ec;
+      --bg1: #f7faf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #cfe8dc 0%, transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, #d9e4f0 0%, transparent 50%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      min-height: 100vh;
+    }
+    main {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 3.5rem 1.25rem 4rem;
+    }
+    h1 {
+      font-size: clamp(2.4rem, 6vw, 3.6rem);
+      letter-spacing: -0.03em;
+      margin: 0 0 0.35rem;
+      font-weight: 750;
+    }
+    .tag {
+      color: var(--muted);
+      font-size: 1.05rem;
+      max-width: 38rem;
+      line-height: 1.45;
+      margin-bottom: 1.5rem;
+    }
+    .cta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      margin-bottom: 2rem;
+    }
+    a.btn {
+      display: inline-block;
+      padding: 0.65rem 1.1rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }
+    a.primary { background: var(--accent); color: #fff; }
+    a.ghost { background: #fff; color: var(--ink); border-color: #c5d0c9; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+      background: rgba(255,255,255,0.72);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    th, td { text-align: left; padding: 0.7rem 0.85rem; border-bottom: 1px solid #e2e8e4; }
+    th { background: rgba(11,110,79,0.08); }
+    footer { margin-top: 2.5rem; color: var(--muted); font-size: 0.9rem; }
+    code { font-size: 0.92em; background: #eef3f0; padding: 0.1em 0.35em; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>FlatWorld</h1>
+    <p class="tag">
+      Warp-accelerated 2D physics and an object-centric state world model
+      (StateLeWM) with three controllers — CEM, BPTT, and PPO — including
+      Push-T <strong>You vs AI</strong>.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/swaggyliu/FlatWorld">GitHub</a>
+      <a class="btn ghost" href="https://github.com/swaggyliu/FlatWorld#3-wm--ppo--push-t">Play Push-T</a>
+      <a class="btn ghost" href="https://github.com/swaggyliu/FlatWorld/blob/main/docs/PARADIGMS.md">Paradigms</a>
+      <a class="btn ghost" href="https://github.com/swaggyliu/FlatWorld/blob/main/CITATION.cff">Cite</a>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Paradigm</th><th>Task</th><th>Result</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>WM + CEM</td><td>Push · Two-room · Reacher</td><td>96–98%</td></tr>
+        <tr><td>WM + BPTT</td><td>SuperMimic-2D</td><td>multi-skill</td></tr>
+        <tr><td>WM + PPO</td><td>Push-T</td><td>90% (36/40)</td></tr>
+      </tbody>
+    </table>
+    <p class="tag" style="margin-top:1.5rem">
+      Manuscript: forthcoming on arXiv (<code>cs.RO</code>). No PDF in this repo —
+      see <code>docs/PARADIGMS.md</code> for the short in-repo narrative.
+    </p>
+    <p class="tag">
+      Local play: <code>python -m game --mode pusht</code> (WASD left, frozen WM+PPO right).
+    </p>
+    <footer>Apache-2.0 · Dongyu Liu</footer>
+  </main>
+</body>
+</html>

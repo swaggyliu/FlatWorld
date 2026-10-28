@@ -34,10 +34,27 @@ dev = [
     "pytest-cov>=4.0",
     "pytest-timeout>=2.0",
 ]
+learning = [
+    "torch>=2.1",
+    "tensordict>=0.4",
+    "rsl-rl-lib>=2.0",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "imageio>=2.31",
+    "imageio-ffmpeg>=0.4",
+]
+game = [
+    "raylib>=5.0",
+]
+all = [
+    "flatworld[dev,learning,game]",
+]
 
 [project.urls]
 Documentation = "https://github.com/swaggyliu/FlatWorld/blob/main/docs/THEORY_AND_IMPLEMENTATION.md"
 Repository = "https://github.com/swaggyliu/FlatWorld"
+Homepage = "https://swaggyliu.github.io/FlatWorld/"
+"Bug Tracker" = "https://github.com/swaggyliu/FlatWorld/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

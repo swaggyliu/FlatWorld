@@ -1,21 +1,9 @@
-"""Python + raylib prototype: authored push stages + CEM spirit.
+"""Python + raylib prototype: Spirit Push (CEM) and Push-T You-vs-AI.
 
 Usage (repo root):
     python -m game
     python -m game --checkpoint learning/checkpoints/push_game
-
-Start screen: pick a world-model checkpoint, then Start.
-Drop your own .pt into learning/world_models to see it in the list.
-
-Five campaign stages, then seeded random layouts (retry keeps the same mix).
-
-In-game:
-    click gold     choose the body to push
-    click empty    push it toward that x
-    sliders        bounce / grip / size (0.5x–2.0x)
-    R / Space      retry this stage (keeps loadout)
-    N              skip (no score) and apply the next stage's suggested loadout
-    Esc            quit
+    python -m game --mode pusht          # split-screen: WASD vs WM+PPO
 """
 
 from __future__ import annotations
@@ -23,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 
+import numpy as np
 import pyray as rl
 import torch
 
@@ -30,6 +19,7 @@ from .camera import Camera
 from .menu import discover_models, ensure_user_model_dir
 from .render import (
     BG, _hit, draw_equipment_panel, draw_hud, draw_scene, draw_start_menu,
+    draw_pusht_versus,
     equipment_layout, load_ui_font, slider_value, t_to_scale, unload_ui_font,
 )
 from .session import GameSession
@@ -37,18 +27,7 @@ from .session import GameSession
 W, H = 1280, 720
 
 
-def main():
-    parser = argparse.ArgumentParser(description="FlatWorld spirit push")
-    parser.add_argument("--checkpoint", type=str,
-                        default="learning/checkpoints/push_game")
-    parser.add_argument("--full", action="store_true",
-                        help="prefer the full ensemble when a folder is selected")
-    parser.add_argument("--width", type=int, default=W)
-    parser.add_argument("--height", type=int, default=H)
-    args = parser.parse_args()
-
-    os.environ.setdefault("HEADLESS", "1")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def _run_push(args, device: str):
     ensure_user_model_dir()
     models = discover_models(args.checkpoint)
     if not models:
@@ -58,10 +37,6 @@ def main():
         if os.path.normpath(m.path) == os.path.normpath(args.checkpoint):
             pick = i
             break
-        if args.full and m.full_ensemble and os.path.isdir(args.checkpoint):
-            if os.path.normpath(m.path) == os.path.normpath(args.checkpoint):
-                pick = i
-                break
 
     rl.set_config_flags(rl.FLAG_MSAA_4X_HINT | rl.FLAG_WINDOW_HIGHDPI)
     rl.init_window(args.width, args.height, "FlatWorld — Spirit Push")
@@ -192,6 +167,109 @@ def main():
 
     unload_ui_font()
     rl.close_window()
+
+
+def _run_pusht(args, device: str):
+    from .pusht_session import PushTVersusSession
+
+    rl.set_config_flags(rl.FLAG_MSAA_4X_HINT | rl.FLAG_WINDOW_HIGHDPI)
+    rl.init_window(args.width, args.height, "FlatWorld — 你能玩过 AI 吗？")
+    rl.set_target_fps(60)
+    load_ui_font()
+
+    error = ""
+    session = None
+    try:
+        session = PushTVersusSession(
+            wm_path=args.wm, policy_path=args.policy, device=device,
+            hold=args.hold, seed=args.seed)
+    except Exception as exc:
+        error = str(exc)
+
+    key_map = {
+        rl.KEY_W: "w", rl.KEY_A: "a", rl.KEY_S: "s", rl.KEY_D: "d",
+    }
+    while not rl.window_should_close():
+        if rl.is_key_pressed(rl.KEY_ESCAPE):
+            break
+        if session is not None:
+            if rl.is_key_pressed(rl.KEY_R) or rl.is_key_pressed(rl.KEY_SPACE):
+                session.next_episode()
+            if rl.is_key_pressed(rl.KEY_P):
+                session.paused = not session.paused
+            for code, name in key_map.items():
+                if rl.is_key_down(code):
+                    session.set_key(name, True)
+                else:
+                    session.set_key(name, False)
+            session.tick()
+
+        rl.begin_drawing()
+        rl.clear_background(BG)
+        if session is None:
+            draw_pusht_versus(
+                args.width, args.height,
+                {"obj_states": np.zeros((3, 6)), "obj_geom": np.ones((3, 2)) * 0.05},
+                {"obj_states": np.zeros((3, 6)), "obj_geom": np.ones((3, 2)) * 0.05},
+                [], [], None, None,
+                title="你能玩过 AI 吗？",
+                subtitle=f"load failed: {error}",
+                hint="train push_t_wm_rsl then retry")
+        else:
+            cd = None
+            if session.phase == "countdown":
+                n = max(1, int(np.ceil(session.countdown_left)))
+                cd = str(n) if session.countdown_left > 0 else "GO!"
+            left_a = session.left.action if session.phase == "race" else None
+            right_a = session.right.action if session.phase == "race" else None
+            draw_pusht_versus(
+                args.width, args.height,
+                session.left.task.observe(),
+                session.right.task.observe(),
+                session.left.trail, session.right.trail,
+                session.sg, session.bg,
+                left_action=left_a, right_action=right_a,
+                left_happy=session.left.ok, right_happy=session.right.ok,
+                title="你能玩过 AI 吗？",
+                subtitle=session.status,
+                countdown=cd,
+                score_line=(
+                    f"YOU {session.player_wins}   —   AI {session.ai_wins}"
+                    f"   (draw {session.draws})"),
+                hint=("WASD move   Space/R rematch   P pause   Esc quit"
+                      + ("   · PAUSED" if session.paused else "")))
+        rl.end_drawing()
+
+    if session is not None:
+        session.close()
+    unload_ui_font()
+    rl.close_window()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FlatWorld spirit push")
+    parser.add_argument("--mode", choices=("push", "pusht"), default="push",
+                        help="push = WM+CEM Spirit Push; pusht = WM+PPO Push-T")
+    parser.add_argument("--checkpoint", type=str,
+                        default="learning/checkpoints/push_game")
+    parser.add_argument("--wm", type=str,
+                        default="learning/checkpoints/push_t_v4")
+    parser.add_argument("--policy", type=str,
+                        default="learning/checkpoints/push_t_wm_rsl/best.pt")
+    parser.add_argument("--hold", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--full", action="store_true",
+                        help="prefer the full ensemble when a folder is selected")
+    parser.add_argument("--width", type=int, default=W)
+    parser.add_argument("--height", type=int, default=H)
+    args = parser.parse_args()
+
+    os.environ.setdefault("HEADLESS", "1")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.mode == "pusht":
+        _run_pusht(args, device)
+    else:
+        _run_push(args, device)
 
 
 if __name__ == "__main__":

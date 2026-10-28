@@ -2,9 +2,15 @@
 
 import numpy as np
 
+from learning.tasks.base import TaskMixin
 
-class CEMWorldTask:
-    """Bind a cost, plan with CEM, execute in the simulator."""
+
+class CEMWorldTask(TaskMixin):
+    """Bind a cost, plan with CEM, execute in the simulator.
+
+    Implements the unified :class:`~learning.tasks.base.FlatWorldTask`
+    surface (``observe`` / ``potential`` / ``metric`` / ``succeeded``).
+    """
 
     def __init__(self, cfg, env, model, norm, device="cpu",
                  tol: float = None, vel_tol: float = None, budget: int = None,
@@ -29,8 +35,12 @@ class CEMWorldTask:
         for k in ("action_cost", "reach_cost", "settle_w"):
             if k in pk:
                 cost_overrides[k] = pk.pop(k)
+        # SolverCEMPlanner does not accept these; keep them for CEMPlanner.
+        wm_only = {}
         for k in ("tactile_mode", "ensemble_reduce", "uncert_cost"):
-            pk.pop(k, None)
+            if k in pk:
+                wm_only[k] = pk.pop(k)
+        pk.pop("use_hybrid", None)  # consumed by task subclasses
         if self.use_servo:
             self.models = []
             self.model = None
@@ -52,6 +62,7 @@ class CEMWorldTask:
             self.model = self.models[0] if self.models else None
             if "tactile_residual" not in pk and self.models:
                 pk["tactile_residual"] = bool(getattr(self.models[0], "tactile_residual", False))
+            pk.update(wm_only)
             self.planner = CEMPlanner(
                 self.models, norm, device=device,
                 force_max=cfg.collect.force_max, **pk)
@@ -74,7 +85,8 @@ class CEMWorldTask:
 
     def _hold(self, action, t, frames):
         obs = None
-        for _ in range(self.stride):
+        n_hold = int(getattr(self, "_action_stride", self.stride) or self.stride)
+        for _ in range(max(n_hold, 1)):
             obs = self.env.step(action)
             t += 1
             if frames is not None:
@@ -155,7 +167,8 @@ class CEMWorldTask:
                 self.env.set_force(self._idle_action())
                 break
             planned = self._plan(cur, goal)
-            if (self.use_solver_cem and self.exec_horizon > 1
+            # Open-loop multi-step exec for solver or WM hybrid macros / CEM.
+            if (self.exec_horizon > 1
                     and isinstance(planned, np.ndarray) and planned.ndim == 2):
                 n_exec = min(self.exec_horizon, len(planned))
                 for j in range(n_exec):

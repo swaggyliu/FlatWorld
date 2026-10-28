@@ -80,10 +80,6 @@ def _as_float(v) -> float:
     return float(v)
 
 
-def _as_vec2(v):
-    a = np.asarray(v, dtype=np.float32).reshape(-1)
-    return wp.vec2(float(a[0]), float(a[1]) if a.size > 1 else 0.0)
-
 
 # ---------------------------------------------------------------------------
 # Serial PGS (dim=1) — critical path kept as real Warp kernels
@@ -2296,8 +2292,198 @@ def _compute_contact_forces_wp(
         contact_force[idx] = force * dt_inv
 
 
+@wp.kernel
+def _detect_plane_mesh_contacts_wp(
+    num_groundmesh_pairs: wp.array(dtype=int),
+    max_ground_contacts: int,
+    restitution_velocity_threshold: float,
+    groundmesh_pairs_buffer: wp.array(dtype=wp.vec2i),
+    filter_by_kind: int,
+    ground_kind: wp.array(dtype=int),
+    rigidDomainIds: wp.array(dtype=wp.vec3i),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    contactParams: wp.array(dtype=wp.vec2),
+    rigid_env_id: wp.array(dtype=int),
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+    rigid2MeshIndices: wp.array(dtype=int),
+    meshBoundaryNodeOffset: wp.array(dtype=int),
+    meshBoundaryNodeCount: wp.array(dtype=int),
+    meshBoundaryCoords: wp.array(dtype=wp.vec2),
+    num_ground_contacts: wp.array(dtype=int),
+    ground_contact_rigid: wp.array(dtype=int),
+    ground_contact_point: wp.array(dtype=wp.vec2),
+    ground_contact_normal: wp.array(dtype=wp.vec2),
+    ground_contact_vel: wp.array(dtype=wp.vec2),
+    ground_contact_depth: wp.array(dtype=float),
+    ground_contact_bounce_vel: wp.array(dtype=float),
+    ground_contact_tangent1: wp.array(dtype=wp.vec2),
+    ground_contact_env_count: wp.array(dtype=int),
+    ground_contact_env_idx: wp.array(dtype=int),
+    max_envs_alloc: int,
+    max_gc_per_env: int,
+):
+    """Plane vs mesh: deepest + ±t1 extremes (host representative-contact policy)."""
+    tid = wp.tid()
+    n_pairs = num_groundmesh_pairs[0]
+    if tid >= n_pairs:
+        return
+    anal_idx = groundmesh_pairs_buffer[tid][0]
+    rigid_idx = groundmesh_pairs_buffer[tid][1]
+    if filter_by_kind != 0 and ground_kind[anal_idx] != GROUND_KIND_PLANE:
+        return
+    planepoint = rigidParams[anal_idx, 0]
+    normal = rigidParams[anal_idx, 1]
+    anal_vel = V[anal_idx]
+    domain_idx = rigidDomainIds[rigid_idx][0]
+    bbox_min = aabb[domain_idx, 0]
+    bbox_max = aabb[domain_idx, 1]
+    support = wp.vec2(
+        bbox_max[0] if normal[0] < 0.0 else bbox_min[0],
+        bbox_max[1] if normal[1] < 0.0 else bbox_min[1],
+    )
+    if wp.dot(support - planepoint, normal) >= 0.0:
+        return
+    mesh_local = rigid2MeshIndices[rigid_idx]
+    if mesh_local < 0:
+        return
+    off = meshBoundaryNodeOffset[mesh_local]
+    nnodes = meshBoundaryNodeCount[mesh_local]
+    t1 = wp.vec2(-normal[1], normal[0])
+    has_contact = int(0)
+    deep_d = float(0.0)
+    deep_pos = wp.vec2(0.0, 0.0)
+    max_t1_proj = float(-1.0e30)
+    max_t1_d = float(0.0)
+    max_t1_pos = wp.vec2(0.0, 0.0)
+    min_t1_proj = float(1.0e30)
+    min_t1_d = float(0.0)
+    min_t1_pos = wp.vec2(0.0, 0.0)
+    for nidx in range(nnodes):
+        pos = meshBoundaryCoords[off + nidx]
+        d = wp.dot(pos - planepoint, normal)
+        if d < 0.0:
+            has_contact = 1
+            if d < deep_d:
+                deep_d = d
+                deep_pos = pos
+            p1 = wp.dot(pos, t1)
+            if p1 > max_t1_proj:
+                max_t1_proj = p1
+                max_t1_d = d
+                max_t1_pos = pos
+            if p1 < min_t1_proj:
+                min_t1_proj = p1
+                min_t1_d = d
+                min_t1_pos = pos
+    if has_contact == 0:
+        return
+    _cache_ground_contact_func(
+        rigid_idx, deep_pos, normal, anal_vel, deep_d,
+        max_ground_contacts, restitution_velocity_threshold,
+        rigidParams, V, RotV, contactParams, rigid_env_id,
+        num_ground_contacts, ground_contact_rigid, ground_contact_point,
+        ground_contact_normal, ground_contact_vel, ground_contact_depth,
+        ground_contact_bounce_vel, ground_contact_tangent1,
+        ground_contact_env_count, ground_contact_env_idx,
+        max_envs_alloc, max_gc_per_env,
+    )
+    sep = 0.005
+    if wp.length(max_t1_pos - deep_pos) > sep:
+        _cache_ground_contact_func(
+            rigid_idx, max_t1_pos, normal, anal_vel, max_t1_d,
+            max_ground_contacts, restitution_velocity_threshold,
+            rigidParams, V, RotV, contactParams, rigid_env_id,
+            num_ground_contacts, ground_contact_rigid, ground_contact_point,
+            ground_contact_normal, ground_contact_vel, ground_contact_depth,
+            ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx,
+            max_envs_alloc, max_gc_per_env,
+        )
+    if (
+        wp.length(min_t1_pos - deep_pos) > sep
+        and wp.length(min_t1_pos - max_t1_pos) > sep
+    ):
+        _cache_ground_contact_func(
+            rigid_idx, min_t1_pos, normal, anal_vel, min_t1_d,
+            max_ground_contacts, restitution_velocity_threshold,
+            rigidParams, V, RotV, contactParams, rigid_env_id,
+            num_ground_contacts, ground_contact_rigid, ground_contact_point,
+            ground_contact_normal, ground_contact_vel, ground_contact_depth,
+            ground_contact_bounce_vel, ground_contact_tangent1,
+            ground_contact_env_count, ground_contact_env_idx,
+            max_envs_alloc, max_gc_per_env,
+        )
+
+
+@wp.kernel
+def _update_mesh_coords_wp(
+    num_mesh: int,
+    mesh2rigid: wp.array(dtype=int),
+    node_off: wp.array(dtype=int),
+    node_cnt: wp.array(dtype=int),
+    pool_ids: wp.array(dtype=int),
+    pool_node_off: wp.array(dtype=int),
+    pool_node_cnt: wp.array(dtype=int),
+    pool_lrs: wp.array(dtype=wp.vec2),
+    rigidParams: wp.array(dtype=wp.vec2, ndim=2),
+    quat: wp.array(dtype=float),
+    scales: wp.array(dtype=wp.vec2),
+    offsets: wp.array(dtype=wp.vec2),
+    domain_ids: wp.array(dtype=wp.vec3i),
+    out_coords: wp.array(dtype=wp.vec2),
+    update_aabb: int,
+    aabb: wp.array(dtype=wp.vec2, ndim=2),
+):
+    """World-space mesh boundary verts + per-mesh AABB (one thread per mesh)."""
+    mid = wp.tid()
+    if mid >= num_mesh:
+        return
+    rid = mesh2rigid[mid]
+    if rid < 0:
+        return
+    pool_id = pool_ids[rid]
+    if pool_id < 0:
+        return
+    n_off = node_off[mid]
+    n_cnt = node_cnt[mid]
+    p_off = pool_node_off[pool_id]
+    p_cnt = pool_node_cnt[pool_id]
+    n_use = n_cnt if n_cnt < p_cnt else p_cnt
+    if n_use <= 0:
+        return
+
+    center = rigidParams[rid, 0]
+    angle = quat[rid]
+    c = wp.cos(angle)
+    s = wp.sin(angle)
+    scale = scales[rid]
+    offset = offsets[rid]
+
+    lb = wp.vec2(1.0e30, 1.0e30)
+    ub = wp.vec2(-1.0e30, -1.0e30)
+    for i in range(n_use):
+        lr = pool_lrs[p_off + i]
+        local = wp.vec2(lr[0] * scale[0], lr[1] * scale[1])
+        world = center + offset + wp.vec2(
+            c * local[0] - s * local[1],
+            s * local[0] + c * local[1],
+        )
+        out_coords[n_off + i] = world
+        lb = wp.vec2(wp.min(lb[0], world[0]), wp.min(lb[1], world[1]))
+        ub = wp.vec2(wp.max(ub[0], world[0]), wp.max(ub[1], world[1]))
+
+    if update_aabb != 0:
+        domain_idx = domain_ids[rid][0]
+        aabb[domain_idx, 0] = lb
+        aabb[domain_idx, 1] = ub
+
+
 class RigidManager:
-    def __init__(self, d, domains, joints, bvh=None, skip_spatial_hash=False, considerRigidRigidContact=True, use_pd=0, pgs_iterations=50):
+    def __init__(self, d, domains, joints, bvh=None, skip_spatial_hash=False, considerRigidRigidContact=True, use_pd=0, pgs_iterations=50,
+                 max_nodes=None, max_joints=None, max_contacts=None, max_ground_contacts=None,
+                 max_ground_pairs=None, max_collision_pairs=None, max_envs_alloc=None):
         """Initialize RigidManager and allocate Warp arrays for rigids and state.
 
         Args:
@@ -2308,6 +2494,8 @@ class RigidManager:
             skip_spatial_hash: If True, skip SpatialHashManager creation (saves ~8GB VRAM)
             considerRigidRigidContact: If True, consider rigid-rigid contact
             use_pd: 0 = no PD, 1 = velocity PD, 2 = torque PD
+            max_nodes/max_joints/max_contacts/...: optional capacity overrides for
+                tiny scenes (e.g. Push-T) so many envs can coexist in RAM.
         """
 
         assert d == 2, "RigidManager is 2D-only"
@@ -2347,12 +2535,28 @@ class RigidManager:
 
         # Dynamic allocation (count + buffer) - drastically reduces memory when few rigids/meshes are used
         num_joints = 0 if joints is None else len(joints)
-        self.MAX_NODES = max(count_rigid + count_anal + 64, 128)
+        need_nodes = count_rigid + count_anal
+        if max_nodes is not None:
+            self.MAX_NODES = max(int(max_nodes), need_nodes + 1)
+        else:
+            self.MAX_NODES = max(need_nodes + 64, 128)
 
         print("Number of maxNodes allocated:", self.MAX_NODES)
         self.MAX_ANAL = max(count_anal + 8, 16)
         self.MAX_MESH = max(count_mesh_rigids + 18, 16)
-        self.MAX_JOINTS = max(num_joints + 8, 128)
+        if max_joints is not None:
+            self.MAX_JOINTS = max(int(max_joints), num_joints + 1)
+        else:
+            self.MAX_JOINTS = max(num_joints + 8, 128)
+        self._cap_max_contacts = None if max_contacts is None else int(max_contacts)
+        self._cap_max_ground_contacts = (
+            None if max_ground_contacts is None else int(max_ground_contacts))
+        self._cap_max_ground_pairs = (
+            None if max_ground_pairs is None else int(max_ground_pairs))
+        self._cap_max_collision_pairs = (
+            None if max_collision_pairs is None else int(max_collision_pairs))
+        self._cap_max_envs_alloc = (
+            None if max_envs_alloc is None else int(max_envs_alloc))
 
         self.d = d
         self.numDomains = len(domains)
@@ -2557,7 +2761,10 @@ class RigidManager:
         self.aabb = None  # Will be set by ExplicitLoop after initialization
 
         # Pre-allocated fields for collision pair processing (avoid dynamic field allocation)
-        self.MAX_COLLISION_PAIRS = 10000  # Maximum collision pairs per frame
+        if self._cap_max_collision_pairs is not None:
+            self.MAX_COLLISION_PAIRS = max(int(self._cap_max_collision_pairs), 8)
+        else:
+            self.MAX_COLLISION_PAIRS = 10000  # Maximum collision pairs per frame
 
         # Buffers for different collision pair types
         self.primitive_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
@@ -2572,7 +2779,11 @@ class RigidManager:
         self.mixed_pairs_buffer = wp.zeros(self.MAX_COLLISION_PAIRS, dtype=wp.vec2i)
         # Ground collision pairs need larger buffer for batched environments
         # Each rigid can collide with ground, so need at least MAX_NODES capacity
-        self.MAX_GROUND_PAIRS = max(self.MAX_NODES * 2, 4096)
+        if self._cap_max_ground_pairs is not None:
+            self.MAX_GROUND_PAIRS = max(
+                int(self._cap_max_ground_pairs), self.MAX_NODES)
+        else:
+            self.MAX_GROUND_PAIRS = max(self.MAX_NODES * 2, 4096)
         self.groundprim_pairs_buffer = wp.zeros(self.MAX_GROUND_PAIRS, dtype=wp.vec2i)
         self.groundmesh_pairs_buffer = wp.zeros(self.MAX_GROUND_PAIRS, dtype=wp.vec2i)
 
@@ -2615,10 +2826,15 @@ class RigidManager:
         self.vox_edge_n = wp.zeros(self.MAX_VOX_EDGES, dtype=wp.vec2)
 
         # ==== Contact Cache: Store detected contacts to avoid redundant detection in PGS iterations ====
-        self.MAX_CONTACTS = max(self.MAX_NODES * 16, 10000)
+        if self._cap_max_contacts is not None:
+            self.MAX_CONTACTS = max(int(self._cap_max_contacts), 8)
+        else:
+            self.MAX_CONTACTS = max(self.MAX_NODES * 16, 10000)
         # For mesh rigids, ground contacts scale with boundary nodes (each below-ground node = 1 contact)
         # Use boundary-aware scaling: typically only ~25% of mesh nodes contact ground simultaneously
-        if count_mesh_nodes > 0:
+        if self._cap_max_ground_contacts is not None:
+            self.MAX_GROUND_CONTACTS = max(int(self._cap_max_ground_contacts), 1)
+        elif count_mesh_nodes > 0:
             self.MAX_GROUND_CONTACTS = max(min(count_mesh_nodes // 4, self.MAX_NODES * 500), 50000)
         else:
             self.MAX_GROUND_CONTACTS = max(self.MAX_NODES * 200, 50000)
@@ -2663,17 +2879,26 @@ class RigidManager:
         # Per-env ground contact indexing for efficient PGS parallel scanning.
         # Without this, each of N env-threads scans ALL contacts → O(N × total_contacts).
         # With per-env indices, each thread accesses only its own contacts → O(contacts_per_env).
-        self.MAX_ENVS_ALLOC = (
-            4096  # Max envs we allocate for (can be set based on expected batch size, but keep reasonable upper bound)
-        )
-        self.MAX_GC_PER_ENV = max(self.MAX_GROUND_CONTACTS // self.MAX_ENVS_ALLOC, 1024)
+        if self._cap_max_envs_alloc is not None:
+            self.MAX_ENVS_ALLOC = max(int(self._cap_max_envs_alloc), 1)
+        else:
+            self.MAX_ENVS_ALLOC = 4096  # upper bound for batched GPU-style envs
+        # Floor of 1024/256 only makes sense for the large default; compact
+        # single-scene envs must stay proportional to contact capacity.
+        gc_floor = 1 if self._cap_max_envs_alloc is not None else 1024
+        cc_floor = 1 if self._cap_max_envs_alloc is not None else 256
+        self.MAX_GC_PER_ENV = max(
+            self.MAX_GROUND_CONTACTS // self.MAX_ENVS_ALLOC, gc_floor)
         self.ground_contact_env_count = wp.zeros(self.MAX_ENVS_ALLOC, dtype=int)
         # Per-env index lists: ground_contact_env_idx[env_id * MAX_GC_PER_ENV + local_i] = global contact idx
-        self.ground_contact_env_idx = wp.zeros(self.MAX_ENVS_ALLOC * self.MAX_GC_PER_ENV, dtype=int)
+        self.ground_contact_env_idx = wp.zeros(
+            self.MAX_ENVS_ALLOC * self.MAX_GC_PER_ENV, dtype=int)
         # Same for rigid-rigid contacts
-        self.MAX_CC_PER_ENV = max(self.MAX_CONTACTS // self.MAX_ENVS_ALLOC, 256)
+        self.MAX_CC_PER_ENV = max(
+            self.MAX_CONTACTS // self.MAX_ENVS_ALLOC, cc_floor)
         self.contact_env_count = wp.zeros(self.MAX_ENVS_ALLOC, dtype=int)
-        self.contact_env_idx = wp.zeros(self.MAX_ENVS_ALLOC * self.MAX_CC_PER_ENV, dtype=int)
+        self.contact_env_idx = wp.zeros(
+            self.MAX_ENVS_ALLOC * self.MAX_CC_PER_ENV, dtype=int)
 
         print("Finished allocating contact cached ======")
 
@@ -3648,16 +3873,34 @@ class RigidManager:
             ],
         )
 
+    def _mesh_narrow_host_cache(self):
+        """Hoist ``.numpy()`` once per narrowphase batch (mesh–mesh / mesh–prim)."""
+        return {
+            "domain_ids": self.rigidDomainIds.numpy(),
+            "aabb": self.aabb.numpy(),
+            "params": self.rigidParams.numpy(),
+            "rot": self.cached_rotation_matrix.numpy(),
+            "radius": self.radius.numpy(),
+            "rigid2mesh": self.rigid2MeshIndices.numpy(),
+            "mesh_node_off": self.meshBoundaryNodeOffset.numpy(),
+            "mesh_node_cnt": self.meshBoundaryNodeCount.numpy(),
+            "mesh_coords": self.meshBoundaryCoords.numpy(),
+            "mesh_elements": self.meshBoundaryElements.numpy(),
+            "sh_margin": float(self._sh_contact_margin.numpy()[0]),
+        }
+
     def detect_mesh_mesh_contacts_kernel(self):
         """Detect and resolve collisions between two mesh rigids."""
         n = int(self.num_mesh_pairs.numpy()[0])
         if n <= 0:
             return
         pairs = self.mesh_pairs_buffer.numpy()
+        cache = self._mesh_narrow_host_cache()
         for i in range(n):
             ic = int(pairs[i][0])
             jc = int(pairs[i][1])
-            self.detectMeshMeshContact_(ic, jc)
+            self._mesh_nodes_vs_mesh_elements(ic, jc, cache)
+            self._mesh_nodes_vs_mesh_elements(jc, ic, cache)
 
     def detect_mixed_contacts_kernel(self):
         """Detect and resolve collisions between a mesh rigid and a primitive rigid."""
@@ -3665,7 +3908,8 @@ class RigidManager:
         if n <= 0:
             return
         pairs = self.mixed_pairs_buffer.numpy()
-        domain_ids = self.rigidDomainIds.numpy()
+        cache = self._mesh_narrow_host_cache()
+        domain_ids = cache["domain_ids"]
         for i in range(n):
             ic = int(pairs[i][0])
             jc = int(pairs[i][1])
@@ -3678,23 +3922,25 @@ class RigidManager:
                 mesh_idx = ic
                 other_idx = jc
 
-            self.detectMeshPrimitiveContact_(mesh_idx, other_idx)
+            self.detectMeshPrimitiveContact_(mesh_idx, other_idx, cache)
 
-    def detectMeshPrimitiveContact_(self, mesh_idx: int, other_idx: int):
+    def detectMeshPrimitiveContact_(self, mesh_idx: int, other_idx: int, cache=None):
         """Handle mesh-primitive contacts (Optimized with Spatial Hash).
 
         Uses Spatial Hash for primitive-sample-vs-mesh checks.
         Uses direct node iteration for mesh-node-vs-primitive checks.
         """
-        domain_ids = self.rigidDomainIds.numpy()
-        aabb = self.aabb.numpy()
-        params = self.rigidParams.numpy()
-        rot = self.cached_rotation_matrix.numpy()
-        radius_np = self.radius.numpy()
-        rigid2mesh = self.rigid2MeshIndices.numpy()
-        mesh_node_off = self.meshBoundaryNodeOffset.numpy()
-        mesh_node_cnt = self.meshBoundaryNodeCount.numpy()
-        mesh_coords = self.meshBoundaryCoords.numpy()
+        if cache is None:
+            cache = self._mesh_narrow_host_cache()
+        domain_ids = cache["domain_ids"]
+        aabb = cache["aabb"]
+        params = cache["params"]
+        rot = cache["rot"]
+        radius_np = cache["radius"]
+        rigid2mesh = cache["rigid2mesh"]
+        mesh_node_off = cache["mesh_node_off"]
+        mesh_node_cnt = cache["mesh_node_cnt"]
+        mesh_coords = cache["mesh_coords"]
 
         mesh_local_idx = int(rigid2mesh[mesh_idx])
         node_offset = int(mesh_node_off[mesh_local_idx])
@@ -3757,18 +4003,22 @@ class RigidManager:
         for nid_local in range(num_nodes):
             coord = mesh_coords[node_offset + nid_local]
             if (coord - intersect_ub).max() <= 0.0 and (intersect_lb - coord).max() <= 0.0:
-                self._mesh_node_vs_primitive(mesh_idx, other_idx, coord)
+                self._mesh_node_vs_primitive(mesh_idx, other_idx, coord, cache)
 
         for k in range(num_samples):
             p = wp.vec2(test_points[0, k], test_points[1, k])
-            self._prim_point_vs_mesh_with_sh(p, p_radius, mesh_idx, other_idx, limit_penetration)
+            self._prim_point_vs_mesh_with_sh(
+                p, p_radius, mesh_idx, other_idx, limit_penetration, cache
+            )
 
-    def _mesh_node_vs_primitive(self, mesh_idx: int, other_idx: int, pos):
+    def _mesh_node_vs_primitive(self, mesh_idx: int, other_idx: int, pos, cache=None):
         """Thin dispatch over shared point-vs-primitive SDF family helpers."""
-        params = self.rigidParams.numpy()
-        rot = self.cached_rotation_matrix.numpy()
-        radius_np = self.radius.numpy()
-        domain_ids = self.rigidDomainIds.numpy()
+        if cache is None:
+            cache = self._mesh_narrow_host_cache()
+        params = cache["params"]
+        rot = cache["rot"]
+        radius_np = cache["radius"]
+        domain_ids = cache["domain_ids"]
         pos = np.asarray(pos, dtype=np.float32).reshape(-1)
         center = np.asarray(params[other_idx, 0], dtype=np.float32).reshape(-1)
         prim = np.asarray(params[other_idx, 1], dtype=np.float32).reshape(-1)
@@ -3786,23 +4036,25 @@ class RigidManager:
             self.cacheContact(mesh_idx, other_idx, cpoint, n, l)
 
     def _prim_point_vs_mesh_with_sh(
-        self, point, radius: float, mesh_idx: int, other_idx: int, limit_penetration: float
+        self, point, radius: float, mesh_idx: int, other_idx: int, limit_penetration: float,
+        cache=None,
     ):
         """Test a point (with optional radius) against mesh using spatial hash."""
+        if cache is None:
+            cache = self._mesh_narrow_host_cache()
         point = np.asarray(point, dtype=np.float32).reshape(-1)
         point_wp = wp.vec2(float(point[0]), float(point[1]))
         cell_size = float(np.min(self.spatialHash.gridSize.numpy()[0]))
         if radius < cell_size * 4.0:
             numPotentials = self.spatialHash.queryPointWithBuffer(point_wp, radius, mesh_idx)
-            mesh_elements = self.meshBoundaryElements.numpy()
+            mesh_elements = cache["mesh_elements"]
             query_elids = self.spatialHash.queryElids.numpy()
-            mesh_coords_arr = self.meshBoundaryCoords
+            mesh_coords_np = cache["mesh_coords"]
 
             for pot_idx in range(numPotentials):
                 eidx = int(query_elids[pot_idx])
                 if eidx >= 0:
                     conn = mesh_elements[eidx]
-                    mesh_coords_np = mesh_coords_arr.numpy()
                     penetration, normal, cpoint, _ = detect_point_to_mesh_boundary_np(
                         point, mesh_coords_np, conn, limit_penetration=limit_penetration + radius
                     )
@@ -3811,35 +4063,27 @@ class RigidManager:
                     if l < 0.0:
                         self.cacheContact(other_idx, mesh_idx, cpoint, normal, l)
 
-    def detectMeshMeshContact_(self, ic: int, jc: int):
-        """Test mesh ic boundary nodes against mesh jc boundary elements using spatial hash acceleration.
+    def detectMeshMeshContact_(self, ic: int, jc: int, cache=None):
+        """Test mesh ic boundary nodes against mesh jc boundary elements (both directions)."""
+        if cache is None:
+            cache = self._mesh_narrow_host_cache()
+        self._mesh_nodes_vs_mesh_elements(ic, jc, cache)
+        self._mesh_nodes_vs_mesh_elements(jc, ic, cache)
 
-        OPTIMIZED: Split into two separate passes to reduce JIT compilation complexity.
-        Each pass is now a separate function to reduce branching and improve compilation time.
-
-        TODO: if several nodes are in contact, we need a manifold reduction strategy to avoid over-correction during PGS iteration. 
-        We can select representative contacts based on penetration depth and spatial distribution across the contact patch.
-        """
-        # First pass: ic nodes vs jc triangles
-        self._mesh_nodes_vs_mesh_elements(ic, jc)
-
-        # Second pass: jc nodes vs ic triangles
-        self._mesh_nodes_vs_mesh_elements(jc, ic)
-
-    def _mesh_nodes_vs_mesh_elements(self, node_mesh_rigid_idx: int, elem_mesh_rigid_idx: int):
+    def _mesh_nodes_vs_mesh_elements(self, node_mesh_rigid_idx: int, elem_mesh_rigid_idx: int, cache=None):
         """Test boundary nodes of node_mesh against boundary elements of elem_mesh."""
-        domain_ids = self.rigidDomainIds.numpy()
-        aabb = self.aabb.numpy()
-        rigid2mesh = self.rigid2MeshIndices.numpy()
-        mesh_node_off = self.meshBoundaryNodeOffset.numpy()
-        mesh_node_cnt = self.meshBoundaryNodeCount.numpy()
-        mesh_coords = self.meshBoundaryCoords.numpy()
-        mesh_elements = self.meshBoundaryElements.numpy()
-        mesh_coords_arr = self.meshBoundaryCoords
+        if cache is None:
+            cache = self._mesh_narrow_host_cache()
+        domain_ids = cache["domain_ids"]
+        aabb = cache["aabb"]
+        rigid2mesh = cache["rigid2mesh"]
+        mesh_node_off = cache["mesh_node_off"]
+        mesh_node_cnt = cache["mesh_node_cnt"]
+        mesh_coords = cache["mesh_coords"]
+        mesh_elements = cache["mesh_elements"]
+        query_buf = float(cache["sh_margin"])
 
         node_mesh_idx = int(rigid2mesh[node_mesh_rigid_idx])
-        elem_mesh_idx = int(rigid2mesh[elem_mesh_rigid_idx])
-
         node_offset = int(mesh_node_off[node_mesh_idx])
         num_nodes = int(mesh_node_cnt[node_mesh_idx])
 
@@ -3859,7 +4103,6 @@ class RigidManager:
             coord_wp = wp.vec2(float(coord[0]), float(coord[1]))
 
             if ((coord - intersect_lb).min() > 0.0) and ((coord - intersect_ub).max() < 0.0):
-                query_buf = float(self._sh_contact_margin.numpy()[0])
                 numPotentials = self.spatialHash.queryPointWithBuffer(
                     coord_wp, query_buf, elem_mesh_rigid_idx
                 )
@@ -3869,7 +4112,6 @@ class RigidManager:
                     elem_idx = int(query_elids[pot_idx])
                     if elem_idx >= 0:
                         conn = mesh_elements[elem_idx]
-                        conn_wp = wp.vec3i(int(conn[0]), int(conn[1]), int(conn[2]))
 
                         lb = np.array([1e30, 1e30], dtype=np.float32)
                         ub = np.array([-1e30, -1e30], dtype=np.float32)
@@ -4076,23 +4318,38 @@ class RigidManager:
         )
 
     def detect_analyticalmesh_contacts_kernel(self):
-        """Detect analytical-plane vs mesh-rigid contacts, parallelized over ground-mesh pairs.
+        """Detect analytical-plane vs mesh-rigid contacts (Warp, one thread per pair).
 
-        Each GPU thread handles one (analIdx, rigidIdx) pair and iterates over its
-        boundary nodes internally. This pair-level dispatch avoids the global atomic
-        contention that node-level expansion would cause (2.6M atomics for 1024 envs).
+        Representative contacts: deepest node + ±t1 extremes (same policy as the
+        former host path). HF / voxel mesh pairs are handled by separate kernels.
         """
         n = int(self.num_groundmesh_pairs.numpy()[0])
         if n <= 0:
             return
-        pairs = self.groundmesh_pairs_buffer.numpy()
-        kind = self.ground_kind.numpy() if self.hasHeightFieldOrVoxel else None
-        for i in range(n):
-            analIdx = int(pairs[i][0])
-            rigidIdx = int(pairs[i][1])
-            if kind is not None and int(kind[analIdx]) != GROUND_KIND_PLANE:
-                continue
-            self.detectAnalytical2MeshPair(analIdx, rigidIdx)
+        filter_by_kind = 1 if self.hasHeightFieldOrVoxel else 0
+        wp.launch(
+            _detect_plane_mesh_contacts_wp,
+            dim=max(n, 1),
+            inputs=[
+                self.num_groundmesh_pairs,
+                *self._ground_cache_inputs(),
+                self.groundmesh_pairs_buffer,
+                filter_by_kind,
+                self.ground_kind,
+                self.rigidDomainIds,
+                self.rigidParams,
+                self.V,
+                self.RotV,
+                self.contactParams,
+                self.rigid_env_id,
+                self.aabb,
+                self.rigid2MeshIndices,
+                self.meshBoundaryNodeOffset,
+                self.meshBoundaryNodeCount,
+                self.meshBoundaryCoords,
+                *self._ground_cache_arrays(),
+            ],
+        )
 
     def detectAnalytical2MeshPair(self, analIdx, rigidIdx):
         """Detect representative boundary-node contacts between an analytical plane
@@ -5113,66 +5370,34 @@ class RigidManager:
         self.updateBBox()
 
     def updateMeshCoords(self):
-        """Transform mesh boundary vertices to world space and refresh mesh AABBs."""
+        """Transform mesh boundary vertices to world space and refresh mesh AABBs (Warp)."""
         if self.numMesh <= 0:
             return
-
-        mesh2rigid = self.mesh2RigidIndices.numpy()
-        node_off = self.meshBoundaryNodeOffset.numpy()
-        node_cnt = self.meshBoundaryNodeCount.numpy()
-        pool_ids = self.instance_pool_id.numpy()
-        pool_node_off = self.pool_node_offset.numpy()
-        pool_node_cnt = self.pool_node_count.numpy()
-        pool_lrs = self.pool_boundary_lrs.numpy()
-        params = self.rigidParams.numpy()
-        quat = self.quat.numpy()
-        scales = self.meshRigidScale.numpy()
-        offsets = self.meshRigidOffset.numpy()
-        domain_ids = self.rigidDomainIds.numpy()
-        coords = self.meshBoundaryCoords.numpy().copy()
-        aabb = self.aabb.numpy().copy() if self.aabb is not None else None
-
-        for mid in range(self.numMesh):
-            rid = int(mesh2rigid[mid])
-            if rid < 0:
-                continue
-            pool_id = int(pool_ids[rid])
-            if pool_id < 0:
-                continue
-            n_off = int(node_off[mid])
-            n_cnt = int(node_cnt[mid])
-            p_off = int(pool_node_off[pool_id])
-            p_cnt = int(pool_node_cnt[pool_id])
-            n_use = min(n_cnt, p_cnt)
-            if n_use <= 0:
-                continue
-
-            center = params[rid, 0]
-            angle = float(quat[rid])
-            c = float(np.cos(angle))
-            s = float(np.sin(angle))
-            R = np.array([[c, -s], [s, c]], dtype=np.float32)
-            scale = scales[rid]
-            offset = offsets[rid]
-
-            lb = np.array([1e30, 1e30], dtype=np.float32)
-            ub = np.array([-1e30, -1e30], dtype=np.float32)
-            for i in range(n_use):
-                lr = pool_lrs[p_off + i]
-                local = np.array([float(lr[0]) * float(scale[0]), float(lr[1]) * float(scale[1])], dtype=np.float32)
-                world = center + offset + R @ local
-                coords[n_off + i] = world
-                lb = np.minimum(lb, world)
-                ub = np.maximum(ub, world)
-
-            if aabb is not None:
-                domain_idx = int(domain_ids[rid][0])
-                aabb[domain_idx, 0] = lb
-                aabb[domain_idx, 1] = ub
-
-        self.meshBoundaryCoords.assign(coords)
-        if aabb is not None:
-            self.aabb.assign(aabb)
+        update_aabb = 1 if self.aabb is not None else 0
+        # aabb is required by the kernel signature; pass a 1x2 dummy when unused.
+        aabb = self.aabb if self.aabb is not None else wp.zeros((1, 2), dtype=wp.vec2)
+        wp.launch(
+            _update_mesh_coords_wp,
+            dim=int(self.numMesh),
+            inputs=[
+                int(self.numMesh),
+                self.mesh2RigidIndices,
+                self.meshBoundaryNodeOffset,
+                self.meshBoundaryNodeCount,
+                self.instance_pool_id,
+                self.pool_node_offset,
+                self.pool_node_count,
+                self.pool_boundary_lrs,
+                self.rigidParams,
+                self.quat,
+                self.meshRigidScale,
+                self.meshRigidOffset,
+                self.rigidDomainIds,
+                self.meshBoundaryCoords,
+                update_aabb,
+                aabb,
+            ],
+        )
 
     def updateBBox(self):
         """Recompute all primitive and mesh rigid bounding boxes (kernel)."""

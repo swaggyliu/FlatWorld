@@ -175,13 +175,16 @@ class StateLeWM(nn.Module):
             prev_c = pair[:, 0]
         else:
             prev_c = self.pair_prob(zt)
+        # Force CEM-like predicted contacts on the last K steps even under TF.
+        force_ol = max(0, min(8, T - 2))
         for t in range(T - 1):
-            xy = obj_states[:, t, :, :3] if use_tf else None
-            if use_tf and pair is not None:
+            use_gt = use_tf and t < (T - 1 - force_ol)
+            xy = obj_states[:, t, :, :3] if use_gt else None
+            if use_gt and pair is not None:
                 pair_now = pair[:, t]
             else:
                 pair_now = self.pair_prob(zt)
-            if use_tf and ground is not None:
+            if use_gt and ground is not None:
                 g_now = ground[:, t]
             else:
                 g_now = self.ground_prob(zt)
@@ -215,6 +218,7 @@ class StateLeWM(nn.Module):
             "pair_logit_pred": self.pair_logit(z_pred) if pair is not None else None,
             "ground_logit": self.ground_logit(z) if ground is not None else None,
             "ground_logit_pred": self.ground_logit(z_pred) if ground is not None else None,
+            "contact_mask": contact_mask,
         }
 
     @staticmethod
@@ -291,17 +295,83 @@ class StateLeWM(nn.Module):
         err = torch.atan2(torch.sin(pred - true), torch.cos(pred - true))
         return err.pow(2)
 
+    def multi_step_loss(self, batch, out, K: int = 12, w_z: float = 0.25):
+        """CEM-style open-loop roll from z0; supervise pose (+latent) each step.
+
+        Matches ``roll_step`` imagination (predicted pair/ground), so gradients
+        align with planning-time compounding instead of teacher-forced contacts.
+        """
+        actions = batch["actions"]
+        states = batch["obj_states"]
+        geom = batch.get("obj_geom")
+        rel = batch.get("rel_type")
+        types = batch.get("obj_types")
+        Tm1 = int(actions.shape[1])
+        K = max(1, min(int(K), Tm1))
+        z = out["z"][:, 0]
+        h = self.predictor.init_hidden(z)
+        prev_c = self.pair_prob(z)
+        loss_xy = z.new_zeros(())
+        loss_th = z.new_zeros(())
+        loss_z = z.new_zeros(())
+        cm = batch.get("contact_mask")
+        for t in range(K):
+            z, h, prev_c = self.roll_step(
+                z, actions[:, t], h, geom, prev_c,
+                rel_type=rel, obj_types=types)
+            pose = self.predictor.pose_head(z)
+            true = states[:, t + 1, :, :3]
+            el_xy = (pose[..., :2] - true[..., :2]).pow(2).mean(dim=(-1, -2))
+            th_p = self._denorm_th(pose[..., 2])
+            th_t = self._denorm_th(true[..., 2])
+            el_th = (
+                (torch.cos(th_p) - torch.cos(th_t)).pow(2)
+                + (torch.sin(th_p) - torch.sin(th_t)).pow(2)
+            ).mean(dim=-1)
+            if cm is not None:
+                c_on = (cm[:, t + 1].sum(dim=-1) > 0.5).to(el_xy.dtype)
+                w = 1.0 + 2.0 * c_on
+                loss_xy = loss_xy + (el_xy * w).mean()
+                loss_th = loss_th + (el_th * w).mean()
+            else:
+                loss_xy = loss_xy + el_xy.mean()
+                loss_th = loss_th + el_th.mean()
+            if w_z > 0.0:
+                loss_z = loss_z + F.mse_loss(z, out["z"][:, t + 1].detach())
+        inv = 1.0 / float(K)
+        return inv * loss_xy + inv * loss_th + float(w_z) * inv * loss_z
+
     def compute_loss(self, out, w_dyn: float = 1.0, w_var: float = 0.1,
                      w_xy: float = 0.5, w_th: float = 0.5, w_pair: float = 1.5,
                      w_ground: float = 0.5, w_drift: float = 0.3, w_vel: float = 0.5,
-                     w_weld: float = 0.5):
-        loss_dyn = F.mse_loss(out["z_pred"], out["z_target"])
+                     w_weld: float = 0.5, w_contact: float = 0.0,
+                     w_ms: float = 0.0, ms_loss=None):
+        # (B, T-1) weight: upweight frames with any tactile/contact slot on.
+        cm = out.get("contact_mask")
+        if cm is not None and float(w_contact) > 0.0:
+            # Align to predicted steps (t=1..T-1 of states / z_pred).
+            c_on = (cm[:, 1:].sum(dim=-1) > 0.5).to(out["z_pred"].dtype)  # (B,T-1)
+            step_w = 1.0 + float(w_contact) * c_on
+        else:
+            step_w = None
+
+        dyn_el = (out["z_pred"] - out["z_target"]).pow(2).mean(dim=(-1, -2))  # (B,T-1)
+        if step_w is not None:
+            loss_dyn = (dyn_el * step_w).sum() / step_w.sum().clamp_min(1.0)
+        else:
+            loss_dyn = dyn_el.mean()
         loss_var = self.sigreg(out["z"])
         loss_xy = F.mse_loss(out["xy_enc"], out["states"][..., :2])
-        loss_xy = loss_xy + F.mse_loss(out["xy_pred"], out["states"][:, 1:, :, :2])
+        xy_pred_el = (out["xy_pred"] - out["states"][:, 1:, :, :2]).pow(2).mean(dim=(-1, -2))
+        if step_w is not None:
+            loss_xy = loss_xy + (xy_pred_el * step_w).sum() / step_w.sum().clamp_min(1.0)
+        else:
+            loss_xy = loss_xy + xy_pred_el.mean()
         d_true = out["states"][:, 1:, :, :2] - out["states"][:, :-1, :, :2]
         d_pred = out["xy_pred"] - out["states"][:, :-1, :, :2]
         move_w = 1.0 + 4.0 * (d_true.norm(dim=-1) > 0.01).to(d_true.dtype)
+        if step_w is not None:
+            move_w = move_w * step_w.unsqueeze(-1)
         loss_xy = loss_xy + (move_w.unsqueeze(-1) * (d_pred - d_true).pow(2)).mean()
 
         pose_enc = out["pose_enc"]
@@ -311,12 +381,18 @@ class StateLeWM(nn.Module):
         th_p = self._denorm_th(pose_pred[..., 2])
         th_t = self._denorm_th(th_true)
         # cos/sin is bounded like xy z-scores; raw wrap-MSE explodes on a spinning arm.
+        th_pred_el = (
+            (torch.cos(th_p) - torch.cos(th_t[:, 1:])).pow(2)
+            + (torch.sin(th_p) - torch.sin(th_t[:, 1:])).pow(2)
+        ).mean(dim=-1)  # (B,T-1)
         loss_th = (
             F.mse_loss(torch.cos(th_e), torch.cos(th_t))
             + F.mse_loss(torch.sin(th_e), torch.sin(th_t))
-            + F.mse_loss(torch.cos(th_p), torch.cos(th_t[:, 1:]))
-            + F.mse_loss(torch.sin(th_p), torch.sin(th_t[:, 1:]))
         )
+        if step_w is not None:
+            loss_th = loss_th + (th_pred_el * step_w).sum() / step_w.sum().clamp_min(1.0)
+        else:
+            loss_th = loss_th + th_pred_el.mean()
 
         pair = out.get("pair_contact")
         ground = out.get("ground_contact")
@@ -358,6 +434,7 @@ class StateLeWM(nn.Module):
         loss_weld = loss_weld + self._weld_loss(
             out["pose_pred"], out["states"][:, 1:], rel)
 
+        loss_ms = zero if ms_loss is None else ms_loss
         total = (w_dyn * loss_dyn
                  + w_var * loss_var
                  + w_xy * loss_xy
@@ -366,7 +443,8 @@ class StateLeWM(nn.Module):
                  + w_ground * loss_g
                  + w_drift * loss_drift
                  + w_vel * loss_vel
-                 + w_weld * loss_weld)
+                 + w_weld * loss_weld
+                 + float(w_ms) * loss_ms)
         return {
             "total": total,
             "dynamics": loss_dyn,
@@ -377,4 +455,5 @@ class StateLeWM(nn.Module):
             "vel": loss_vel,
             "theta": loss_th,
             "weld": loss_weld,
+            "multistep": loss_ms,
         }

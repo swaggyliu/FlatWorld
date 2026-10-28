@@ -172,7 +172,59 @@ def _draw_scene(ax, states, cfg, target_idx=None, alpha=1.0, geom=None,
             ax.plot(x, y, "k*", ms=14, alpha=alpha)
 
 
-def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5, title=None):
+def _focus_mask(states_list, geoms_list=None):
+    """(N,) bool: bodies that should define the shared view.
+
+    Static thin-and-tall bars are dropped: a two-room wall would otherwise
+    stretch the window far past the region the EE actually visits. They are
+    still drawn, just clipped to the window.
+    """
+    n = np.asarray(states_list[0]).shape[1]
+    if geoms_list is None:
+        return np.ones(n, dtype=bool)
+    span = np.zeros(n)
+    for traj in states_list:
+        s = np.nanmax(traj[:, :, :2], axis=0) - np.nanmin(traj[:, :, :2], axis=0)
+        span = np.maximum(span, np.nanmax(s, axis=-1))
+    is_bar = np.zeros(n, dtype=bool)
+    for g in geoms_list:
+        g = np.asarray(g)
+        is_bar |= ((np.maximum(g[:, 0], g[:, 1]) > 0.5)
+                   & (np.minimum(g[:, 0], g[:, 1]) < 0.1))
+    return ~(is_bar & (span < 0.05))
+
+
+def _scene_window(states_list, goals, geoms_list=None, pad_frac=0.05):
+    """One world window for the whole grid, from focus bodies + goals.
+
+    Sharing it (plus a fixed box aspect) is what keeps every subplot the
+    same size instead of letting each episode autoscale independently.
+    """
+    focus = _focus_mask(states_list, geoms_list)
+    xs, ys = [], []
+    for traj in states_list:
+        for i in np.nonzero(focus)[0]:
+            xs.append(np.asarray(traj)[:, i, 0])
+            ys.append(np.asarray(traj)[:, i, 1])
+    for g in goals:
+        xs.append(np.asarray([g[0]]))
+        ys.append(np.asarray([g[1]]))
+    xs, ys = np.concatenate(xs), np.concatenate(ys)
+    x0, x1 = float(np.nanmin(xs)), float(np.nanmax(xs))
+    y0, y1 = float(np.nanmin(ys)), float(np.nanmax(ys))
+    # body half-extents: centres alone would clip a link / box at the border
+    margin = 0.0
+    if geoms_list is not None:
+        for g in geoms_list:
+            g = np.asarray(g)[focus]
+            if len(g):
+                margin = max(margin, float(np.max(g)))
+    pad = pad_frac * max(x1 - x0, y1 - y0) + margin
+    return x0 - pad, x1 + pad, y0 - pad, y1 + pad
+
+
+def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5, title=None,
+                cell=3.2):
     d = np.load(traj_npz, allow_pickle=True)
     states = d["states"]
     goals = d["goal"]
@@ -183,7 +235,15 @@ def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5, title=None):
     n = len(states) if n_show is None else min(n_show, len(states))
     ncols = min(ncols, n)
     nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.4 * ncols, 3.1 * nrows))
+
+    states_list = [np.asarray(states[i]) for i in range(n)]
+    geoms_list = ([np.asarray(geoms[i]) for i in range(n)]
+                  if geoms is not None else None)
+    x0, x1, y0, y1 = _scene_window(states_list, goals[:n], geoms_list)
+    y0 = min(y0, -0.08)                       # keep the ground line in frame
+    aspect = (y1 - y0) / (x1 - x0)            # fixed for every subplot
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(cell * ncols, cell * aspect * nrows))
     axes = np.atleast_1d(axes).ravel()
     for i in range(n):
         ax = axes[i]
@@ -203,11 +263,10 @@ def plot_scenes(traj_npz, out, cfg, n_show=None, ncols=5, title=None):
         color = "#2a9d8f" if succ[i] else "#e76f51"
         final_d = np.linalg.norm(traj[-1, ti, :2] - g)
         ax.set_title(f"{i}: {tag}  d={final_d:.3f}", color=color, fontsize=9)
-        xmax = max(1.6, float(np.nanmax(traj[..., 0])) + 0.08)
-        ymax = max(0.55, float(np.nanmax(traj[..., 1])) + 0.08)
-        ax.set_xlim(0.0, xmax)
-        ax.set_ylim(-0.08, ymax)
-        ax.set_aspect("equal")
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_box_aspect(aspect)             # identical box for every cell
         ax.grid(alpha=0.25)
         ax.tick_params(labelsize=7)
         if i == 0:

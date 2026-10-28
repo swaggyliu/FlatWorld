@@ -61,7 +61,9 @@ depracted/
 !docs/statelewm_inference.svg
 !docs/statelewm_worldmodel.png
 !docs/statelewm_worldmodel.svg
-paper/*
+!docs/push_t_*.png
+# Manuscript stays local — author uploads to arXiv (cs.RO); not on GitHub.
+paper/
 
 # Local files
 learning/improvement.md
@@ -69,17 +71,39 @@ learning/qa.md
 scripts/*
 debug_*
 _debug_*
+learning/_probe_*.py
+learning/_*.py
+analyze_fails.py
 
 # learning module: generated data / checkpoints / logs / debug dumps
 *_last.pt
 learning/results/*
 !learning/results/*.png
 !learning/results/*.csv
+!learning/results/wm_rl/
+!learning/results/wm_rl/**
+!learning/results/push_t_v4/
+!learning/results/push_t_v4/**
+!learning/results/reacher/
+!learning/results/reacher/**
+!learning/results/two_room/
+!learning/results/two_room/**
 *.txt
 !requirements.txt
+learning/checkpoints/**/logs/
+learning/checkpoints/**/_eval_logs/
+learning/checkpoints/**/_game_logs/
+learning/checkpoints/**/_promo_logs/
+# Raw collect rollouts stay local (weights + reports are enough to reproduce).
+learning/data/push_t_*/
+learning/data/reacher_*/
+learning/data/two_room_*/
+learning/data/rollouts_*/
 
 # supermimic2d: scratch / resume artifacts (keep best.pt, baked refs, videos)
 supermimic2d/**/__pycache__/
 supermimic2d/**/last.pt
 supermimic2d/**/_diag*/
 supermimic2d/**/frames/
+
+learning/checkpoints/**/_smoke/

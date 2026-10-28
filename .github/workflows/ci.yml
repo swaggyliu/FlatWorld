@@ -32,3 +32,8 @@ jobs:
           FLATWORLD_DEVICE: "cpu"
         run: |
           python -m pytest test2D -q --tb=short --timeout=120
+
+      - name: Learning import smoke (optional)
+        continue-on-error: true
+        run: |
+          python -c "from learning.tasks.base import FlatWorldTask; from learning.tasks import push_t; print('learning ok')"

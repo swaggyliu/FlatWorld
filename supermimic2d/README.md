@@ -2,11 +2,13 @@
 
 A **2D recreation of [SuperMimic](https://supermimic.github.io/)** on [FlatWorld](../).
 
-FlatWorld’s StateLeWM learns a differentiable dynamics model and plans through
-imagined rollouts. SuperMimic uses the same idea for **motion tracking**: fit one
-world model of shared rigid-body dynamics, then improve a goal-conditioned policy
-by **backpropagation-through-time** through short imagined rollouts (instead of
-model-free PPO in the simulator).
+FlatWorld’s StateLeWM is one latent dynamics front-end with three controllers
+([docs/PARADIGMS.md](../docs/PARADIGMS.md)): **WM+CEM** (Push / Two-room /
+Reacher), **WM+BPTT** (this package), and **WM+PPO** (Push-T). SuperMimic-2D is
+the BPTT branch — **motion tracking**: fit one world model of shared rigid-body
+dynamics, then improve a goal-conditioned policy by backpropagation-through-time
+through short imagined rollouts (instead of model-free PPO in the simulator for
+the improve step).
 
 ```
 (1) Collect     πθ + noise  →  FlatWorld sim  →  replay B
@@ -49,7 +51,6 @@ Main deliverables under `runs/lafan2d/`:
 | File | Description |
 |------|-------------|
 | `promo_supermimic.mp4` | Branded ~33s promo (title → skills → end card) |
-| `showcase_30s.mp4` | Multi-skill overlay reel |
 | `best.pt` | Best checkpoint |
 | `baked_refs/*.npz` | Physics-baked reference motions |
 | `*_ref.mp4` / `*_overlay.mp4` | Per-skill reference / policy+ghost |
@@ -93,11 +94,7 @@ python -m supermimic2d.train --out supermimic2d/runs/lafan2d --library lafan2d -
 python -m supermimic2d.render_library --out supermimic2d/runs/lafan2d \
   --overlay --ckpt supermimic2d/runs/lafan2d/best.pt
 
-# website showcase (~30s)
-python -m supermimic2d.render_showcase --ckpt supermimic2d/runs/lafan2d/best.pt \
-  --out supermimic2d/runs/lafan2d/showcase_30s.mp4
-
-# branded promo
+# branded promo (shipped media)
 python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt \
   --out supermimic2d/runs/lafan2d/promo_supermimic.mp4
 

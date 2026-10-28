@@ -13,9 +13,14 @@ predicts **per-object** latent dynamics for model-predictive control.
   <img src="../docs/statelewm_inference.png" width="920" alt="StateLeWM inference: observe, encode, latent, CEM imagination, act in FlatWorld" />
 </p>
 
-Actions are **not** produced by the network. The world model answers
-"what happens if I apply this force"; a CEM planner (or the collection
-policy) supplies `(Fx, Fy)` on the end-effector.
+Actions are **not** produced by the world model itself. Controllers
+plug in on top of the same latent dynamics:
+
+| Paradigm | Role of the WM | Flagship | Doc |
+|----------|----------------|----------|-----|
+| **WM + CEM** | imagine rollouts for online planning | Push / Two-room / Reacher | this file |
+| **WM + BPTT** | differentiable imagination for π | SuperMimic-2D | [`../supermimic2d/README.md`](../supermimic2d/README.md) |
+| **WM + PPO** | frozen encoder → policy obs `z‖feat` | Push-T (≥90%) | below + [`../docs/PARADIGMS.md`](../docs/PARADIGMS.md) |
 
 ## Overview
 
@@ -72,12 +77,27 @@ learning/
 │   ├── predictor.py            # Interaction Network + per-node GRU
 │   └── lewm.py                 # assembled model + losses
 ├── planner.py                  # generic latent CEM (sample / roll / elite)
+├── tasks/base.py               # FlatWorldTask protocol (obs / Φ / success)
+├── tasks/adapters.py           # CEM / PPO / Mimic helpers
 ├── tasks/push_to_goal.py       # PushToGoal env loop + xy_head cost
-├── train.py                    # training + long-horizon open-loop eval
-├── eval_task.py                # task success-rate evaluation
+├── tasks/push_t.py             # Push-T task + progress reward Φ
+├── rl/                         # vec env, WM encode obs, PPO helpers
+├── train.py                    # WM training + long-horizon open-loop eval
+├── train_rsl_wm_push_t.py      # WM-obs rsl-rl PPO (Push-T)
+├── eval_task.py                # CEM task success-rate evaluation
+├── eval_rl_push_t_report.py    # Push-T PPO sim eval + figures
+├── render_pusht_promo.py       # short WM+PPO promo mp4
 ├── replay.py                   # dump failed-eval MP4s
 └── make_report.py              # curves / success stats / scene renders
 ```
+
+### Unified task API
+
+Every scene task exposes `observe` / `sample_goal` / `potential` (Φ) /
+`metric` / `succeeded` (`learning/tasks/base.py`). CEM plans with geometric
+costs; PPO uses `progress_reward` / `adapters.ppo_step_reward`
+(`r = Φ_prev − Φ`). SuperMimic uses the parallel `MimicRefTask` surface.
+
 
 ## Observation / npz format
 
@@ -311,6 +331,42 @@ python -m learning.eval_task --task reacher \
     --checkpoint learning/checkpoints/reacher --episodes 50
 ```
 
+## Push-T — WM + PPO
+
+Push-T is an underactuated T-block alignment task: force EE must contact and
+rotate/translate the T onto a pose goal. Short-horizon CEM on the same WM
+family is a weak fit (non-convex contact, long horizon). The working stack:
+
+1. Collect goal-free Push-T + contact-rich rollouts; train StateLeWM
+   (`learning/checkpoints/push_t_v4`).
+2. Freeze the WM. Policy obs = flatten(`z`) ‖ task features (pose / EE–T).
+3. PPO (`rsl-rl`) in **real** FlatWorld with progress reward
+   `Φ_prev − Φ`, vectorized envs (128 envs / ≤6 Windows workers).
+4. Eval in sim until ≥90% success.
+
+| run | success | notes |
+|-----|---------|-------|
+| WM-obs rsl-rl (`push_t_wm_rsl`) | **36/40 = 90%** | seed 1000, hold=5, iter 350 hit target |
+| raw-state rsl-rl ablation (`push_t_rsl`) | 90% train-eval | confirms task is learnable without WM |
+
+```bash
+python -m learning.train_rsl_wm_push_t \
+    --wm learning/checkpoints/push_t_v4 \
+    --out learning/checkpoints/push_t_wm_rsl \
+    --num-envs 128 --num-workers 6 --target-rate 0.9
+python -m learning.eval_rl_push_t_report \
+    --policy learning/checkpoints/push_t_wm_rsl/best.pt \
+    --wm learning/checkpoints/push_t_v4 \
+    --out learning/results/wm_rl --tag wm_rsl
+```
+
+Figures: `learning/results/wm_rl/` and `docs/push_t_*.png`.
+Playable duel: `python -m game --mode pusht` (WASD vs this policy).
+Why CEM vs BPTT vs PPO: **[docs/PARADIGMS.md](../docs/PARADIGMS.md)**.
+
+Early pure-imagination PPO on Push-T drifted (~8%); that path was removed.
+Shipped stack keeps **physics in the RL loop**.
+
 ## Pipeline
 
 ```bash
@@ -354,7 +410,9 @@ under `current_best/` after `--current-best`).
 
 ## Further work
 
-The per-object GNN + `rel_v` edges + ensemble **training path** are in
-place; the remaining leverage is **variable-N / new geometry for
-levels**, not more contact-label or chain-Δv training on this PushToGoal
-split.
+See **[docs/PARADIGMS.md](../docs/PARADIGMS.md)** (roadmap). Short list:
+
+1. Shared `Task` protocol for CEM / BPTT / PPO.
+2. Variable-N / new geometry for CEM levels (not more PushToGoal contact labels).
+3. Push-T variants + optional CEM residual on the PPO policy.
+4. Longer-horizon WM calibration if revisiting pure imagination RL.

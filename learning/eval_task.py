@@ -57,8 +57,11 @@ def build_parser():
                         help="CEM over FlatWorld solver (same physics as collect); no WM")
     parser.add_argument("--servo", action="store_true",
                         help="closed-loop hint servo (no CEM, no world model)")
+    parser.add_argument("--pure-cem", action="store_true",
+                        help="disable hybrid phase/macros (pure CEM: solver or WM)")
     parser.add_argument("--exec-horizon", type=int, default=4,
-                        help="solver-CEM steps to execute before replanning")
+                        help="open-loop steps to execute before replanning "
+                             "(solver-CEM / WM hybrid macros)")
     parser.add_argument("--target-mode", type=str, default="leftmost",
                         choices=("leftmost", "rightmost", "random"))
     parser.add_argument("--record", type=int, default=50,
@@ -98,22 +101,24 @@ def build_parser():
     return parser
 
 
-def _cem_defaults(task_name: str, solver: bool):
-    """Shorter H + denser CEM on Push-T (indirect contact); other tasks keep prior defaults."""
+def _cem_defaults(task_name: str, solver: bool, hybrid: bool = True):
+    """CEM defaults. Push-T CEM is legacy; prefer WM-obs PPO for that task."""
+    del hybrid
     is_pt = task_name in ("push_t", "push-t")
     if solver:
-        return (16, 16, 3, 6) if is_pt else (16, 12, 2, 4)
+        return (10, 10, 2, 4) if is_pt else (16, 12, 2, 4)
     if is_pt:
-        return 12, 192, 10, 32
+        return 12, 48, 4, 12
     return 32, 96, 5, 16
 
 
 def run_eval(args):
     solver = bool(getattr(args, "solver_cem", False))
     servo = bool(getattr(args, "servo", False))
+    hybrid = not bool(getattr(args, "pure_cem", False))
     task_name = getattr(args, "task", "push")
     TaskCls, cfg = _task_bundle(task_name)
-    dH, dP, dI, dE = _cem_defaults(task_name, solver)
+    dH, dP, dI, dE = _cem_defaults(task_name, solver, hybrid=hybrid)
     H = args.horizon if args.horizon is not None else dH
     P = args.population if args.population is not None else dP
     I = args.iterations if args.iterations is not None else dI
@@ -132,6 +137,7 @@ def run_eval(args):
         n_models = 0
         pk = dict(
             use_solver_cem=True,
+            use_hybrid=hybrid,
             horizon=H, population=P, iterations=I, elites=elites,
             seed=args.seed,
             exec_horizon=int(getattr(args, "exec_horizon", 4)),
@@ -140,6 +146,7 @@ def run_eval(args):
             pk["reach_cost"] = 0.0
         print(f"solver CEM H={H} P={P} iters={I} elites={elites} "
               f"stride={stride} exec={pk['exec_horizon']} "
+              f"hybrid={'on' if hybrid else 'off'} "
               f"(same ExplicitLoop as collect)", flush=True)
     else:
         import torch
@@ -149,7 +156,12 @@ def run_eval(args):
         n_models = len(model) if isinstance(model, list) else 1
         stride = int(args.stride) if args.stride is not None else int(ckpt_stride)
         pk = dict(horizon=H, population=P, iterations=I, seed=args.seed,
-                  elites=elites)
+                  elites=elites, use_hybrid=hybrid,
+                  exec_horizon=int(getattr(args, "exec_horizon", 6)))
+        if task_name in ("push_t", "push-t") and not servo:
+            print("note: Push-T CEM is legacy; prefer "
+                  "`python -m learning.train_rsl_wm_push_t` / "
+                  "`python -m game --mode pusht`", flush=True)
         if args.uncert_cost is not None:
             pk["uncert_cost"] = float(args.uncert_cost)
         pk["ensemble_reduce"] = getattr(args, "reduce", "mean")
@@ -160,6 +172,9 @@ def run_eval(args):
         if getattr(args, "settle_w", None) is not None:
             pk["settle_w"] = float(args.settle_w)
         pk["tactile_mode"] = args.tactile
+        print(f"WM CEM H={H} P={P} iters={I} elites={elites} "
+              f"stride={stride} exec={pk['exec_horizon']} "
+              f"hybrid={'on' if hybrid else 'off'}", flush=True)
     task = TaskCls(
         cfg, model, norm, device=device, tol=args.tol,
         vel_tol=args.vel_tol, budget=args.budget,
@@ -202,7 +217,7 @@ def run_eval(args):
             recorded["final_dist"].append(r["final_dist"])
             recorded["settle_frame"].append(r["settle_frame"])
         records.append({key: v for key, v in r.items() if key != "frames"})
-        if only.strip() or (k + 1) % 10 == 0 or k == 0 or n_run <= 15:
+        if only.strip() or (k + 1) % 10 == 0 or k == 0 or n_run <= 20 or solver:
             rate = n_success / (k + 1)
             extra = ""
             if "init_ee_gap" in r:
@@ -234,15 +249,21 @@ def run_eval(args):
         "mean_settle_frame": float(np.mean(frames)),
         "elapsed_s": elapsed,
         "n_models": n_models,
-        "planner": "servo" if servo else ("solver_cem" if solver else "wm_cem"),
+        "planner": (
+            "servo" if servo else
+            ("solver_cem" if solver else "wm_cem")
+            + ("" if servo else ("_hybrid" if hybrid else "_pure"))
+        ),
         "target_mode": getattr(args, "target_mode", ""),
         "task": getattr(args, "task", "push"),
         "ee_scale": args.ee_scale,
         "ee_spawn": getattr(args, "ee_spawn", "default"),
+        "use_hybrid": hybrid and not servo,
         "cem": {"horizon": H, "population": P,
                 "iterations": I, "elites": elites,
                 "stride": stride,
-                "exec_horizon": int(getattr(args, "exec_horizon", 4)) if solver else 1,
+                "exec_horizon": int(getattr(args, "exec_horizon",
+                                            6 if not solver else 4)),
                 "uncert_cost": args.uncert_cost,
                 "score": getattr(args, "score", "xy"),
                 "only": getattr(args, "only", "") or None},

@@ -1,0 +1,64 @@
+{
+  "method": "rsl_rl_ppo_physics",
+  "final_success_rate": 0.85,
+  "final_n_success": 34,
+  "final_episodes": 40,
+  "final_mean_dist": 0.30186851816251875,
+  "best_train_eval_rate": 0.9,
+  "wm_rl_best_ref": 0.45,
+  "handrolled_phys_best_ref": 0.1,
+  "num_envs": 128,
+  "num_workers": 6,
+  "hold": 5,
+  "history": [
+    {
+      "iter": 50,
+      "success_rate": 0.05,
+      "mean_dist": 0.7724207401275635,
+      "elapsed_s": 874.6462776660919
+    },
+    {
+      "iter": 100,
+      "success_rate": 0.25,
+      "mean_dist": 0.550241906195879,
+      "elapsed_s": 1861.2918891906738
+    },
+    {
+      "iter": 150,
+      "success_rate": 0.65,
+      "mean_dist": 0.26779056042432786,
+      "elapsed_s": 2694.1653022766113
+    },
+    {
+      "iter": 200,
+      "success_rate": 0.75,
+      "mean_dist": 0.19725498985499143,
+      "elapsed_s": 3539.8481113910675
+    },
+    {
+      "iter": 250,
+      "success_rate": 0.75,
+      "mean_dist": 0.19642669707536697,
+      "elapsed_s": 4443.3016493320465
+    },
+    {
+      "iter": 300,
+      "success_rate": 0.8,
+      "mean_dist": 0.2056879721581936,
+      "elapsed_s": 5358.983110666275
+    },
+    {
+      "iter": 350,
+      "success_rate": 0.7,
+      "mean_dist": 0.22822032500989736,
+      "elapsed_s": 6278.311970710754
+    },
+    {
+      "iter": 400,
+      "success_rate": 0.9,
+      "mean_dist": 0.1625676540657878,
+      "elapsed_s": 7175.063922405243
+    }
+  ],
+  "elapsed_s": 7285.1885533332825
+}

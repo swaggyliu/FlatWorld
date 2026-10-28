@@ -33,6 +33,7 @@ class CEMPlanner:
         self.fmax = force_max
         self.uncert_cost = uncert_cost
         self.ensemble_reduce = str(ensemble_reduce)
+        self.hint_w = 0.60  # blend weight for cost.hint_action into CEM mean
         self.tactile_residual = bool(tactile_residual)
         self.tactile_xy_tol = float(tactile_xy_tol)
         if tactile_mode is None:
@@ -226,13 +227,15 @@ class CEMPlanner:
             prev = pred
         return total + cost.terminal(pred)
 
-    def plan(self, z0, geom: np.ndarray, states_now: np.ndarray, cost,
-             idle_action=None):
-        """Optimize an action sequence. Returns best first action (2,) in N."""
+    def plan_sequence(self, z0, geom: np.ndarray, states_now: np.ndarray, cost,
+                      idle_action=None):
+        """Optimize an action sequence. Returns elite (H, 2) in N."""
         z0s = [z0] if isinstance(z0, torch.Tensor) else list(z0)
         now_xy = torch.as_tensor(states_now[:, :3], device=self.device,
                                  dtype=torch.float32)
         idle_t = self._idle_tensor(idle_action)[0]
+        hw = float(getattr(self, "hint_w", 0.60))
+        hw = float(np.clip(hw, 0.0, 1.0))
         with torch.inference_mode():
             bases = [self._zero_pose(m, z, self._norm_geom(geom, m), now_xy,
                                      idle_action=idle_action)
@@ -245,8 +248,8 @@ class CEMPlanner:
                     np.asarray(hint, dtype=np.float32),
                     device=self.device, dtype=self.mean.dtype).reshape(2)
                 hint_t = hint_t.clamp(self.low, self.high)
-                mean = 0.40 * self.mean + 0.60 * hint_t.unsqueeze(0)
-            best_first = None
+                mean = (1.0 - hw) * self.mean + hw * hint_t.unsqueeze(0)
+            best_seq = None
             for _ in range(self.iters):
                 noise = torch.randn(self.P, self.H, 2, device=self.device)
                 seqs = (mean + self.std * noise).clamp(self.low, self.high)
@@ -271,10 +274,17 @@ class CEMPlanner:
                 elite = seqs[total.topk(self.E, largest=False).indices]
                 mean = elite.mean(0).clone()
                 self.std = elite.std(0).clamp_min(1e-3).clone()
-                best_first = elite[0, 0].clone()
+                best_seq = elite[0].clone()
             rolled = torch.roll(mean, -1, 0)
             rolled[-1] = idle_t
             self.mean = rolled
             floor = (self.high - self.low) * 0.05
             self.std = torch.maximum(self.std * 0.9, floor).clone()
-        return best_first.detach().float().cpu().numpy()
+        return best_seq.detach().float().cpu().numpy()
+
+    def plan(self, z0, geom: np.ndarray, states_now: np.ndarray, cost,
+             idle_action=None):
+        """Optimize an action sequence. Returns best first action (2,) in N."""
+        seq = self.plan_sequence(z0, geom, states_now, cost,
+                                 idle_action=idle_action)
+        return np.asarray(seq[0], dtype=np.float32)

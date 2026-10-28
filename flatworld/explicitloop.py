@@ -82,7 +82,8 @@ class ExplicitLoop(MixedContact):
         use_pd=0,
         mass_scaling_dt=0.0,
         max_contact_velocity=50.0,
-        pgs_iterations=50
+        pgs_iterations=50,
+        rigid_capacity=None,
     ):
         """
         Args:
@@ -101,8 +102,11 @@ class ExplicitLoop(MixedContact):
                 all element critical time steps >= this value (seconds).
             max_contact_velocity: Deprecated — ignored.  Spatial hashes are
                 rebuilt lazily each substep / every 1/600 s with no velocity buffer.
+            rigid_capacity: Optional dict of RigidManager capacity overrides
+                (max_nodes, max_joints, max_contacts, ...).
         """
         ensure_warp()
+        self._rigid_capacity = dict(rigid_capacity or {})
 
         self.domains = domains
         self._consider_rigid_rigid_contact = considerRigidRigidContact
@@ -158,6 +162,7 @@ class ExplicitLoop(MixedContact):
                 considerRigidRigidContact=considerRigidRigidContact,
                 use_pd=self.use_pd,
                 pgs_iterations=pgs_iterations,
+                **self._rigid_capacity,
             )
             self.stableTime = min(self.rigidManager.stableTime, self.stableTime)
             self.rigidManager.setGlobalAABB(self.aabb)
@@ -258,10 +263,10 @@ class ExplicitLoop(MixedContact):
                     ):
                         continue
 
-                    if hasattr(dom_i, "env_id") and hasattr(dom_j, "env_id") and dom_i.env_id != dom_j.env_id:
-                        print(
-                            f"Warning: Skipping contact between domain {i} (env {dom_i.env_id}) and domain {j} (env {dom_j.env_id}) due to different env_ids"
-                        )
+                    # Multi-env isolation (env_id<0 = global, collides with all).
+                    ei = int(getattr(dom_i, "env_id", -1))
+                    ej = int(getattr(dom_j, "env_id", -1))
+                    if ei >= 0 and ej >= 0 and ei != ej:
                         continue
                     print(
                         "Creating contact between domain", i, "and domain", j, "of types", dom_i.type, "and", dom_j.type

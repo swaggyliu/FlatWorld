@@ -139,18 +139,28 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
     best_val = float("inf")
     if init_dir:
         val0 = evaluate(model, val_loader, device)
-        best_val = val0["dynamics"] + 0.5 * val0.get("openloop_10", 0.0)
+        ol_w = float(getattr(args, "val_ol_w", 2.0))
+        best_val = (val0["dynamics"]
+                    + ol_w * val0.get("openloop_10", 0.0)
+                    + 0.5 * ol_w * val0.get("openloop_25", 0.0))
         torch.save(_ckpt_dict(model, n_obj, args, 0, seed, val0), best_path)
         print(f"  init val score {best_val:.5f} (seeded {out_name})")
     t0 = time.time()
     for epoch in range(1, args.epochs + 1):
         model.train()
         ep = {"total": 0.0, "dynamics": 0.0, "sigreg": 0.0,
-              "pair": 0.0, "drift": 0.0, "weld": 0.0}
+              "pair": 0.0, "drift": 0.0, "weld": 0.0, "multistep": 0.0}
         n = 0
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             out = model(batch)
+            w_ms = float(getattr(args, "w_ms", 0.0))
+            ms_loss = None
+            if w_ms > 0.0:
+                ms_loss = model.multi_step_loss(
+                    batch, out,
+                    K=int(getattr(args, "ms_horizon", 12)),
+                    w_z=float(getattr(args, "w_ms_z", 0.25)))
             losses = model.compute_loss(
                 out,
                 w_pair=float(getattr(args, "w_pair", 1.5)),
@@ -159,7 +169,9 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
                 w_xy=float(getattr(args, "w_xy", 0.5)),
                 w_th=float(getattr(args, "w_th", 0.5)),
                 w_vel=float(getattr(args, "w_vel", 0.5)),
-                w_weld=float(getattr(args, "w_weld", 0.5)))
+                w_weld=float(getattr(args, "w_weld", 0.5)),
+                w_contact=float(getattr(args, "w_contact", 0.0)),
+                w_ms=w_ms, ms_loss=ms_loss)
             opt.zero_grad()
             losses["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -168,17 +180,26 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
             for k in ep:
                 if k in losses:
                     ep[k] += losses[k].detach().item() * bs
+            if "multistep" in losses and "multistep" not in ep:
+                ep["multistep"] = 0.0
+            if "multistep" in losses:
+                ep["multistep"] = ep.get("multistep", 0.0) + losses["multistep"].detach().item() * bs
             n += bs
         sched.step()
-        if epoch > args.epochs // 3:
-            progress = (epoch - args.epochs // 3) / max(
-                1, args.epochs - args.epochs // 3)
-            model.set_ss_prob(min(0.9, 0.6 + 0.3 * progress))
+        # Aggressive scheduled sampling → match CEM open-loop earlier.
+        if epoch > max(1, args.epochs // 5):
+            progress = (epoch - args.epochs // 5) / max(
+                1, args.epochs - args.epochs // 5)
+            model.set_ss_prob(min(0.95, 0.70 + 0.25 * progress))
         ep = {k: v / n for k, v in ep.items()}
 
         if epoch % 5 == 0 or epoch == 1 or epoch == args.epochs:
             val = evaluate(model, val_loader, device)
-            score = val["dynamics"] + 0.5 * val.get("openloop_10", 0.0)
+            # Prefer multi-step latent OL (CEM horizon); was undervaluing open-loop.
+            ol_w = float(getattr(args, "val_ol_w", 2.0))
+            score = (val["dynamics"]
+                     + ol_w * val.get("openloop_10", 0.0)
+                     + 0.5 * ol_w * val.get("openloop_25", 0.0))
             if logger is not None:
                 logger.writerow([
                     epoch, f"{ep['total']:.5f}", f"{ep['dynamics']:.5f}",
@@ -198,13 +219,13 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
             print(f"  [{epoch:3d}/{args.epochs}] total {ep['total']:.4f} "
                   f"dyn {ep['dynamics']:.4f} "
                   f"pair {ep.get('pair', 0):.4f} "
-                  f"weld {ep.get('weld', 0):.4f} "
+                  f"ms {ep.get('multistep', 0):.4f} "
                   f"drft {ep.get('drift', 0):.4f} | "
                   f"val dyn {val['dynamics']:.4f} "
                   f"ol {val.get('openloop_10', float('nan')):.3f}/"
                   f"{val.get('openloop_25', float('nan')):.3f}/"
                   f"{val.get('openloop_50', float('nan')):.3f} "
-                  f"z_std {val['z_std']:.3f}")
+                  f"z_std {val['z_std']:.3f}", flush=True)
             if epoch >= min_epoch and score < best_val:
                 best_val = score
                 torch.save(_ckpt_dict(model, n_obj, args, epoch, seed, val),
@@ -262,6 +283,17 @@ def main():
                         help="velocity readout loss weight")
     parser.add_argument("--w-weld", type=float, default=0.5,
                         help="welded-pair relative-pose rigidity weight")
+    parser.add_argument("--w-contact", type=float, default=0.0,
+                        help="extra weight on dyn/xy/θ loss at contact frames "
+                             "(0=off; try 2–4 for Push-T contact fit)")
+    parser.add_argument("--w-ms", type=float, default=0.0,
+                        help="CEM-style multi-step consistency loss weight")
+    parser.add_argument("--ms-horizon", type=int, default=12,
+                        help="open-loop steps for --w-ms (model steps)")
+    parser.add_argument("--w-ms-z", type=float, default=0.25,
+                        help="latent MSE weight inside multi-step loss")
+    parser.add_argument("--val-ol-w", type=float, default=2.0,
+                        help="weight on val openloop_* when picking best.pt")
     parser.add_argument("--tactile-drop-prob", type=float, default=0.5,
                         help="train-time probability of a state-only encode "
                              "(tactile residual off); 0 = always inject tactile")

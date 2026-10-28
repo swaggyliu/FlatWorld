@@ -40,6 +40,7 @@ class RigidBodyDomain(DomainBase):
         collision_shapes=None,
         category_bits=COLLISION_CATEGORY_ORDINARY_RIGID,
         collide_bits=COLLISION_MASK_ALL,
+        env_id: int = -1,
     ):
         self.rigid = rigid
         self.d = rigid.d
@@ -65,6 +66,9 @@ class RigidBodyDomain(DomainBase):
         # considerContact/considerGroundContact at attach time.
         self.category_bits = category_bits
         self.collide_bits = collide_bits
+        # Multi-env collision filter: >=0 only collides within same env;
+        # -1 = global (collides with every env).
+        self.env_id = int(env_id)
 
     def attach(self, rigidManager, offset: int, domain_idx: int):
         """Attach this rigid domain to the RigidManager at the given offset.

@@ -460,8 +460,12 @@ def _detect_inner_collision_kernel(
                         # Index objects by primitive_id (same as original implementation).
                         obj_a = objects[node_a_prim_id]
                         obj_b = objects[node_b_prim_id]
+                        # Multi-env isolation: tagged rigids (env_id>=0) only
+                        # collide within the same env. env_id<0 is global.
                         skip_pair = int(0)
-                        if int(obj_a.env_id) >= 0 and int(obj_b.env_id) >= 0:
+                        ea = int(obj_a.env_id)
+                        eb = int(obj_b.env_id)
+                        if ea >= 0 and eb >= 0 and ea != eb:
                             skip_pair = 1
                         if skip_pair == 0:
                             pair_index = int(wp.atomic_add(pair_count, 0, 1))
@@ -706,10 +710,7 @@ class CollisionDetector:
                     ],
                 )
 
-        print(
-            f"BVH: Built {num_envs} per-env sub-trees, "
-            f"total {int(self.node_count.numpy()[0])} nodes"
-        )
+        # Hot path (rebuild every ~100 steps) — keep quiet.
 
     def refit(self, aabbArrays):
         nc = int(self.node_count.numpy()[0])

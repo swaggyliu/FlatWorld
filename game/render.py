@@ -215,10 +215,33 @@ def draw_spring_along(ax, ay, bx, by, coils: int, amp: float,
 
 
 def draw_spring_icon(cx: float, cy: float, w: float, h: float, coils: int = 5):
-    draw_spring_along(cx - w * 0.5, cy, cx + w * 0.5, cy, coils, h * 0.5,
-                      SPRING, 2.6)
-    rl.draw_circle(int(cx - w * 0.5), int(cy), 3, SPRING_DK)
-    rl.draw_circle(int(cx + w * 0.5), int(cy), 3, SPRING_DK)
+    """Legacy name — cartoon bounce blob (no metal coil)."""
+    del coils
+    draw_bounce_icon(cx, cy, max(w, h) * 0.45)
+
+
+def draw_bounce_icon(cx: float, cy: float, r: float = 12.0):
+    """Jelly disc + smile arc — cartoon elasticity, not a coil spring."""
+    rl.draw_circle(int(cx), int(cy), int(r + 3), SPRING_DK)
+    rl.draw_circle(int(cx), int(cy), int(r), SPRING)
+    rl.draw_circle(int(cx - r * 0.35), int(cy - r * 0.15), int(r * 0.18),
+                   rl.Color(40, 30, 20, 220))
+    rl.draw_circle(int(cx + r * 0.35), int(cy - r * 0.15), int(r * 0.18),
+                   rl.Color(40, 30, 20, 220))
+    # bounce smile
+    rl.draw_line_ex(
+        rl.Vector2(cx - r * 0.35, cy + r * 0.25),
+        rl.Vector2(cx, cy + r * 0.45), 2.5, rl.Color(40, 30, 20, 220))
+    rl.draw_line_ex(
+        rl.Vector2(cx, cy + r * 0.45),
+        rl.Vector2(cx + r * 0.35, cy + r * 0.25), 2.5, rl.Color(40, 30, 20, 220))
+    # little hop arcs under the blob
+    rl.draw_line_ex(
+        rl.Vector2(cx - r * 0.9, cy + r * 0.95),
+        rl.Vector2(cx - r * 0.2, cy + r * 1.15), 2.0, SPRING)
+    rl.draw_line_ex(
+        rl.Vector2(cx + r * 0.2, cy + r * 1.15),
+        rl.Vector2(cx + r * 0.9, cy + r * 0.95), 2.0, SPRING)
 
 
 def _grip_color(mu: float):
@@ -286,7 +309,7 @@ def draw_equipment_panel(width: int, restitution: float, friction: float,
     rl.draw_rectangle_rounded(lay["panel"], 0.12, 6, PANEL)
     text("EQUIPMENT", lay["panel"].x + 16, lay["panel"].y + 10, 16, MUTED)
     sx, sy = lay["icon_spring"]
-    draw_spring_icon(sx, sy, 30, 16, coils=5)
+    draw_bounce_icon(sx, sy, 11.0)
     gx, gy = lay["icon_grip"]
     draw_grip_icon(gx, gy, friction)
     zx, zy = lay["icon_size"]
@@ -307,53 +330,47 @@ def draw_equipment_panel(width: int, restitution: float, friction: float,
     return lay
 
 
-def _draw_body_spring(cam: Camera, x, y, r, dx, dy, rest: float):
-    """One coil sticking out of the body along a unit direction."""
-    s = 0.30 + 0.70 * rest
-    ax = x + dx * r * 0.82
-    ay = y + dy * r * 0.82
-    length = r * (0.36 + 0.64 * s)
-    bx = ax + dx * length
-    by = ay + dy * length
-    a = cam.to_screen(ax, ay)
-    b = cam.to_screen(bx, by)
-    amp = cam.px(r * (0.12 + 0.20 * rest))
-    draw_spring_along(a.x, a.y, b.x, b.y, 3 + int(round(rest * 5)), amp,
-                      SPRING, 2.2 + rest)
-
-
-def _spirit_gear(cam: Camera, x, y, r, restitution):
-    """Cardinal springs (restitution). Friction is the body rim color."""
+def _jelly_radii(r: float, restitution: float, speed: float = 0.0):
+    """Cartoon squash/stretch from bounce slider + motion."""
     rest = max(0.0, min(1.0, float(restitution)))
-    for dx, dy in ((-1.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, -1.0)):
-        _draw_body_spring(cam, x, y, r, dx, dy, rest)
+    # Higher bounce → rounder / puffier; motion adds a little stretch.
+    puff = 1.0 + 0.18 * rest
+    stretch = 1.0 + min(0.22, 0.08 * max(0.0, float(speed)))
+    rx = r * puff * stretch
+    ry = r * puff / stretch
+    return rx, ry
 
 
 def draw_spirit(cam: Camera, x, y, r, look_x=1.0, look_y=0.0,
                 hurt=0.0, happy=False, restitution: float = 0.15,
-                friction: float = 0.5):
-    """Chubby round spirit for the force-controlled EE."""
+                friction: float = 0.5, speed: float = 0.0):
+    """Chubby jelly spirit — bounce = squash/stretch + soft aura (no coils)."""
     ln = (look_x * look_x + look_y * look_y) ** 0.5
     if ln < 1e-6:
         lx, ly = 1.0, 0.0
     else:
         lx, ly = look_x / ln, look_y / ln
 
-    pr = cam.px(r * 1.08)
+    rw, rh = _jelly_radii(r, restitution, speed)
+    prx, pry = cam.px(rw * 1.05), cam.px(rh * 1.05)
     body_c = cam.to_screen(x, y)
-    shadow = cam.to_screen(x, 0.012)
-    rl.draw_ellipse(int(shadow.x), int(shadow.y), int(pr * 0.88),
-                    max(4, int(pr * 0.26)), rl.Color(8, 12, 18, 80))
 
     body = rl.Color(72, 214, 196, 255)
     if hurt > 0:
         body = rl.color_lerp(body, HAZARD, min(1.0, hurt))
     rim, _ = _grip_color(friction)
-    rl.draw_circle_v(body_c, pr + 5.0, rim)
-    rl.draw_circle_v(body_c, pr, body)
 
-    # dumpling ears
-    ear_r = pr * 0.28
+    # soft jelly aura (bounce strength)
+    aura = 4.0 + 10.0 * max(0.0, min(1.0, float(restitution)))
+    rl.draw_ellipse(int(body_c.x), int(body_c.y),
+                    int(prx + aura), int(pry + aura),
+                    rl.Color(SPRING.r, SPRING.g, SPRING.b, 55))
+    rl.draw_ellipse(int(body_c.x), int(body_c.y),
+                    int(prx + 5), int(pry + 5), rim)
+    rl.draw_ellipse(int(body_c.x), int(body_c.y), int(prx), int(pry), body)
+
+    # dumpling ears (also slightly squashed)
+    ear_r = min(prx, pry) * 0.28
     ear_l = cam.to_screen(x - r * 0.55, y + r * 0.72)
     ear_rgt = cam.to_screen(x + r * 0.55, y + r * 0.72)
     rl.draw_circle_v(ear_l, ear_r + 2.5, rim)
@@ -363,17 +380,17 @@ def draw_spirit(cam: Camera, x, y, r, look_x=1.0, look_y=0.0,
 
     # pale belly
     belly = cam.to_screen(x, y - r * 0.10)
-    rl.draw_circle_v(belly, pr * 0.58, rl.Color(210, 250, 242, 210))
+    rl.draw_circle_v(belly, min(prx, pry) * 0.58, rl.Color(210, 250, 242, 210))
 
     # glossy highlight
     hi = cam.to_screen(x - r * 0.30, y + r * 0.30)
-    rl.draw_circle_v(hi, pr * 0.20, rl.Color(255, 255, 255, 95))
+    rl.draw_circle_v(hi, min(prx, pry) * 0.20, rl.Color(255, 255, 255, 95))
 
     blush = rl.Color(255, 130, 150, 90 if not happy else 130)
-    rl.draw_circle_v(cam.to_screen(x - r * 0.48, y - r * 0.06), pr * 0.16, blush)
-    rl.draw_circle_v(cam.to_screen(x + r * 0.48, y - r * 0.06), pr * 0.16, blush)
-
-    _spirit_gear(cam, x, y, r, restitution)
+    rl.draw_circle_v(cam.to_screen(x - r * 0.48, y - r * 0.06),
+                     min(prx, pry) * 0.16, blush)
+    rl.draw_circle_v(cam.to_screen(x + r * 0.48, y - r * 0.06),
+                     min(prx, pry) * 0.16, blush)
 
     eye_y = y + r * 0.10
     eye_dx = r * 0.30
@@ -656,3 +673,119 @@ def draw_start_menu(width: int, height: int, model_label: str, model_detail: str
         ew = text_width(error, 16)
         text(error, (width - ew) * 0.5, 508, 16, HAZARD)
     return prev, nxt, start
+
+
+def _draw_pusht_world(cam: Camera, states: np.ndarray, geom: np.ndarray,
+                      stem_goal, bar_goal, trail, action=None,
+                      happy: bool = False, restitution: float = 0.35):
+    """Draw Push-T bodies (no ground / horizon)."""
+    if trail:
+        for i in range(1, len(trail)):
+            a = cam.to_screen(*trail[i - 1])
+            b = cam.to_screen(*trail[i])
+            rl.draw_line_ex(a, b, 2.5, TRAIL)
+    if stem_goal is not None:
+        draw_star(cam, float(stem_goal[0]), float(stem_goal[1]), 0.04, GOAL)
+    if bar_goal is not None:
+        p = cam.to_screen(float(bar_goal[0]), float(bar_goal[1]))
+        rl.draw_circle(int(p.x), int(p.y), 5, GOAL)
+    n = len(states)
+    for i in range(1, n):
+        x, y, th = float(states[i, 0]), float(states[i, 1]), float(states[i, 2])
+        hw, hh = float(geom[i, 0]), float(geom[i, 1])
+        fill = TARGET if i == 1 else BOX
+        _box(cam, x, y, th, hw, hh, fill, outline=None)
+    if n > 0:
+        x, y = float(states[0, 0]), float(states[0, 1])
+        hw = float(geom[0, 0])
+        spd = float(np.linalg.norm(states[0, 3:5])) if states.shape[1] >= 5 else 0.0
+        look_x = float(states[1, 0]) - x if n > 1 else 1.0
+        look_y = float(states[1, 1]) - y if n > 1 else 0.0
+        draw_spirit(cam, x, y, hw, look_x, look_y, hurt=0.0, happy=happy,
+                    restitution=restitution, friction=0.5, speed=spd)
+        if action is not None:
+            draw_force_arrow(cam, x, y, hw, float(action[0]), float(action[1]))
+
+
+def draw_pusht_scene(cam: Camera, states: np.ndarray, geom: np.ndarray,
+                     stem_goal, bar_goal, trail, action=None,
+                     happy: bool = False):
+    """Single-panel Push-T without horizon."""
+    rl.draw_rectangle(0, 0, cam.width, cam.height, BG)
+    _draw_pusht_world(cam, states, geom, stem_goal, bar_goal, trail,
+                      action=action, happy=happy)
+
+
+def draw_pusht_versus(width: int, height: int,
+                      left_obs, right_obs,
+                      left_trail, right_trail,
+                      stem_goal, bar_goal,
+                      left_action=None, right_action=None,
+                      left_happy: bool = False, right_happy: bool = False,
+                      title: str = "你能玩过 AI 吗？",
+                      subtitle: str = "",
+                      countdown: str | None = None,
+                      score_line: str = "",
+                      hint: str = ""):
+    """Split-screen You vs AI — no ground horizon."""
+    mid = width // 2
+    rl.draw_rectangle(0, 0, width, height, BG)
+    scale = 280.0
+    oy = height - 100.0
+    world_ox = mid * 0.5 - 0.95 * scale
+
+    cam_l = Camera(mid, height, origin_x=world_ox, scale=scale, ground_pad=100.0)
+    cam_l.oy = oy
+    cam_r = Camera(mid, height, origin_x=mid + world_ox, scale=scale,
+                   ground_pad=100.0)
+    cam_r.oy = oy
+
+    rl.begin_scissor_mode(0, 0, mid - 1, height)
+    rl.draw_rectangle(0, 0, mid, height, rl.Color(24, 36, 52, 255))
+    _draw_pusht_world(
+        cam_l, left_obs["obj_states"], left_obs["obj_geom"],
+        stem_goal, bar_goal, left_trail,
+        action=left_action, happy=left_happy, restitution=0.45)
+    text("YOU  ·  WASD", 24, height - 36, 16, HP_OK)
+    rl.end_scissor_mode()
+
+    rl.begin_scissor_mode(mid + 1, 0, width - mid - 1, height)
+    rl.draw_rectangle(mid, 0, width - mid, height, rl.Color(28, 32, 48, 255))
+    _draw_pusht_world(
+        cam_r, right_obs["obj_states"], right_obs["obj_geom"],
+        stem_goal, bar_goal, right_trail,
+        action=right_action, happy=right_happy, restitution=0.45)
+    text("AI  ·  WM+PPO", mid + 24, height - 36, 16, BRAIN)
+    rl.end_scissor_mode()
+
+    rl.draw_rectangle(mid - 2, 0, 4, height, rl.Color(60, 80, 100, 255))
+
+    banner = rl.Rectangle(width * 0.5 - 280, 12, 560, 78)
+    rl.draw_rectangle_rounded(banner, 0.18, 8, PANEL)
+    tw = text_width(title, 22)
+    text(title, (width - tw) * 0.5, 20, 22, TEXT)
+    if subtitle:
+        sw = text_width(subtitle, 14)
+        col = HP_OK if ("YOU" in subtitle.upper() or "WIN" in subtitle.upper()) else TEXT
+        text(subtitle, (width - sw) * 0.5, 48, 14, col)
+    if score_line:
+        lw = text_width(score_line, 13)
+        text(score_line, (width - lw) * 0.5, 68, 13, MUTED)
+    if countdown:
+        cw = text_width(countdown, 72)
+        text(countdown, (width - cw) * 0.5, height * 0.40, 72, TARGET)
+    if hint:
+        hw = text_width(hint, 14)
+        text(hint, (width - hw) * 0.5, height - 22, 14, MUTED)
+
+
+def draw_pusht_hud(status: str, width: int, successes: int, attempts: int,
+                   t: int, hint: str = ""):
+    panel = rl.Rectangle(16, 12, 520, 110)
+    rl.draw_rectangle_rounded(panel, 0.12, 6, PANEL)
+    text("Spirit Push-T", 28, 20, 18, TEXT)
+    text(status, 28, 48, 16, HP_OK if "WIN" in status else TEXT)
+    rate = f"success  {successes}/{max(attempts, 1)}    t={t}"
+    text(rate, 28, 74, 14, MUTED)
+    if hint:
+        text(hint, 28, 94, 13, MUTED)

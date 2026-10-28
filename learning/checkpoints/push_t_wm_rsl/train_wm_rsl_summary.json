@@ -1,0 +1,57 @@
+{
+  "method": "rsl_rl_ppo_wm_obs",
+  "wm": "learning/checkpoints/push_t_v4",
+  "final_success_rate": 0.9,
+  "final_n_success": 36,
+  "final_episodes": 40,
+  "final_mean_dist": 0.187904139701277,
+  "best_train_eval_rate": 0.9,
+  "num_envs": 128,
+  "num_workers": 6,
+  "hold": 5,
+  "history": [
+    {
+      "iter": 50,
+      "success_rate": 0.4,
+      "mean_dist": 0.4826091073453426,
+      "elapsed_s": 1030.367550611496
+    },
+    {
+      "iter": 100,
+      "success_rate": 0.8,
+      "mean_dist": 0.184416588768363,
+      "elapsed_s": 2012.7454311847687
+    },
+    {
+      "iter": 150,
+      "success_rate": 0.8,
+      "mean_dist": 0.24092056043446064,
+      "elapsed_s": 2989.1014156341553
+    },
+    {
+      "iter": 200,
+      "success_rate": 0.7,
+      "mean_dist": 0.20853377059102057,
+      "elapsed_s": 3978.714363336563
+    },
+    {
+      "iter": 250,
+      "success_rate": 0.65,
+      "mean_dist": 0.2276678502559662,
+      "elapsed_s": 4982.346075296402
+    },
+    {
+      "iter": 300,
+      "success_rate": 0.7,
+      "mean_dist": 0.20393321476876736,
+      "elapsed_s": 5986.481868505478
+    },
+    {
+      "iter": 350,
+      "success_rate": 0.9,
+      "mean_dist": 0.1486143536865711,
+      "elapsed_s": 6962.792017221451
+    }
+  ],
+  "elapsed_s": 7088.563952207565
+}

@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use FlatWorld / StateLeWM, please cite this work."
+title: "StateLeWM: Object-Centric State World Models for Contact-Rich Planar Manipulation"
+authors:
+  - family-names: Liu
+    given-names: Dongyu
+    email: liudongyu@numericsv.tech
+version: "0.1.0"
+date-released: "2026-10-28"
+license: Apache-2.0
+repository-code: "https://github.com/swaggyliu/FlatWorld"
+# Fill after arXiv (cs.RO) upload:
+# identifiers:
+#   - type: arxiv
+#     value: "XXXX.XXXXX"
+abstract: >
+  Object-centric state+tactile world model (StateLeWM) on FlatWorld with
+  WM+CEM, WM+BPTT, and WM+PPO controllers; a fast 2D testbed before 3D
+  and vision.

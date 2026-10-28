@@ -1,4 +1,4 @@
-"""ICEM (Sample-Efficient CEM) over the FlatWorld solver.
+"""Sample-efficient CEM over the FlatWorld solver (SolverCEMPlanner).
 
 Based on Pinneri et al., "Sample-Efficient Cross-Entropy Method for Real-Time
 Planning". Key improvements over vanilla CEM:
@@ -42,7 +42,7 @@ def _smooth_noise(noise):
 
 
 class SolverCEMPlanner:
-    """Receding-horizon ICEM whose forward model is ``PushSceneEnv``."""
+    """Receding-horizon CEM whose forward model is ``PushSceneEnv``."""
 
     def __init__(self, env, stride: int = 1, horizon: int = 16,
                  population: int = 12, elites: int = 4, iterations: int = 2,
@@ -123,10 +123,14 @@ class SolverCEMPlanner:
         mean, std = self.mean, self.std
         hint = getattr(cost, "hint_action", None)
 
-        # Hint as soft prior (not hardcoded samples). ICEM_HINT_W overrides
-        # the mix weight (0 = pure cost optimisation, no hint prior).
+        # Hint as soft prior (not hardcoded samples). Task may set
+        # ``self.hint_w``; CEM_HINT_W env overrides when present.
         import os as _os
-        hint_w = float(_os.environ.get("ICEM_HINT_W", "0.45"))
+        env_w = _os.environ.get("CEM_HINT_W")
+        if env_w is not None:
+            hint_w = float(env_w)
+        else:
+            hint_w = float(getattr(self, "hint_w", 0.45))
         if hint is not None and hint_w > 0.0:
             h = np.asarray(hint, dtype=np.float32).reshape(2)
             mean = ((1.0 - hint_w) * mean + hint_w * h).astype(np.float32)

@@ -433,7 +433,13 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         ee_pos = obs["obj_states"][0, :2]
         obj_pos_all = obs["obj_states"][1:, :2]
         if str(getattr(cfg.scene, "kind", "")) == "push_t":
-            a = push_t_action(obs, rng, cfg, push_t_mem)
+            # Honor mode mix: spin/hop enrich rotation & glancing contact.
+            if mode == "spin":
+                a = spin_action(obs, rng, cfg, hop_mem)
+            elif mode == "hop":
+                a = hop_action(obs, rng, cfg, hop_mem)
+            else:
+                a = push_t_action(obs, rng, cfg, push_t_mem)
             obs = env.step(a)
             actions.append(a)
             states.append(obs["obj_states"])
@@ -540,6 +546,15 @@ def main():
     parser.add_argument("--out", type=str, default=None, help="output directory")
     parser.add_argument("--start-index", type=int, default=0,
                         help="first rollout index (resume after interruption)")
+    parser.add_argument("--contact-rich", action="store_true",
+                        help="Push-T: raise table_mu + mix spin for denser "
+                             "contact/rotation (eval scene stays default)")
+    parser.add_argument("--table-mu", type=float, default=None,
+                        help="override scene.table_mu for this collect run")
+    parser.add_argument("--mode-spin", type=float, default=None,
+                        help="override collect.mode_spin (Push-T)")
+    parser.add_argument("--mode-push", type=float, default=None,
+                        help="override collect.mode_push (Push-T)")
     args = parser.parse_args()
 
     cfg = _make_cfg(args.task)
@@ -551,6 +566,25 @@ def main():
         cfg.collect.seed = args.seed
     if args.force_max is not None:
         cfg.collect.force_max = args.force_max
+    if args.contact_rich and args.task in ("push_t", "push-t"):
+        # Keep eval push_t_config at μ=0.20; only this collect run is sticky.
+        cfg.scene.table_mu = 0.45
+        cfg.collect.mode_push = 0.55
+        cfg.collect.mode_spin = 0.45
+        cfg.collect.mode_free = 0.0
+        cfg.collect.mode_attract = 0.0
+        cfg.collect.mode_release = 0.0
+        cfg.collect.mode_hop = 0.0
+        cfg.collect.mode_pile = 0.0
+        cfg.collect.mode_door = 0.0
+        print("contact-rich Push-T: table_mu=0.45 mode_push=0.55 mode_spin=0.45",
+              flush=True)
+    if args.table_mu is not None:
+        cfg.scene.table_mu = float(args.table_mu)
+    if args.mode_spin is not None:
+        cfg.collect.mode_spin = float(args.mode_spin)
+    if args.mode_push is not None:
+        cfg.collect.mode_push = float(args.mode_push)
     out_dir = args.out or cfg.collect.out_dir
     os.makedirs(out_dir, exist_ok=True)
 

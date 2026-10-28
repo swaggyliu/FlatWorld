@@ -52,8 +52,11 @@ OBJ_TYPE_BALL = 2
 class PushSceneEnv:
     """Gym-style (numpy dict obs) FlatWorld push environment."""
 
-    def __init__(self, cfg: Config = None, device: str = None):
+    def __init__(self, cfg: Config = None, device: str = None, env_id: int = -1):
         self.cfg = cfg or Config()
+        # Multi-env isolation tag stamped onto rigid domains in `_register`.
+        # >=0 → only collide within this env; -1 → global / single-env default.
+        self.env_id = int(env_id)
         init_warp(device=device, prefer_cuda=False)  # CPU is faster for small scenes; GPU also works
         self._build()
 

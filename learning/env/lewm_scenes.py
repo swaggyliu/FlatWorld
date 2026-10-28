@@ -79,11 +79,11 @@ class LewmSceneEnv(PushSceneEnv):
     planar = False
     torque_control = False
 
-    def __init__(self, cfg: Config = None, device: str = None):
+    def __init__(self, cfg: Config = None, device: str = None, env_id: int = -1):
         self.connected_pairs = set()
         self.joint_rel = {}
         self.fixed_slots = set()
-        super().__init__(cfg, device)
+        super().__init__(cfg, device, env_id=env_id)
 
     def rel_type_mat(self):
         from learning.models.relations import empty_rel, set_pair
@@ -102,13 +102,22 @@ class LewmSceneEnv(PushSceneEnv):
     def _register(self, joints=None):
         sc = self.cfg.scene
         domains = [self.ee_domain] + self.obj_domains
+        # Stamp env_id so RigidManager / BVH skip cross-env rigid pairs.
+        eid = int(getattr(self, "env_id", -1))
+        for d in domains:
+            d.env_id = eid
         damp = float(getattr(sc, "loop_damping", 0.0))
         use_pd = int(getattr(self, "use_pd", getattr(sc, "use_pd", 0)))
         self.use_pd = use_pd
+        # Optional compact RigidManager capacities (Push-T / many parallel envs).
+        cap = getattr(self, "rigid_capacity", None)
+        if cap is None:
+            cap = getattr(sc, "rigid_capacity", None)
         self.looper = ExplicitLoop(
             0.0, domains, joints or [], useAdapativeDT=True, damping=damp,
             considerRigidRigidContact=bool(getattr(self, "rigid_rigid_contact", True)),
-            use_pd=use_pd)
+            use_pd=use_pd,
+            rigid_capacity=cap)
         self.rm = self.looper.rigidManager
         self.ee_idx = self.ee_domain.ndOffset
         self.rigid_ids = [self.ee_idx] + [d.ndOffset for d in self.obj_domains]
@@ -344,6 +353,16 @@ class PushTEnv(LewmSceneEnv):
     planar = True
     STEM = 1
     BAR = 2
+    # Tiny scene: shrink RigidManager pools so 128+ parallel envs fit in RAM.
+    rigid_capacity = {
+        "max_nodes": 8,
+        "max_joints": 4,
+        "max_contacts": 64,
+        "max_ground_contacts": 4,
+        "max_ground_pairs": 8,
+        "max_collision_pairs": 64,
+        "max_envs_alloc": 1,
+    }
 
     def _build(self):
         sc = self.cfg.scene

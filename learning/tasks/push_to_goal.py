@@ -171,7 +171,11 @@ class PushToGoalCost:
 
 
 class PushToGoalTask:
-    """Push a target object to a goal position with the learned world model."""
+    """Push a target object to a goal position with the learned world model.
+
+    Exposes the unified FlatWorldTask API (``observe`` / ``potential`` /
+    ``metric`` / ``succeeded``) used by CEM and optional PPO adapters.
+    """
 
     def __init__(self, cfg, model, norm, device="cpu",
                  tol: float = None, vel_tol: float = None, budget: int = None,
@@ -215,6 +219,7 @@ class PushToGoalTask:
                                       force_max=cfg.collect.force_max, **pk)
         self.target_idx = None
         self.ee_idx = 0
+        self.goal = None
 
     def _geom(self) -> np.ndarray:
         if getattr(self.env, "obj_geom", None) is not None:
@@ -338,6 +343,38 @@ class PushToGoalTask:
             cur = dict(cur)
             cur["obj_geom"] = self._geom()
         return cur
+
+    # --- FlatWorldTask API (CEM / PPO shared) ---
+    def observe(self):
+        return self._observe()
+
+    def sample_goal(self, rng, obs):
+        if self.target_idx is None:
+            self.target_idx = self._pick_target(obs, rng)
+        goal = self._sample_goal(rng, obs, self.target_idx)
+        self.goal = goal
+        return goal
+
+    def metric(self, obs, goal) -> float:
+        g = goal if goal is not None else self.goal
+        idx = int(self.target_idx if self.target_idx is not None else 1)
+        return float(np.linalg.norm(obs["obj_states"][idx, :2] - g[:2]))
+
+    def potential(self, obs, goal=None) -> float:
+        return self.metric(obs, goal if goal is not None else self.goal)
+
+    def succeeded(self, obs, goal) -> bool:
+        g = goal if goal is not None else self.goal
+        return self._succeeded(obs["obj_states"], g)
+
+    def reset(self, rng):
+        obs = self.env.reset(rng)
+        self.env.set_ee_radius(float(self.cfg.scene.ee_radius) * self.ee_scale)
+        return self._observe()
+
+    def step(self, action):
+        self.env.step(np.asarray(action, dtype=np.float32))
+        return self._observe()
 
     def _plan(self, cur, goal):
         """Bind cost and run CEM. Solver CEM returns ``(H, 2)``; latent returns ``(2,)``."""
