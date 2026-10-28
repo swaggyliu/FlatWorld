@@ -126,6 +126,7 @@ class PushTVersusSession:
     DEFAULT_ROUND_SECONDS = 30
     MIN_ROUND_SECONDS = 10
     MAX_ROUND_SECONDS = 180
+    SUCCESS_TOL = 0.12  # Match the saved WM/PPO evaluation's position tolerance.
     PLAYER_FORCE = 5.5  # N, within typical force_max=6
     # Physics substeps per web/desktop tick. Player uses latest stick each step;
     # With the default five-step action hold, AI inference runs at most once
@@ -186,11 +187,11 @@ class PushTVersusSession:
         self.fmax = float(cfg.collect.force_max)
         # Two independent plants, same config.
         self.left = _Side(
-            PushTTask(cfg, planner_kwargs=dict(use_servo=True),
+            PushTTask(cfg, tol=self.SUCCESS_TOL, planner_kwargs=dict(use_servo=True),
                       ee_spawn="support"),
             "YOU")
         self.right = _Side(
-            PushTTask(push_t_config(), planner_kwargs=dict(use_servo=True),
+            PushTTask(push_t_config(), tol=self.SUCCESS_TOL, planner_kwargs=dict(use_servo=True),
                       ee_spawn="support"),
             "AI")
         # A wall clock keeps the HUD and timeout consistent under CPU load.

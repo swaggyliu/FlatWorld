@@ -11,6 +11,8 @@ python -m game --mode pusht \
 ```
 
 Push-T duel: 3s countdown, first to seat the T wins, Space/R rematch.
+Both players use the saved evaluation's 0.12 m position tolerance for each T
+part; the existing angle and settling-speed requirements still apply.
 Web rounds default to 30 playable seconds (countdown and pauses excluded).
 Settings → Round length accepts 10–180 seconds, saved on this device and applied
 on the next rematch or connection. Both sides always share the same round clock.
