@@ -2,27 +2,45 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <title>FlatWorld — You vs AI (Push-T)</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header>
     <h1>You vs AI</h1>
-    <p class="sub">Push-T · WASD left · frozen WM+PPO right</p>
+    <p class="sub">Push-T · drag / D-pad left · WM+PPO right</p>
   </header>
   <div class="bar">
     <span id="score">YOU 0 — AI 0</span>
     <span id="status">connecting…</span>
-    <span id="difficulty" class="difficulty">
+  </div>
+  <div class="toolbar">
+    <div id="difficulty" class="difficulty" aria-label="AI difficulty">
       <span>AI</span>
       <button type="button" data-level="low">Low</button>
       <button type="button" data-level="medium" class="active">Medium</button>
       <button type="button" data-level="high">High</button>
-    </span>
+    </div>
+    <div class="actions">
+      <button type="button" id="rematch" class="action-btn">Rematch</button>
+      <button type="button" id="pause" class="action-btn ghost">Pause</button>
+    </div>
   </div>
   <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
-  <p class="hint">WASD move · 1/2/3 difficulty · Space/R rematch · P pause · click canvas to focus</p>
+  <div id="pad" class="pad" aria-label="Move">
+    <button type="button" class="pad-btn" data-key="w" aria-label="Up">▲</button>
+    <div class="pad-mid">
+      <button type="button" class="pad-btn" data-key="a" aria-label="Left">◀</button>
+      <button type="button" class="pad-btn" data-key="s" aria-label="Down">▼</button>
+      <button type="button" class="pad-btn" data-key="d" aria-label="Right">▶</button>
+    </div>
+  </div>
+  <p class="hint">
+    Mobile: drag on <strong>YOU</strong> panel or use the D-pad · Rematch / difficulty buttons above ·
+    Desktop: WASD · 1/2/3 · Space/R · P
+  </p>
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>

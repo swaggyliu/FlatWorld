@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>FlatWorld — 2D physics + StateLeWM</title>
   <link rel="stylesheet" href="pusht/style.css" />
   <style>
@@ -96,24 +96,47 @@
     .play-shell canvas {
       width: 100%;
       height: auto;
+      max-height: min(62vh, 560px);
       display: block;
       background: #0f1412;
       border-radius: 10px;
+      touch-action: none;
     }
-    .hint {
+    .play-shell .toolbar {
+      justify-content: flex-start;
+      margin: 0 0.35rem 0.55rem;
+    }
+    .play-shell .hint {
       margin: 0.55rem 0.35rem 0.1rem;
       color: var(--muted);
       font-size: 0.88rem;
+      text-align: left;
+      max-width: none;
     }
-    .difficulty button {
+    .play-shell .difficulty button,
+    .play-shell .action-btn.ghost,
+    .play-shell .pad-btn {
       border-color: var(--line);
       background: #fff;
       color: var(--muted);
     }
-    .difficulty button.active {
+    .play-shell .difficulty button.active,
+    .play-shell .action-btn {
       background: var(--accent);
       border-color: var(--accent);
       color: #fff;
+    }
+    .play-shell .pad {
+      margin-left: 0.35rem;
+      margin-right: 0.35rem;
+    }
+    @media (max-width: 720px) {
+      .wrap { padding: 0.85rem 0.7rem 2.5rem; }
+      .brand { font-size: 1.7rem; }
+      .lede { font-size: 0.95rem; margin-bottom: 0.75rem; }
+      .play-shell { padding: 0.55rem; border-radius: 12px; }
+      .play-shell canvas { max-height: min(54vh, 520px); }
+      .nav a { padding: 0.4rem 0.55rem; font-size: 0.85rem; }
     }
     section { margin-top: 2.2rem; }
     section h3 { margin: 0 0 0.55rem; font-size: 1.2rem; }
@@ -196,7 +219,7 @@
       Warp-accelerated 2D physics with explicit FEM, impulse rigid bodies, and
       mixed-domain contact — plus StateLeWM, one latent world model with three
       controllers (CEM, BPTT, PPO). Play <strong>You vs AI</strong> below
-      (WASD left, frozen WM+PPO right).
+      (drag / D-pad on mobile, WASD on desktop).
     </p>
 
     <div class="play-shell">
@@ -207,15 +230,32 @@
       <div class="bar">
         <span id="score">YOU 0 — AI 0</span>
         <span id="status">connecting…</span>
-        <span id="difficulty" class="difficulty">
+      </div>
+      <div class="toolbar">
+        <div id="difficulty" class="difficulty" aria-label="AI difficulty">
           <span>AI</span>
           <button type="button" data-level="low">Low</button>
           <button type="button" data-level="medium" class="active">Medium</button>
           <button type="button" data-level="high">High</button>
-        </span>
+        </div>
+        <div class="actions">
+          <button type="button" id="rematch" class="action-btn">Rematch</button>
+          <button type="button" id="pause" class="action-btn ghost">Pause</button>
+        </div>
       </div>
       <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
-      <p class="hint">WASD move · 1/2/3 difficulty · Space / R rematch · P pause · click canvas to focus</p>
+      <div id="pad" class="pad" aria-label="Move">
+        <button type="button" class="pad-btn" data-key="w" aria-label="Up">▲</button>
+        <div class="pad-mid">
+          <button type="button" class="pad-btn" data-key="a" aria-label="Left">◀</button>
+          <button type="button" class="pad-btn" data-key="s" aria-label="Down">▼</button>
+          <button type="button" class="pad-btn" data-key="d" aria-label="Right">▶</button>
+        </div>
+      </div>
+      <p class="hint">
+        Mobile: drag on YOU panel or D-pad · Rematch / difficulty buttons ·
+        Desktop: WASD · 1/2/3 · Space/R · P
+      </p>
     </div>
 
     <section>

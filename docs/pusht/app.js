@@ -4,6 +4,9 @@
   const statusEl = document.getElementById("status");
   const scoreEl = document.getElementById("score");
   const diffEl = document.getElementById("difficulty");
+  const rematchBtn = document.getElementById("rematch");
+  const pauseBtn = document.getElementById("pause");
+  const padEl = document.getElementById("pad");
 
   const params = new URLSearchParams(location.search);
   const endpoints = [
@@ -20,6 +23,11 @@
   let reconnectAt = 0;
   let everOpened = false;
   let difficulty = "medium";
+  let portrait = false;
+  let aimActive = false;
+  let aimWorld = null; // [x, y] in world coords on YOU panel
+  let scale = 280;
+  let padY = 100;
 
   function send(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -27,6 +35,26 @@
 
   function syncKeys() {
     send({ type: "keys", down: [...keys] });
+  }
+
+  function setKey(k, down) {
+    if (!["w", "a", "s", "d"].includes(k)) return;
+    const had = keys.has(k);
+    if (down && !had) {
+      keys.add(k);
+      syncKeys();
+    } else if (!down && had) {
+      keys.delete(k);
+      syncKeys();
+    }
+  }
+
+  function clearMoveKeys() {
+    let changed = false;
+    for (const k of ["w", "a", "s", "d"]) {
+      if (keys.delete(k)) changed = true;
+    }
+    if (changed) syncKeys();
   }
 
   function setDifficulty(level, rematch) {
@@ -38,6 +66,10 @@
     }
     send({ type: "difficulty", level });
     if (rematch) send({ type: "rematch" });
+  }
+
+  function rematch() {
+    send({ type: "rematch" });
   }
 
   function connect() {
@@ -97,26 +129,167 @@
     };
   }
 
+  function layoutMode() {
+    const coarse = window.matchMedia("(pointer: coarse)").matches;
+    const narrow = window.innerWidth < 720;
+    return coarse || narrow;
+  }
+
+  function resizeCanvas() {
+    portrait = layoutMode();
+    const cssW = Math.min(canvas.clientWidth || window.innerWidth - 24, 1100);
+    // Landscape split / portrait stacked — pick internal pixel size.
+    let w;
+    let h;
+    if (portrait) {
+      w = Math.round(Math.min(640, cssW * (window.devicePixelRatio > 1.5 ? 1.25 : 1.5)));
+      h = Math.round(w * 1.55);
+    } else {
+      w = 1100;
+      h = 560;
+    }
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    // Fit world units into a panel.
+    const panelW = portrait ? w : w / 2;
+    const panelH = portrait ? h / 2 : h;
+    scale = Math.min(panelW * 0.42, panelH * 0.55);
+    padY = Math.max(48, panelH * 0.16);
+  }
+
+  function youPanelRect() {
+    if (portrait) {
+      return { x: 0, y: 0, w: canvas.width, h: canvas.height / 2 - 2 };
+    }
+    return { x: 0, y: 0, w: canvas.width / 2 - 2, h: canvas.height };
+  }
+
+  function canvasPointFromEvent(e) {
+    const r = canvas.getBoundingClientRect();
+    const cx = (e.clientX - r.left) * (canvas.width / Math.max(r.width, 1));
+    const cy = (e.clientY - r.top) * (canvas.height / Math.max(r.height, 1));
+    return [cx, cy];
+  }
+
+  function worldToScreen(panelX, panelY, panelW, panelH, x, y) {
+    const ox = panelX + panelW * 0.5 - 0.95 * scale;
+    const oy = panelY + panelH - padY;
+    return [ox + x * scale, oy - y * scale];
+  }
+
+  function screenToWorld(panelX, panelY, panelW, panelH, sx, sy) {
+    const ox = panelX + panelW * 0.5 - 0.95 * scale;
+    const oy = panelY + panelH - padY;
+    return [(sx - ox) / scale, (oy - sy) / scale];
+  }
+
+  function updateAimKeys() {
+    if (!aimActive || !aimWorld || !state || !state.left || !state.left.states) {
+      return;
+    }
+    const st = state.left.states[0];
+    if (!st) return;
+    const dx = aimWorld[0] - st[0];
+    const dy = aimWorld[1] - st[1];
+    const mag = Math.hypot(dx, dy);
+    const next = new Set();
+    if (mag > 0.03) {
+      const ax = Math.abs(dx);
+      const ay = Math.abs(dy);
+      // Allow diagonals when both axes matter.
+      if (ax >= ay * 0.45) next.add(dx > 0 ? "d" : "a");
+      if (ay >= ax * 0.45) next.add(dy > 0 ? "w" : "s");
+    }
+    let changed = false;
+    for (const k of ["w", "a", "s", "d"]) {
+      const want = next.has(k);
+      const have = keys.has(k);
+      if (want && !have) {
+        keys.add(k);
+        changed = true;
+      } else if (!want && have) {
+        keys.delete(k);
+        changed = true;
+      }
+    }
+    if (changed) syncKeys();
+  }
+
+  function onPointerDown(e) {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    canvas.setPointerCapture?.(e.pointerId);
+    const [sx, sy] = canvasPointFromEvent(e);
+    const you = youPanelRect();
+    if (sx >= you.x && sx <= you.x + you.w && sy >= you.y && sy <= you.y + you.h) {
+      aimActive = true;
+      aimWorld = screenToWorld(you.x, you.y, you.w, you.h, sx, sy);
+      updateAimKeys();
+      e.preventDefault();
+    }
+  }
+
+  function onPointerMove(e) {
+    if (!aimActive) return;
+    const [sx, sy] = canvasPointFromEvent(e);
+    const you = youPanelRect();
+    aimWorld = screenToWorld(you.x, you.y, you.w, you.h, sx, sy);
+    updateAimKeys();
+    e.preventDefault();
+  }
+
+  function onPointerUp(e) {
+    if (!aimActive) return;
+    aimActive = false;
+    aimWorld = null;
+    clearMoveKeys();
+    try {
+      canvas.releasePointerCapture?.(e.pointerId);
+    } catch (_) {}
+  }
+
   if (diffEl) {
     diffEl.addEventListener("click", (e) => {
       const btn = e.target.closest("button[data-level]");
       if (!btn) return;
       setDifficulty(btn.dataset.level, true);
-      canvas.focus();
     });
+  }
+  rematchBtn?.addEventListener("click", () => rematch());
+  pauseBtn?.addEventListener("click", () => send({ type: "pause" }));
+
+  function bindPadButton(btn) {
+    const k = btn.dataset.key;
+    const down = (e) => {
+      e.preventDefault();
+      btn.classList.add("active");
+      setKey(k, true);
+    };
+    const up = (e) => {
+      e.preventDefault();
+      btn.classList.remove("active");
+      setKey(k, false);
+    };
+    btn.addEventListener("pointerdown", down);
+    btn.addEventListener("pointerup", up);
+    btn.addEventListener("pointercancel", up);
+    btn.addEventListener("pointerleave", up);
+  }
+  if (padEl) {
+    for (const btn of padEl.querySelectorAll("button[data-key]")) {
+      bindPadButton(btn);
+    }
   }
 
   window.addEventListener("keydown", (e) => {
     const k = e.key.toLowerCase();
     if (["w", "a", "s", "d"].includes(k)) {
       e.preventDefault();
-      if (!keys.has(k)) {
-        keys.add(k);
-        syncKeys();
-      }
+      setKey(k, true);
     } else if (k === " " || k === "r") {
       e.preventDefault();
-      send({ type: "rematch" });
+      rematch();
     } else if (k === "p") {
       e.preventDefault();
       send({ type: "pause" });
@@ -133,23 +306,20 @@
   });
   window.addEventListener("keyup", (e) => {
     const k = e.key.toLowerCase();
-    if (keys.delete(k)) syncKeys();
+    if (["w", "a", "s", "d"].includes(k)) setKey(k, false);
   });
-  canvas.addEventListener("pointerdown", () => canvas.focus());
 
-  const SCALE = 280;
-  const PAD_Y = 100;
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointercancel", onPointerUp);
+  window.addEventListener("resize", resizeCanvas);
+  window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 150));
 
-  function worldToScreen(panelX, panelW, x, y) {
-    const ox = panelX + panelW * 0.5 - 0.95 * SCALE;
-    const oy = canvas.height - PAD_Y;
-    return [ox + x * SCALE, oy - y * SCALE];
-  }
-
-  function drawBox(panelX, panelW, x, y, th, hw, hh, fill, stroke) {
-    const [cx, cy] = worldToScreen(panelX, panelW, x, y);
-    const w = 2 * hw * SCALE;
-    const h = 2 * hh * SCALE;
+  function drawBox(panelX, panelY, panelW, panelH, x, y, th, hw, hh, fill, stroke) {
+    const [cx, cy] = worldToScreen(panelX, panelY, panelW, panelH, x, y);
+    const w = 2 * hw * scale;
+    const h = 2 * hh * scale;
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(-th);
@@ -163,9 +333,9 @@
     ctx.restore();
   }
 
-  function drawSpirit(panelX, panelW, x, y, r, lookX, lookY, happy) {
-    const [cx, cy] = worldToScreen(panelX, panelW, x, y);
-    const pr = r * SCALE;
+  function drawSpirit(panelX, panelY, panelW, panelH, x, y, r, lookX, lookY, happy) {
+    const [cx, cy] = worldToScreen(panelX, panelY, panelW, panelH, x, y);
+    const pr = r * scale;
     ctx.beginPath();
     ctx.fillStyle = "#62cfbe";
     ctx.arc(cx, cy, pr, 0, Math.PI * 2);
@@ -192,59 +362,97 @@
     }
   }
 
-  function drawTrail(panelX, panelW, trail, color) {
+  function drawTrail(panelX, panelY, panelW, panelH, trail, color) {
     if (!trail || trail.length < 2) return;
     ctx.beginPath();
     ctx.strokeStyle = color;
     ctx.lineWidth = 2.5;
     for (let i = 0; i < trail.length; i++) {
-      const [sx, sy] = worldToScreen(panelX, panelW, trail[i][0], trail[i][1]);
+      const [sx, sy] = worldToScreen(
+        panelX, panelY, panelW, panelH, trail[i][0], trail[i][1]);
       if (i === 0) ctx.moveTo(sx, sy);
       else ctx.lineTo(sx, sy);
     }
     ctx.stroke();
   }
 
-  function drawPanel(panelX, panelW, side, goal, label, labelColor, bg) {
+  function drawPanel(panelX, panelY, panelW, panelH, side, goal, label, labelColor, bg) {
     ctx.fillStyle = bg;
-    ctx.fillRect(panelX, 0, panelW, canvas.height);
+    ctx.fillRect(panelX, panelY, panelW, panelH);
     if (!side) return;
     const st = side.states;
     const geom = side.geom;
     if (goal) {
-      drawBox(panelX, panelW, goal.stem[0], goal.stem[1], goal.theta,
+      drawBox(panelX, panelY, panelW, panelH, goal.stem[0], goal.stem[1], goal.theta,
         geom[1][0], geom[1][1], "rgba(230,90,100,0.30)", "rgba(230,70,85,0.55)");
-      drawBox(panelX, panelW, goal.bar[0], goal.bar[1], goal.theta,
+      drawBox(panelX, panelY, panelW, panelH, goal.bar[0], goal.bar[1], goal.theta,
         geom[2][0], geom[2][1], "rgba(230,90,100,0.30)", "rgba(230,70,85,0.55)");
     }
-    drawTrail(panelX, panelW, side.trail, "rgba(62,207,190,0.45)");
+    drawTrail(panelX, panelY, panelW, panelH, side.trail, "rgba(62,207,190,0.45)");
     for (let i = 1; i < st.length; i++) {
       const fill = i === 1 ? "#e9c46a" : "#c9b8a0";
-      drawBox(panelX, panelW, st[i][0], st[i][1], st[i][2],
+      drawBox(panelX, panelY, panelW, panelH, st[i][0], st[i][1], st[i][2],
         geom[i][0], geom[i][1], fill, null);
     }
     if (st.length > 0) {
       const lookX = st.length > 1 ? st[1][0] - st[0][0] : 1;
       const lookY = st.length > 1 ? st[1][1] - st[0][1] : 0;
-      drawSpirit(panelX, panelW, st[0][0], st[0][1], geom[0][0],
+      drawSpirit(panelX, panelY, panelW, panelH, st[0][0], st[0][1], geom[0][0],
         lookX, lookY, !!side.ok);
     }
+    if (aimActive && aimWorld && label.startsWith("YOU")) {
+      const [ax, ay] = worldToScreen(
+        panelX, panelY, panelW, panelH, aimWorld[0], aimWorld[1]);
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(98,207,190,0.85)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 4]);
+      const [sx, sy] = worldToScreen(
+        panelX, panelY, panelW, panelH, st[0][0], st[0][1]);
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(ax, ay);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.fillStyle = "rgba(98,207,190,0.9)";
+      ctx.arc(ax, ay, 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.fillStyle = labelColor;
-    ctx.font = "16px Segoe UI, sans-serif";
-    ctx.fillText(label, panelX + 16, canvas.height - 18);
+    ctx.font = `${portrait ? 14 : 16}px Segoe UI, sans-serif`;
+    ctx.fillText(label, panelX + 12, panelY + panelH - 12);
   }
 
   function frame() {
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       if (performance.now() >= reconnectAt) connect();
     }
-    const mid = canvas.width / 2;
+    if (aimActive) updateAimKeys();
+    resizeCanvas();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (state) {
-      drawPanel(0, mid - 2, state.left, state.goal, "YOU · WASD", "#62cfbe", "#182430");
-      drawPanel(mid + 2, mid - 2, state.right, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
+
+    let youRect;
+    let aiRect;
+    if (portrait) {
+      const mid = canvas.height / 2;
+      youRect = { x: 0, y: 0, w: canvas.width, h: mid - 2 };
+      aiRect = { x: 0, y: mid + 2, w: canvas.width, h: mid - 2 };
+      ctx.fillStyle = "#3c5064";
+      ctx.fillRect(0, mid - 2, canvas.width, 4);
+    } else {
+      const mid = canvas.width / 2;
+      youRect = { x: 0, y: 0, w: mid - 2, h: canvas.height };
+      aiRect = { x: mid + 2, y: 0, w: mid - 2, h: canvas.height };
       ctx.fillStyle = "#3c5064";
       ctx.fillRect(mid - 2, 0, 4, canvas.height);
+    }
+
+    if (state) {
+      drawPanel(youRect.x, youRect.y, youRect.w, youRect.h,
+        state.left, state.goal, portrait ? "YOU · drag / pad" : "YOU · WASD / drag",
+        "#62cfbe", "#182430");
+      drawPanel(aiRect.x, aiRect.y, aiRect.w, aiRect.h,
+        state.right, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
 
       const overlay = state.phase === "over" ? state.status
         : (state.phase === "countdown"
@@ -255,7 +463,7 @@
         if (/YOU WIN/i.test(overlay)) col = "#62cfbe";
         else if (/AI WIN/i.test(overlay)) col = "#ba8cd6";
         ctx.fillStyle = col;
-        ctx.font = "bold 64px Segoe UI, sans-serif";
+        ctx.font = `bold ${portrait ? 42 : 64}px Segoe UI, sans-serif`;
         ctx.textAlign = "center";
         ctx.fillText(overlay, canvas.width / 2, canvas.height * 0.42);
         ctx.textAlign = "left";
@@ -271,6 +479,7 @@
   }
 
   if (diffEl) setDifficulty(difficulty, false);
+  resizeCanvas();
   connect();
   requestAnimationFrame(frame);
 })();
