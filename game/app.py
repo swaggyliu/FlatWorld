@@ -236,7 +236,7 @@ def _run_pusht(args, device: str):
                 subtitle=overlay,
                 countdown=cd,
                 score_line=(
-                    f"YOU {session.player_wins}   —   AI {session.ai_wins}"
+                    f"YOU {session.player_wins}   vs   AI {session.ai_wins}"
                     f"   (draw {session.draws})"),
                 hint=("WASD move   Space/R rematch   P pause   Esc quit"
                       + ("   · PAUSED" if session.paused else "")),
