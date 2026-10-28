@@ -155,6 +155,7 @@ def _build_app(
     *,
     limits: WebLimits | None = None,
     allowed_origins: set[str] | frozenset[str] | None = None,
+    allow_no_origin: bool = False,
 ) -> FastAPI:
     limits = limits or WebLimits()
     origins = DEFAULT_ORIGINS if allowed_origins is None else frozenset(allowed_origins)
@@ -213,8 +214,15 @@ def _build_app(
     @app.websocket("/ws")
     async def ws_game(ws: WebSocket):
         # CORS middleware only handles HTTP. Enforce WS origins before upgrading.
+        # WeChat mini program clients (wx.connectSocket) send no Origin header;
+        # --allow-no-origin / PUSHT_ALLOW_NO_ORIGIN=1 admits them. Browser
+        # clients still must present a whitelisted exact Origin.
         origin_headers = ws.headers.getlist("origin")
-        if len(origin_headers) != 1 or origin_headers[0] not in origins:
+        if origin_headers:
+            if len(origin_headers) != 1 or origin_headers[0] not in origins:
+                await ws.close(code=1008)
+                return
+        elif not allow_no_origin:
             await ws.close(code=1008)
             return
         if state["assets"] is None:
@@ -480,6 +488,10 @@ def main():
     ap.add_argument("--max-sessions-per-ip", type=int, default=2)
     ap.add_argument("--allowed-origin", action="append", default=[],
                     help="Additional exact browser origin (repeatable).")
+    ap.add_argument("--allow-no-origin", action="store_true", default=None,
+                    help="Accept WebSocket clients without an Origin header "
+                         "(WeChat mini program). Also enabled via "
+                         "PUSHT_ALLOW_NO_ORIGIN=1.")
     args = ap.parse_args()
 
     # Ensure repo root is on sys.path when launched as module.
@@ -487,13 +499,16 @@ def main():
     os.chdir(root)
 
     import uvicorn
+    allow_no_origin = args.allow_no_origin or os.environ.get(
+        "PUSHT_ALLOW_NO_ORIGIN", "").strip().lower() in {"1", "true", "yes"}
     app = _build_app(
         args.wm, args.policy, args.hold, args.seed, args.hz, args.max_sessions,
         limits=WebLimits(per_ip=args.max_sessions_per_ip),
         allowed_origins=DEFAULT_ORIGINS | set(args.allowed_origin) | {
             value.strip() for value in os.environ.get("PUSHT_ALLOWED_ORIGINS", "").split(",")
             if value.strip()
-        })
+        },
+        allow_no_origin=allow_no_origin)
     uvicorn.run(
         app, host=args.host, port=args.port, log_level="info",
         proxy_headers=True, forwarded_allow_ips="127.0.0.1,::1",

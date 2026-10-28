@@ -25,7 +25,7 @@ Type=simple
 WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=FLATWORLD_DEVICE=cpu
-ExecStart=${APP_DIR}/.venv/bin/python -m game.web_server --host 127.0.0.1 --port 8765
+ExecStart=${APP_DIR}/.venv/bin/python -m game.web_server --host 127.0.0.1 --port 8765 --allow-no-origin
 Restart=on-failure
 RestartSec=5
 
