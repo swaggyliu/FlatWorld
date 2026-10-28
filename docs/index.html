@@ -154,9 +154,23 @@
     }
     .figs img {
       width: 100%;
+      max-width: 720px;
+      height: auto;
       border-radius: 10px;
       border: 1px solid var(--line);
       background: #fff;
+    }
+    .clips {
+      display: grid;
+      gap: 1rem;
+      margin-top: 0.85rem;
+    }
+    .clips video {
+      width: 100%;
+      max-width: 720px;
+      border-radius: 10px;
+      background: #111;
+      border: 1px solid var(--line);
     }
     footer {
       margin-top: 2.4rem;
@@ -174,6 +188,7 @@
         <a class="primary" href="https://github.com/swaggyliu/FlatWorld">GitHub</a>
         <a href="theory.html">Theory</a>
         <a href="paradigms.html">Paradigms</a>
+        <a href="media.html">Media</a>
         <a href="https://github.com/swaggyliu/FlatWorld/blob/main/README.md">README</a>
       </nav>
     </div>
@@ -226,6 +241,15 @@
       <div class="figs">
         <img src="statelewm_worldmodel.png" alt="StateLeWM one-step world model" />
         <img src="statelewm_inference.png" alt="StateLeWM inference loop" />
+      </div>
+    </section>
+
+    <section>
+      <h3>Demos</h3>
+      <p>Promo clips — also on the <a href="media.html">media</a> page.</p>
+      <div class="clips">
+        <video controls preload="metadata" playsinline src="media/pusht_promo.mp4"></video>
+        <video controls preload="metadata" playsinline src="media/promo_supermimic.mp4"></video>
       </div>
     </section>
 

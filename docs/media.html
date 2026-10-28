@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Media — FlatWorld</title>
+  <link rel="stylesheet" href="doc.css" />
+  <style>
+    .clip {
+      margin: 1.5rem 0 2.2rem;
+      padding: 0.9rem;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    .clip h2 { margin: 0 0 0.55rem; font-size: 1.15rem; border: 0; }
+    .clip p { color: var(--muted); margin: 0 0 0.75rem; }
+    video {
+      width: 100%;
+      max-width: 820px;
+      display: block;
+      border-radius: 10px;
+      background: #111;
+    }
+  </style>
+</head>
+<body>
+  <nav class="doc-nav">
+    <a href="./">FlatWorld</a>
+    <a href="theory.html">Theory</a>
+    <a href="paradigms.html">Paradigms</a>
+    <a href="media.html">Media</a>
+    <a href="https://github.com/swaggyliu/FlatWorld">GitHub</a>
+  </nav>
+  <main class="doc-body">
+    <h1>Demos</h1>
+    <p>Inline players for the promo clips. Also linked from the README.</p>
+
+    <section class="clip" id="pusht">
+      <h2>Push-T · You vs AI</h2>
+      <p>WM-obs PPO (~0.3M world model) racing a human on the same goal.</p>
+      <video controls preload="metadata" playsinline src="media/pusht_promo.mp4"></video>
+    </section>
+
+    <section class="clip" id="supermimic">
+      <h2>SuperMimic-2D promo</h2>
+      <p>Shared rigid-body WM + BPTT skills (~33s).</p>
+      <video controls preload="metadata" playsinline src="media/promo_supermimic.mp4"></video>
+    </section>
+
+    <section class="clip" id="dance">
+      <h2>Dance overlay</h2>
+      <p>Policy vs reference ghost.</p>
+      <video controls preload="metadata" playsinline src="media/dance_overlay.mp4"></video>
+    </section>
+  </main>
+</body>
+</html>

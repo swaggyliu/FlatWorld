@@ -59,9 +59,19 @@ pytest test2D -q
 | **WM + PPO**  | Push-T                          | **36/40 = 90%** | `learning/checkpoints/push_t_wm_rsl`（WM：`push_t`）   |
 
 
-![StateLeWM 一步预测：当前帧到下一帧](docs/statelewm_worldmodel.png)
+<p align="center">
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#pusht"><strong>▶ Push-T / You vs AI</strong></a>
+  ·
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>SuperMimic 宣传片</strong></a>
+</p>
 
-![StateLeWM 推理：观察、编码、潜变量、CEM 想象、在 FlatWorld 执行](docs/statelewm_inference.png)
+<p align="center">
+  <img src="docs/statelewm_worldmodel.png" width="720" alt="StateLeWM 一步预测" />
+</p>
+
+<p align="center">
+  <img src="docs/statelewm_inference.png" width="720" alt="StateLeWM 推理流程" />
+</p>
 
 ### 1. WM + CEM — 推箱 · 穿门 · 机械臂
 
@@ -91,7 +101,11 @@ pytest test2D -q
 
 FlatWorld 上的 **2D [SuperMimic](https://supermimic.github.io/)**：拟合共享刚体世界模型，再在短想象轨迹上 **BPTT** 改进目标条件策略。说明：**[supermimic2d/README.md](supermimic2d/README.md)**。
 
-**▶ 观看宣传片（约 33 秒）** · dance 对比
+<p align="center">
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>▶ 观看宣传片（约 33 秒）</strong></a>
+  ·
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#dance">dance 对比</a>
+</p>
 
 ```bash
 python -m supermimic2d.bake_refs
@@ -107,7 +121,9 @@ python -m supermimic2d.render_promo --ckpt supermimic2d/runs/lafan2d/best.pt
 **rsl-rl PPO**：策略观测 = WM 潜变量 ‖ 任务特征，**奖励与转移在真实 FlatWorld**，
 向量化并行环境。仿真评测 **36/40 = 90%**。
 
-![Push-T WM-obs PPO 成功率 90%](docs/push_t_success.png)
+<p align="center">
+  <img src="docs/push_t_success.png" width="680" alt="Push-T WM-obs PPO 成功率 90%" />
+</p>
 
 ```bash
 python -m learning.train_rsl_wm_push_t \
@@ -133,9 +149,14 @@ python -m game --mode pusht   # Push-T：You vs AI split-screen (WASD vs PPO)
 
 金色是目标，红色碰一次就重来，星星是终点。右侧滑条改弹性 / 摩擦力 / 尺寸。
 
-![Spirit Push 开始菜单](docs/game/menu.png)
-
-![第 1 关 Push](docs/game/push.png)![第 3 关 Bank](docs/game/bank.png)![第 5 关 Gauntlet](docs/game/gauntlet.png)
+<p align="center">
+  <img src="docs/game/menu.png" width="640" alt="Spirit Push 开始菜单" />
+</p>
+<p align="center">
+  <img src="docs/game/push.png" width="260" alt="第 1 关 Push" />
+  <img src="docs/game/bank.png" width="260" alt="第 3 关 Bank" />
+  <img src="docs/game/gauntlet.png" width="260" alt="第 5 关 Gauntlet" />
+</p>
 
 截图再生成：`python scripts/capture_game.py`。
 

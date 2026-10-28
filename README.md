@@ -79,11 +79,19 @@ Manuscript: arXiv forthcoming (**cs.RO**, no PDF in-repo).
 | **WM + PPO**  | Push-T                          | **36/40 = 90%**      | `learning/checkpoints/push_t_wm_rsl` (+ WM `push_t`) |
 
 
-**▶ Push-T promo / You vs AI** · SuperMimic promo
+<p align="center">
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#pusht"><strong>▶ Push-T / You vs AI</strong></a>
+  ·
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>SuperMimic promo</strong></a>
+</p>
 
-![StateLeWM one-step world model: current frame to predicted next frame](docs/statelewm_worldmodel.png)
+<p align="center">
+  <img src="docs/statelewm_worldmodel.png" width="720" alt="StateLeWM one-step world model" />
+</p>
 
-![StateLeWM inference: observe, encode, latent, CEM imagination, act in FlatWorld](docs/statelewm_inference.png)
+<p align="center">
+  <img src="docs/statelewm_inference.png" width="720" alt="StateLeWM inference loop" />
+</p>
 
 ### 1. WM + CEM — Push · Two-room · Reacher
 
@@ -121,7 +129,11 @@ rigid-body WM, then improve a goal-conditioned policy by **BPTT through short
 imagined rollouts** (walk / run / sprint / dance / jump / crouch / fight /
 fall-getup). Write-up: **[supermimic2d/README.md](supermimic2d/README.md)**.
 
-**▶ Watch the promo (~33s)** · dance overlay
+<p align="center">
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>▶ Watch the promo (~33s)</strong></a>
+  ·
+  <a href="https://swaggyliu.github.io/FlatWorld/media.html#dance">dance overlay</a>
+</p>
 
 ```bash
 python -m supermimic2d.bake_refs
@@ -137,9 +149,14 @@ Underactuated T-block alignment where CEM alone is weak. Freeze Push-T StateLeWM
 (`push_t`), train **rsl-rl PPO** with policy obs = WM latents ‖ task features,
 **rewards / dynamics on real FlatWorld**, vectorized envs. Sim eval **36/40 = 90%**.
 
-![Push-T WM-obs PPO success summary 90%](docs/push_t_success.png)
-
-![Push-T WM-obs PPO train curve to 90%](docs/push_t_train_curve.png)![Push-T WM-obs PPO scene rollouts](docs/push_t_scenes.png)
+<p align="center">
+  <img src="docs/push_t_success.png" width="680" alt="Push-T WM-obs PPO success summary 90%" />
+</p>
+<p align="center">
+  <img src="docs/push_t_train_curve.png" width="480" alt="Push-T train curve" />
+  &nbsp;
+  <img src="docs/push_t_scenes.png" width="480" alt="Push-T scene rollouts" />
+</p>
 
 ```bash
 python -m learning.train_rsl_wm_push_t \
@@ -171,9 +188,14 @@ python -m game --mode pusht
 Gold is the target, red is a one-hit hazard, the star is the goal.
 Sliders set bounce / grip / size.
 
-![Spirit Push start menu](docs/game/menu.png)
-
-![Level 1 Push](docs/game/push.png)![Level 3 Bank](docs/game/bank.png)![Level 5 Gauntlet](docs/game/gauntlet.png)
+<p align="center">
+  <img src="docs/game/menu.png" width="640" alt="Spirit Push start menu" />
+</p>
+<p align="center">
+  <img src="docs/game/push.png" width="260" alt="Level 1 Push" />
+  <img src="docs/game/bank.png" width="260" alt="Level 3 Bank" />
+  <img src="docs/game/gauntlet.png" width="260" alt="Level 5 Gauntlet" />
+</p>
 
 
 | shot     | stage                                                                |
@@ -191,7 +213,14 @@ Regenerate shots: `python scripts/capture_game.py`.
 
 Live-rendered screenshots from `test2D` demos:
 
-![Domino chain](docs/gallery/domino.png)![FEM + rigid](docs/gallery/fem-rigid-mixed.png)![2D robot arm](docs/gallery/robot.png)![25 boxes](docs/gallery/rigid-25-boxes.png)![FEM height field](docs/gallery/fem-heightfield.png)![Pendulum](docs/gallery/pendulum.png)
+<p align="center">
+  <img src="docs/gallery/domino.png" width="180" alt="Domino chain" />
+  <img src="docs/gallery/fem-rigid-mixed.png" width="180" alt="FEM + rigid" />
+  <img src="docs/gallery/robot.png" width="180" alt="2D robot arm" />
+  <img src="docs/gallery/rigid-25-boxes.png" width="180" alt="25 boxes" />
+  <img src="docs/gallery/fem-heightfield.png" width="180" alt="FEM height field" />
+  <img src="docs/gallery/pendulum.png" width="180" alt="Pendulum" />
+</p>
 
 **35 scenes** — full catalog: [docs/gallery/README.md](docs/gallery/README.md)
 
