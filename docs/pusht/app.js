@@ -6,9 +6,26 @@
   const diffEl = document.getElementById("difficulty");
   const rematchBtn = document.getElementById("rematch");
   const pauseBtn = document.getElementById("pause");
-  const stickEl = document.getElementById("stick");
-  const stickBase = stickEl?.querySelector(".stick-base");
-  const stickKnob = document.getElementById("stick-knob");
+  const settingsBtn = document.getElementById("settings");
+  const settingsDialog = document.getElementById("settings-dialog");
+  const controlSelect = document.getElementById("control-mode");
+  const musicToggle = document.getElementById("music-enabled");
+  const sfxToggle = document.getElementById("sfx-enabled");
+  const hintEl = document.getElementById("control-hint");
+  const clockEl = document.getElementById("round-clock");
+  const timeEl = document.getElementById("time-left");
+  const progressEl = document.getElementById("time-progress");
+  const preferences = { mode: "drag", music: true, sfx: true };
+  try {
+    const saved = JSON.parse(localStorage.getItem("flatworld-pusht-settings") || "null");
+    if (saved?.mode === "drag" || saved?.mode === "wasd") preferences.mode = saved.mode;
+    if (typeof saved?.music === "boolean") preferences.music = saved.music;
+    if (typeof saved?.sfx === "boolean") preferences.sfx = saved.sfx;
+  } catch (_) {}
+  const sound = window.PushTAudio ? new window.PushTAudio() : {
+    unlock() {}, configure() {}, setPlaying() {}, push() {},
+  };
+  sound.configure(preferences.music, preferences.sfx);
 
   const params = new URLSearchParams(location.search);
   const endpoints = [
@@ -30,10 +47,11 @@
   let scale = 280;
   let padY = 100;
 
-  // Stick drag state (widget or YOU panel).
+  // Drag directly on the player's panel; both modes send the same bounded vector.
   let stickDragging = false;
-  let stickSource = null; // "widget" | "panel"
+  let pointerId = null;
   let panelAim = null;
+  const heldKeys = new Set();
 
   // Coalesce stick WS sends (~40Hz) while always keeping the latest vector.
   const STICK_SEND_MS = 25;
@@ -57,7 +75,6 @@
     stick.x = x;
     stick.y = y;
     stickDirty = true;
-    updateKnob(x, y);
     if (immediate) flushStick(true);
   }
 
@@ -76,13 +93,6 @@
       y = 0;
     }
     syncStick(x, y, false);
-  }
-
-  function updateKnob(x, y) {
-    if (!stickKnob || !stickBase) return;
-    const maxPx = stickBase.clientWidth * 0.28;
-    stickKnob.style.transform =
-      `translate(${x * maxPx}px, ${-y * maxPx}px)`;
   }
 
   function setDifficulty(level, rematch) {
@@ -130,6 +140,9 @@
     };
     ws.onclose = (event) => {
       state = null;
+      zeroStickIfNeeded();
+      updateSound();
+      updateClock();
       if ([1000, 1008, 1009].includes(event.code)) {
         statusEl.textContent = event.reason || "Session ended — press Rematch to reconnect";
         reconnectAt = Infinity;
@@ -154,7 +167,16 @@
           statusEl.textContent = msg.message || "error";
           return;
         }
+        if (msg.type !== "state") return;
         state = msg;
+        if (msg.paused || msg.phase === "over") zeroStickIfNeeded();
+        updateClock();
+        updateSound();
+        playPushSound(msg);
+        if (pauseBtn) {
+          pauseBtn.textContent = msg.paused ? "Resume" : "Pause";
+          pauseBtn.setAttribute("aria-pressed", String(!!msg.paused));
+        }
         if (msg.status) statusEl.textContent = msg.status;
         if (msg.difficulty && msg.difficulty !== difficulty) {
           difficulty = msg.difficulty;
@@ -228,69 +250,22 @@
     return [(sx - ox) / scale, (oy - sy) / scale];
   }
 
-  // ---- virtual joystick widget ----
-  function onStickPointerDown(e) {
-    if (!stickBase) return;
-    if (e.pointerType === "mouse" && e.button !== 0) return;
-    stickDragging = true;
-    stickSource = "widget";
-    stickBase.setPointerCapture?.(e.pointerId);
-    moveStickFromEvent(e);
-    flushStick(true);
-    e.preventDefault();
+  function canMove() {
+    return !!state && !state.paused && state.phase !== "over" && !settingsDialog?.open;
   }
 
-  function moveStickFromEvent(e) {
-    const r = stickBase.getBoundingClientRect();
-    const cx = r.left + r.width / 2;
-    const cy = r.top + r.height / 2;
-    const dx = e.clientX - cx;
-    // Screen Y down → stick Y up
-    const dy = cy - e.clientY;
-    setStickFromVector(dx, dy, r.width * 0.42);
-  }
-
-  function onStickPointerMove(e) {
-    if (!stickDragging || stickSource !== "widget") return;
-    moveStickFromEvent(e);
-    e.preventDefault();
-  }
-
-  function endStickDrag(source, e) {
-    if (!stickDragging || (source && stickSource !== source)) return;
-    stickDragging = false;
-    stickSource = null;
-    panelAim = null;
-    syncStick(0, 0, true);
-    if (e) {
-      try {
-        const el = source === "panel" ? canvas : stickBase;
-        el?.releasePointerCapture?.(e.pointerId);
-      } catch (_) {}
-    }
-  }
-
-  function onStickPointerUp(e) {
-    endStickDrag("widget", e);
-  }
-
-  if (stickBase) {
-    stickBase.addEventListener("pointerdown", onStickPointerDown);
-    stickBase.addEventListener("pointermove", onStickPointerMove);
-    stickBase.addEventListener("pointerup", onStickPointerUp);
-    stickBase.addEventListener("pointercancel", onStickPointerUp);
-    stickBase.addEventListener("lostpointercapture", () => endStickDrag("widget"));
-  }
-
-  // ---- drag on YOU panel also drives the same stick ----
+  // Dragging sets a world-space target, so holding a finger still also steers
+  // toward that point as the player moves, rather than applying stale force.
   function onCanvasPointerDown(e) {
+    sound.unlock();
+    if (preferences.mode !== "drag" || !canMove() || stickDragging) return;
     if (e.pointerType === "mouse" && e.button !== 0) return;
-    if (stickDragging && stickSource === "widget") return;
     const [sx, sy] = canvasPointFromEvent(e);
     const you = youPanelRect();
     if (sx >= you.x && sx <= you.x + you.w && sy >= you.y && sy <= you.y + you.h) {
       stickDragging = true;
-      stickSource = "panel";
+      pointerId = e.pointerId;
+      canvas.focus({ preventScroll: true });
       canvas.setPointerCapture?.(e.pointerId);
       updatePanelStick(sx, sy);
       flushStick(true);
@@ -302,44 +277,55 @@
     const you = youPanelRect();
     const world = screenToWorld(you.x, you.y, you.w, you.h, sx, sy);
     panelAim = world;
+    steerToAim();
+  }
+
+  function steerToAim() {
+    if (!panelAim) return;
     let ox = 0.95;
     let oy = 0.55;
     if (state?.left?.states?.[0]) {
       ox = state.left.states[0][0];
       oy = state.left.states[0][1];
     }
-    setStickFromVector(world[0] - ox, world[1] - oy, 0.55);
+    setStickFromVector(panelAim[0] - ox, panelAim[1] - oy, 0.55);
   }
 
   function onCanvasPointerMove(e) {
-    if (!stickDragging || stickSource !== "panel") return;
+    if (!stickDragging || e.pointerId !== pointerId) return;
     const [sx, sy] = canvasPointFromEvent(e);
     updatePanelStick(sx, sy);
     e.preventDefault();
   }
 
   function onCanvasPointerUp(e) {
-    endStickDrag("panel", e);
+    if (e.pointerId === pointerId) zeroStickIfNeeded();
   }
 
   canvas.addEventListener("pointerdown", onCanvasPointerDown);
   canvas.addEventListener("pointermove", onCanvasPointerMove);
   canvas.addEventListener("pointerup", onCanvasPointerUp);
   canvas.addEventListener("pointercancel", onCanvasPointerUp);
-  canvas.addEventListener("lostpointercapture", () => endStickDrag("panel"));
+  canvas.addEventListener("lostpointercapture", onCanvasPointerUp);
 
   // Safety: blur / tab hide zeros the stick so force never sticks.
   function zeroStickIfNeeded() {
+    heldKeys.clear();
+    const captured = pointerId;
+    pointerId = null;
     if (stickDragging || stick.x || stick.y) {
       stickDragging = false;
-      stickSource = null;
       panelAim = null;
       syncStick(0, 0, true);
+    }
+    if (captured !== null) {
+      try { canvas.releasePointerCapture?.(captured); } catch (_) {}
     }
   }
   window.addEventListener("blur", zeroStickIfNeeded);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) zeroStickIfNeeded();
+    updateSound();
   });
 
   if (diffEl) {
@@ -352,8 +338,30 @@
   rematchBtn?.addEventListener("click", () => rematch());
   pauseBtn?.addEventListener("click", () => send({ type: "pause" }));
 
-  // Shortcuts: rematch / pause / difficulty only (stick is the sole move input).
+  function movementKey(e) {
+    return { KeyW: "w", KeyA: "a", KeyS: "s", KeyD: "d" }[e.code]
+      || ("wasd".includes(e.key.toLowerCase()) && e.key.length === 1 ? e.key.toLowerCase() : null);
+  }
+
+  function syncKeys() {
+    let x = Number(heldKeys.has("d")) - Number(heldKeys.has("a"));
+    let y = Number(heldKeys.has("w")) - Number(heldKeys.has("s"));
+    const n = Math.hypot(x, y);
+    if (n > 1) { x /= n; y /= n; }
+    syncStick(x, y, true);
+  }
+
   window.addEventListener("keydown", (e) => {
+    sound.unlock();
+    if (settingsDialog?.open || e.target?.closest?.("input, select, textarea, button, a, [contenteditable]")) return;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    const move = movementKey(e);
+    if (move && preferences.mode === "wasd" && canMove()) {
+      e.preventDefault();
+      if (!heldKeys.has(move)) { heldKeys.add(move); syncKeys(); }
+      return;
+    }
+    if (e.repeat) return;
     const k = e.key.toLowerCase();
     if (k === " " || k === "r") {
       e.preventDefault();
@@ -372,8 +380,94 @@
       setDifficulty("high", true);
     }
   });
+  window.addEventListener("keyup", (e) => {
+    const move = movementKey(e);
+    if (move && heldKeys.delete(move)) { e.preventDefault(); syncKeys(); }
+  });
+  window.addEventListener("pointerdown", () => sound.unlock(), { passive: true });
   window.addEventListener("resize", resizeCanvas);
   window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 150));
+
+  function updatePreferences() {
+    if (controlSelect) controlSelect.value = preferences.mode;
+    if (musicToggle) musicToggle.checked = preferences.music;
+    if (sfxToggle) sfxToggle.checked = preferences.sfx;
+    if (hintEl) hintEl.textContent = preferences.mode === "drag"
+      ? "Drag anywhere on the YOU panel to move · release to stop · Settings for WASD"
+      : "W A S D to move · release to stop · Settings for drag controls";
+    canvas.dataset.controls = preferences.mode;
+    canvas.setAttribute("aria-label", preferences.mode === "drag"
+      ? "You versus AI. Drag on the player panel to move."
+      : "You versus AI. Use W A S D to move.");
+    sound.configure(preferences.music, preferences.sfx);
+    try { localStorage.setItem("flatworld-pusht-settings", JSON.stringify(preferences)); } catch (_) {}
+  }
+
+  settingsBtn?.addEventListener("click", () => {
+    zeroStickIfNeeded();
+    sound.unlock();
+    settingsDialog?.showModal();
+  });
+  document.getElementById("settings-close")?.addEventListener("click", () => settingsDialog?.close());
+  settingsDialog?.addEventListener("click", (e) => {
+    const rect = settingsDialog.getBoundingClientRect();
+    if (e.target === settingsDialog && (e.clientX < rect.left || e.clientX > rect.right
+        || e.clientY < rect.top || e.clientY > rect.bottom)) settingsDialog.close();
+  });
+  settingsDialog?.addEventListener("close", () => canvas.focus({ preventScroll: true }));
+  controlSelect?.addEventListener("change", () => {
+    zeroStickIfNeeded();
+    preferences.mode = controlSelect.value === "wasd" ? "wasd" : "drag";
+    updatePreferences();
+  });
+  musicToggle?.addEventListener("change", () => {
+    preferences.music = musicToggle.checked;
+    sound.unlock();
+    updatePreferences();
+  });
+  sfxToggle?.addEventListener("change", () => {
+    preferences.sfx = sfxToggle.checked;
+    sound.unlock();
+    updatePreferences();
+  });
+
+  function updateClock() {
+    if (!clockEl || !timeEl || !progressEl) return;
+    const duration = Number(state?.round_duration);
+    const remaining = Number(state?.time_remaining);
+    const valid = Number.isFinite(duration) && duration > 0 && Number.isFinite(remaining);
+    progressEl.max = valid ? duration : 1;
+    progressEl.value = valid ? Math.max(0, Math.min(duration, remaining)) : 1;
+    timeEl.textContent = valid ? `${Math.ceil(Math.max(0, remaining) * 10) / 10}s${state.paused ? " · paused" : ""}` : "—";
+    progressEl.setAttribute("aria-valuetext", valid ? `${timeEl.textContent} remaining` : "Waiting for game");
+    clockEl.dataset.urgent = String(valid && remaining <= 5 && state.phase === "race");
+  }
+
+  function updateSound() {
+    sound.setPlaying(!!state && !state.paused && state.phase !== "over", !document.hidden);
+  }
+
+  function playPushSound(msg) {
+    if (msg.phase !== "race" || msg.paused || !msg.left?.states || !msg.left?.geom) return;
+    const states = msg.left.states;
+    const geom = msg.left.geom;
+    const player = states[0];
+    if (!player || !geom[0]) return;
+    for (let i = 1; i < states.length; i++) {
+      const box = states[i];
+      if (!geom[i]) continue;
+      const dx = player[0] - box[0], dy = player[1] - box[1];
+      const c = Math.cos(box[2]), s = Math.sin(box[2]);
+      const lx = Math.abs(c * dx + s * dy), ly = Math.abs(-s * dx + c * dy);
+      const distance = Math.hypot(Math.max(0, lx - geom[i][0]), Math.max(0, ly - geom[i][1]));
+      const speed = Math.hypot(box[3] || 0, box[4] || 0);
+      const force = Math.hypot(stick.x, stick.y);
+      if (distance <= geom[0][0] + 0.02 && (speed > 0.025 || force > 0.1)) {
+        sound.push(Math.min(1, speed * 2 + force * 0.3));
+        break;
+      }
+    }
+  }
 
   function drawBox(panelX, panelY, panelW, panelH, x, y, th, hw, hh, fill, stroke) {
     const [cx, cy] = worldToScreen(panelX, panelY, panelW, panelH, x, y);
@@ -459,8 +553,7 @@
       drawSpirit(panelX, panelY, panelW, panelH, st[0][0], st[0][1], geom[0][0],
         lookX, lookY, !!side.ok);
     }
-    if (panelAim && label.startsWith("YOU") && stickDragging
-        && stickSource === "panel" && st && st.length > 0) {
+    if (panelAim && label.startsWith("YOU") && stickDragging && st && st.length > 0) {
       const [ax, ay] = worldToScreen(
         panelX, panelY, panelW, panelH, panelAim[0], panelAim[1]);
       const [sx, sy] = worldToScreen(
@@ -487,6 +580,7 @@
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       if (performance.now() >= reconnectAt) connect();
     }
+    if (stickDragging && canMove()) steerToAim();
     flushStick(false);
     resizeCanvas();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -509,7 +603,7 @@
 
     if (state) {
       drawPanel(youRect.x, youRect.y, youRect.w, youRect.h,
-        state.left, state.goal, "YOU · stick", "#62cfbe", "#182430");
+        state.left, state.goal, preferences.mode === "drag" ? "YOU · drag" : "YOU · WASD", "#62cfbe", "#182430");
       drawPanel(aiRect.x, aiRect.y, aiRect.w, aiRect.h,
         state.right, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
 
@@ -538,6 +632,8 @@
   }
 
   if (diffEl) setDifficulty(difficulty, false);
+  updatePreferences();
+  updateClock();
   resizeCanvas();
   connect();
   requestAnimationFrame(frame);

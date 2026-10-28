@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>FlatWorld — 2D physics + StateLeWM</title>
-  <link rel="stylesheet" href="pusht/style.css" />
+  <link rel="stylesheet" href="pusht/style.css?v=play3" />
   <style>
     :root {
       --ink: #152018;
@@ -96,7 +96,6 @@
     .play-shell canvas {
       width: 100%;
       height: auto;
-      max-height: min(62vh, 560px);
       display: block;
       background: #0f1412;
       border-radius: 10px;
@@ -125,52 +124,13 @@
       border-color: var(--accent);
       color: #fff;
     }
-    .play-shell .stick {
-      margin: 0.65rem 0.35rem 0.15rem;
-    }
-    .play-shell .stick-base {
-      border-color: #9bb0a4;
-      background:
-        radial-gradient(circle at 50% 50%, transparent 28%, rgba(11, 110, 79, 0.12) 29%, transparent 31%),
-        radial-gradient(circle at 50% 50%, transparent 46%, rgba(155, 176, 164, 0.45) 47%, transparent 49%),
-        repeating-conic-gradient(from 0deg, transparent 0deg 8deg, rgba(11, 110, 79, 0.06) 8deg 10deg),
-        radial-gradient(circle at 50% 42%, #eef5f1 0%, #d7e4dc 62%, #c5d5cb 100%);
-      box-shadow: inset 0 0 0 1px rgba(11, 110, 79, 0.18),
-                  0 8px 20px rgba(20, 40, 30, 0.12);
-    }
-    .play-shell .stick-base::before {
-      background: linear-gradient(
-        to bottom,
-        rgba(11, 110, 79, 0.45) 0%,
-        rgba(11, 110, 79, 0.45) 10%,
-        transparent 10%,
-        transparent 90%,
-        rgba(11, 110, 79, 0.45) 90%,
-        rgba(11, 110, 79, 0.45) 100%
-      );
-    }
-    .play-shell .stick-base::after {
-      background: linear-gradient(
-        to right,
-        rgba(11, 110, 79, 0.45) 0%,
-        rgba(11, 110, 79, 0.45) 10%,
-        transparent 10%,
-        transparent 90%,
-        rgba(11, 110, 79, 0.45) 90%,
-        rgba(11, 110, 79, 0.45) 100%
-      );
-    }
-    .play-shell .stick-knob {
-      background: radial-gradient(circle at 35% 30%, #7ad9b8, #0b6e4f 58%, #08553d);
-      border-color: rgba(255, 255, 255, 0.55);
-    }
-    .play-shell .stick-label { color: var(--muted); }
+    .play-shell .round-clock { margin: 0.15rem 0.35rem 0.7rem; width: calc(100% - 0.7rem); }
+    .play-shell .game-settings { --text: var(--ink); --bg: #fff; background: #f7faf8; }
     @media (max-width: 720px) {
       .wrap { padding: 0.85rem 0.7rem 2.5rem; }
       .brand { font-size: 1.7rem; }
       .lede { font-size: 0.95rem; margin-bottom: 0.75rem; }
       .play-shell { padding: 0.55rem; border-radius: 12px; }
-      .play-shell canvas { max-height: min(54vh, 520px); }
       .nav a { padding: 0.4rem 0.55rem; font-size: 0.85rem; }
     }
     section { margin-top: 2.2rem; }
@@ -259,7 +219,7 @@
       Warp-accelerated 2D physics with explicit FEM, impulse rigid bodies, and
       mixed-domain contact — plus StateLeWM, one latent world model with three
       controllers (CEM, BPTT, PPO). Play <strong>You vs AI</strong> below
-      (drag the 360° stick or YOU panel).
+      (drag on the YOU panel, or choose WASD in Settings).
     </p>
 
     <div class="play-shell">
@@ -281,19 +241,34 @@
         <div class="actions">
           <button type="button" id="rematch" class="action-btn">Rematch</button>
           <button type="button" id="pause" class="action-btn ghost">Pause</button>
+          <button type="button" id="settings" class="action-btn ghost" aria-haspopup="dialog">Settings</button>
         </div>
       </div>
-      <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
-      <div id="stick" class="stick" aria-label="Move stick">
-        <div class="stick-base">
-          <div class="stick-knob" id="stick-knob"></div>
-        </div>
-        <p class="stick-label">Drag to move · 360°</p>
+      <div id="round-clock" class="round-clock">
+        <div class="clock-label"><span>ROUND TIME</span><span id="time-left">—</span></div>
+        <progress id="time-progress" max="1" value="1" aria-label="Round time remaining"></progress>
       </div>
-      <p class="hint">
-        Drag the stick (mouse or finger) · also drag on the YOU panel ·
-        Rematch / difficulty · 1/2/3 · Space/R · P
-      </p>
+      <canvas id="c" width="1100" height="560" tabindex="0" aria-describedby="control-hint"></canvas>
+      <p id="control-hint" class="hint">Drag anywhere on the YOU panel to move · release to stop · Settings for WASD</p>
+      <dialog id="settings-dialog" class="game-settings" aria-labelledby="settings-title">
+        <div class="settings-heading">
+          <h2 id="settings-title">Settings</h2>
+          <button type="button" id="settings-close" class="action-btn ghost" aria-label="Close settings">Done</button>
+        </div>
+        <label class="setting-row" for="control-mode">
+          <span>Controls<small>Choose how you move</small></span>
+          <select id="control-mode"><option value="drag">Drag on the board</option><option value="wasd">W A S D</option></select>
+        </label>
+        <label class="setting-row" for="music-enabled">
+          <span>Music<small>A gentle background melody</small></span>
+          <input type="checkbox" id="music-enabled" role="switch" checked />
+        </label>
+        <label class="setting-row" for="sfx-enabled">
+          <span>Sound effects<small>Soft taps when you push the T</small></span>
+          <input type="checkbox" id="sfx-enabled" role="switch" checked />
+        </label>
+        <p class="settings-note">Sound starts after your first interaction. Your choices are saved on this device.</p>
+      </dialog>
     </div>
 
     <section>
@@ -360,7 +335,8 @@
 
     <footer>Apache-2.0 · Dongyu Liu</footer>
   </div>
-  <script src="pusht/config.js?v=secure2"></script>
-  <script src="pusht/app.js?v=secure2"></script>
+  <script src="pusht/config.js?v=play3"></script>
+  <script src="pusht/audio.js?v=play3"></script>
+  <script src="pusht/app.js?v=play3"></script>
 </body>
 </html>

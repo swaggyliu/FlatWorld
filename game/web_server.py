@@ -249,6 +249,7 @@ def _build_app(
                 session = PushTVersusSession(
                     shared=state["assets"],
                     seed=session_seed,
+                    tick_hz=hz,
                 )
 
             try:

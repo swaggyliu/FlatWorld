@@ -123,6 +123,7 @@ class PushTVersusSession:
     """You (stick) vs AI — first to seat the T wins."""
 
     COUNTDOWN_S = 3.0
+    EXTRA_ROUND_SECONDS = 10.0
     PLAYER_FORCE = 5.5  # N, within typical force_max=6
     # Physics substeps per web/desktop tick. Player uses latest stick each step;
     # AI inference is capped to once per tick so WM+PPO cannot stall the loop.
@@ -136,6 +137,7 @@ class PushTVersusSession:
         hold: int = 5,
         seed: int = 1000,
         shared: SharedPushTAssets | None = None,
+        tick_hz: float = 30.0,
     ):
         self.seed = int(seed)
         self.ep = 0
@@ -187,6 +189,12 @@ class PushTVersusSession:
             PushTTask(push_t_config(), planner_kwargs=dict(use_servo=True),
                       ee_spawn="support"),
             "AI")
+        # Preserve the old nominal web duration, then add ten playable seconds.
+        # A wall clock keeps the HUD and timeout consistent even under CPU load.
+        self.round_duration = (
+            self.left.task.budget / (max(float(tick_hz), 5.0) * self.SUBSTEPS)
+            + self.EXTRA_ROUND_SECONDS)
+        self.round_elapsed = 0.0
         self.sg = self.left.task.stem_goal
         self.bg = self.left.task.bar_goal
         self.gth = self.left.task.goal_theta
@@ -224,6 +232,8 @@ class PushTVersusSession:
         self.gth = self.left.task.goal_theta
 
         self.phase = "countdown"
+        self.paused = False
+        self.round_elapsed = 0.0
         self.countdown_left = self.COUNTDOWN_S
         self._last_wall = time.perf_counter()
         self.winner = None
@@ -318,10 +328,6 @@ class PushTVersusSession:
             side.action[:] = 0
             side.task.env.set_force((0.0, 0.0))
             return
-        if side.t >= int(side.task.budget):
-            side.done = True
-            side.action[:] = 0
-            return
         if hold_every:
             if side.hold_left <= 0:
                 side.action = action
@@ -334,11 +340,11 @@ class PushTVersusSession:
         side.t += 1
 
     def tick(self):
+        now = time.perf_counter()
+        dt = max(0.0, now - self._last_wall)
+        self._last_wall = now
         if self.paused:
             return
-        now = time.perf_counter()
-        dt = now - self._last_wall
-        self._last_wall = now
 
         if self.phase == "countdown":
             self.countdown_left = max(0.0, self.countdown_left - dt)
@@ -350,6 +356,11 @@ class PushTVersusSession:
             return
 
         if self.phase == "over":
+            return
+
+        self.round_elapsed = min(self.round_duration, self.round_elapsed + dt)
+        if self.round_elapsed >= self.round_duration:
+            self._finish_round("draw")
             return
 
         # Several physics steps per frame for readable pace.
@@ -381,17 +392,25 @@ class PushTVersusSession:
                 self.winner = "draw"
 
             if self.winner is not None:
-                self.phase = "over"
-                if self.winner == "player":
-                    self.player_wins += 1
-                    self.status = "YOU WIN!"
-                elif self.winner == "ai":
-                    self.ai_wins += 1
-                    self.status = "AI WINS"
-                else:
-                    self.draws += 1
-                    self.status = "DRAW"
+                self._finish_round(self.winner)
                 break
+
+    def _finish_round(self, winner: str):
+        self.winner = winner
+        self.phase = "over"
+        self.player_stick[:] = 0.0
+        for side in (self.left, self.right):
+            side.action[:] = 0.0
+            side.task.env.set_force((0.0, 0.0))
+        if winner == "player":
+            self.player_wins += 1
+            self.status = "YOU WIN!"
+        elif winner == "ai":
+            self.ai_wins += 1
+            self.status = "AI WINS"
+        else:
+            self.draws += 1
+            self.status = "TIME'S UP — DRAW" if self.round_elapsed >= self.round_duration else "DRAW"
 
     def close(self):
         # Shared web assets are owned by the server lifespan, not each session.
@@ -422,6 +441,8 @@ class PushTVersusSession:
             "phase": self.phase,
             "status": self.status,
             "countdown": float(self.countdown_left),
+            "round_duration": float(self.round_duration),
+            "time_remaining": max(0.0, float(self.round_duration - self.round_elapsed)),
             "winner": self.winner,
             "paused": bool(self.paused),
             "difficulty": self.difficulty,

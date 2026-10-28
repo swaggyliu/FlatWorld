@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="mobile-web-app-capable" content="yes" />
   <title>FlatWorld — You vs AI (Push-T)</title>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=play3" />
 </head>
 <body>
   <header>
     <h1>You vs AI</h1>
-    <p class="sub">Push-T · joystick 360° · WM+PPO on the right</p>
+    <p class="sub">Push-T · seat the T on the ghost goal before the AI</p>
   </header>
   <div class="bar">
     <span id="score">YOU 0 — AI 0</span>
@@ -26,20 +26,36 @@
     <div class="actions">
       <button type="button" id="rematch" class="action-btn">Rematch</button>
       <button type="button" id="pause" class="action-btn ghost">Pause</button>
+      <button type="button" id="settings" class="action-btn ghost" aria-haspopup="dialog">Settings</button>
     </div>
   </div>
-  <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
-  <div id="stick" class="stick" aria-label="Move stick">
-    <div class="stick-base">
-      <div class="stick-knob" id="stick-knob"></div>
-    </div>
-    <p class="stick-label">Drag to move · 360°</p>
+  <div id="round-clock" class="round-clock">
+    <div class="clock-label"><span>ROUND TIME</span><span id="time-left">—</span></div>
+    <progress id="time-progress" max="1" value="1" aria-label="Round time remaining"></progress>
   </div>
-  <p class="hint">
-    Drag the stick (mouse or finger) for any direction · also drag on the YOU panel ·
-    Rematch / difficulty · 1/2/3 · Space/R · P
-  </p>
-  <script src="config.js?v=secure2"></script>
-  <script src="app.js?v=secure2"></script>
+  <canvas id="c" width="1100" height="560" tabindex="0" aria-describedby="control-hint"></canvas>
+  <p id="control-hint" class="hint">Drag anywhere on the YOU panel to move · release to stop · Settings for WASD</p>
+  <dialog id="settings-dialog" class="game-settings" aria-labelledby="settings-title">
+    <div class="settings-heading">
+      <h2 id="settings-title">Settings</h2>
+      <button type="button" id="settings-close" class="action-btn ghost" aria-label="Close settings">Done</button>
+    </div>
+    <label class="setting-row" for="control-mode">
+      <span>Controls<small>Choose how you move</small></span>
+      <select id="control-mode"><option value="drag">Drag on the board</option><option value="wasd">W A S D</option></select>
+    </label>
+    <label class="setting-row" for="music-enabled">
+      <span>Music<small>A gentle background melody</small></span>
+      <input type="checkbox" id="music-enabled" role="switch" checked />
+    </label>
+    <label class="setting-row" for="sfx-enabled">
+      <span>Sound effects<small>Soft taps when you push the T</small></span>
+      <input type="checkbox" id="sfx-enabled" role="switch" checked />
+    </label>
+    <p class="settings-note">Sound starts after your first interaction. Your choices are saved on this device.</p>
+  </dialog>
+  <script src="config.js?v=play3"></script>
+  <script src="audio.js?v=play3"></script>
+  <script src="app.js?v=play3"></script>
 </body>
 </html>
