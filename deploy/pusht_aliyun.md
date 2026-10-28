@@ -73,7 +73,31 @@ Reads `deploy/local.env`. Remote scripts expect env vars:
 - `PUSHT_APP_USER` — Linux account that owns the app
 - `PUSHT_REMOTE_DIR` — checkout path (default `$HOME/flatworld`)
 
-## nginx TLS (preferred for Pages)
+## Public entry: flexphysics.com (ICP / 小程序 TCP 备案)
+
+Game process stays on node2 (`127.0.0.1:8765`). Gateway
+`www.flexphysics.com` already WebSocket-proxies `/cal/task-data/ws/` to
+node2 `:9527`. A small bridge in the compute Starlette app exposes Push-T:
+
+| URL | Role |
+|-----|------|
+| `wss://www.flexphysics.com/cal/task-data/ws/_fw` | Game WebSocket |
+| `https://www.flexphysics.com/cal/task-data/ws/_fw/health` | Health |
+
+Install / refresh the bridge (on node2, as `numericsv`):
+
+```bash
+bash deploy/mount_pusht_flexphysics.sh
+```
+
+Optional cleaner path `/flatworld/` needs a gateway nginx edit (root); see
+`deploy/gateway_nginx_flatworld_pusht.snippet.conf`. Until then the `/_fw`
+bridge is the public entry.
+
+Pages `docs/pusht/config.js` primary is the flexphysics.com WSS URL; sslip.io
+remains the fallback.
+
+## nginx TLS on node2 (sslip.io fallback)
 
 User-space (high port, self-signed — not enough for Pages):
 
@@ -87,9 +111,6 @@ System nginx + certbot (needs sudo + SG 80/443):
 ```bash
 sudo -E bash deploy/remote_nginx_sslip_root.sh
 ```
-
-Then point Pages `docs/pusht/config.js` at `wss://$PUSHT_TLS_HOST/ws`
-(without committing the literal production host in markdown docs).
 
 ## Service
 

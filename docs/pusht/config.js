@@ -27,9 +27,12 @@
     return;
   }
 
-  // Primary + fallback (base64; not rendered in the page chrome).
-  window.PUSHT_WS = dec("d3NzOi8vOC4xMzguMTUyLjE4NS5zc2xpcC5pby93cw==");
+  // Primary: flexphysics.com (ICP/TCP 备案) via gateway→node2 bridge.
+  // Fallback: direct node2 sslip.io TLS.
+  window.PUSHT_WS = dec(
+    "d3NzOi8vd3d3LmZsZXhwaHlzaWNzLmNvbS9jYWwvdGFzay1kYXRhL3dzL19mdw=="
+  );
   window.PUSHT_WS_FALLBACK = dec(
-    "d3NzOi8vaW1tZWRpYXRlLXBhbGUtaW5kaWNhdGUtZGlzcGxheWVkLnRyeWNsb3VkZmxhcmUuY29tL3dz"
+    "d3NzOi8vOC4xMzguMTUyLjE4NS5zc2xpcC5pby93cw=="
   );
 })();

@@ -40,6 +40,8 @@ from fastapi.staticfiles import StaticFiles
 
 DEFAULT_ORIGINS = frozenset({
     "https://swaggyliu.github.io",
+    "https://www.flexphysics.com",
+    "https://flexphysics.com",
     "http://localhost:8765",
     "http://127.0.0.1:8765",
 })
