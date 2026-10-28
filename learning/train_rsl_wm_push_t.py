@@ -248,6 +248,28 @@ def main():
     t0 = time.time()
     remaining = args.max_iterations
     done_iters = 0
+    # Resume mid-run: keep prior eval history / best so a worse first eval
+    # does not clobber best.pt, and continue the iteration budget.
+    summary_path = os.path.join(args.out, "train_wm_rsl_summary.json")
+    if resume_path and os.path.exists(summary_path):
+        try:
+            with open(summary_path, encoding="utf-8") as f:
+                prev = json.load(f)
+            prev_hist = list(prev.get("history") or [])
+            if prev_hist:
+                history = prev_hist
+                done_iters = int(prev_hist[-1].get("iter", 0))
+                remaining = max(0, int(args.max_iterations) - done_iters)
+            br = prev.get("best_rate", prev.get("best_train_eval_rate", None))
+            if br is not None:
+                best_rate = float(br)
+            print(
+                f"continuing summary: done_iters={done_iters} "
+                f"remaining={remaining} best_rate={best_rate}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"warning: could not load prior summary: {exc}", flush=True)
 
     while remaining > 0:
         chunk = min(args.eval_every, remaining)
