@@ -10,12 +10,57 @@ First side to succeed wins. Each round starts with a 3s countdown.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import deque
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import numpy as np
 import torch
 from tensordict import TensorDict
+
+
+@dataclass
+class SharedPushTAssets:
+    """WM + PPO loaded once and reused across concurrent web sessions."""
+
+    wm: Any
+    policy: Any
+    hold: int
+    task_features: Callable
+    device: str
+    inference_lock: threading.Lock
+    _train_env: Any = None
+
+    def close(self):
+        env = self._train_env
+        if env is not None and hasattr(env, "close"):
+            try:
+                env.close()
+            except Exception:
+                pass
+            self._train_env = None
+
+
+def load_shared_pusht_assets(
+    wm_path: str,
+    policy_path: str,
+    device: str | None = None,
+    hold: int = 5,
+) -> SharedPushTAssets:
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    wm, policy, env, hold_i, task_features = _load_policy(
+        wm_path, policy_path, device, hold)
+    return SharedPushTAssets(
+        wm=wm,
+        policy=policy,
+        hold=int(hold_i),
+        task_features=task_features,
+        device=device,
+        inference_lock=threading.Lock(),
+        _train_env=env,
+    )
 
 
 def _load_policy(wm_path: str, policy_path: str, device: str, hold: int):
@@ -87,9 +132,8 @@ class PushTVersusSession:
         device: str | None = None,
         hold: int = 5,
         seed: int = 1000,
+        shared: SharedPushTAssets | None = None,
     ):
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
         self.seed = int(seed)
         self.ep = 0
         self.paused = False
@@ -102,9 +146,24 @@ class PushTVersusSession:
         self._last_wall = time.perf_counter()
         self.status = "LOADING"
         self.player_keys = set()  # 'w','a','s','d'
+        self._shared = shared
+        self._owns_assets = shared is None
 
-        self.wm, self.policy, self._train_env, self.hold, self._task_features = (
-            _load_policy(wm_path, policy_path, device, hold))
+        if shared is not None:
+            self.device = shared.device
+            self.wm = shared.wm
+            self.policy = shared.policy
+            self.hold = int(shared.hold)
+            self._task_features = shared.task_features
+            self._train_env = None
+            self._inference_lock = shared.inference_lock
+        else:
+            device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = device
+            self.wm, self.policy, self._train_env, self.hold, self._task_features = (
+                _load_policy(wm_path, policy_path, device, hold))
+            self._inference_lock = threading.Lock()
+
         # AI difficulty: stretch hold (rarer replans) + scale force.
         # Prefer this over wall-clock sleep so the player side stays smooth.
         self._base_hold = int(self.hold)
@@ -198,18 +257,20 @@ class PushTVersusSession:
 
     @torch.no_grad()
     def _ai_action(self, cur: dict) -> np.ndarray:
-        z, _, _, _ = self.wm.encode_one(cur, use_tactile=False)
-        pose = torch.as_tensor(
-            cur["obj_states"][:, :3], dtype=torch.float32,
-            device=self.wm.device).unsqueeze(0)
-        feat = self._task_features(pose, self.sg, self.bg, self.gth)
-        x = torch.cat([z.reshape(1, -1), feat], dim=-1)
-        pol_dev = next(self.policy.parameters()).device
-        td = TensorDict({"policy": x.to(pol_dev)}, batch_size=[1])
-        a = self.policy(td, stochastic_output=False)
-        if isinstance(a, tuple):
-            a = a[0]
-        a = a.detach().float().cpu().numpy().reshape(-1)
+        # Serialize WM/policy forwards when many web sessions share weights.
+        with self._inference_lock:
+            z, _, _, _ = self.wm.encode_one(cur, use_tactile=False)
+            pose = torch.as_tensor(
+                cur["obj_states"][:, :3], dtype=torch.float32,
+                device=self.wm.device).unsqueeze(0)
+            feat = self._task_features(pose, self.sg, self.bg, self.gth)
+            x = torch.cat([z.reshape(1, -1), feat], dim=-1)
+            pol_dev = next(self.policy.parameters()).device
+            td = TensorDict({"policy": x.to(pol_dev)}, batch_size=[1])
+            a = self.policy(td, stochastic_output=False)
+            if isinstance(a, tuple):
+                a = a[0]
+            a = a.detach().float().cpu().numpy().reshape(-1)
         scale = float(self.fmax) * float(self.ai_force_scale)
         return (np.clip(a, -1.0, 1.0) * scale).astype(np.float32)
 
@@ -315,8 +376,13 @@ class PushTVersusSession:
                 break
 
     def close(self):
-        if hasattr(self, "_train_env") and hasattr(self._train_env, "close"):
-            self._train_env.close()
+        # Shared web assets are owned by the server lifespan, not each session.
+        if not self._owns_assets:
+            return
+        if hasattr(self, "_train_env") and self._train_env is not None:
+            if hasattr(self._train_env, "close"):
+                self._train_env.close()
+            self._train_env = None
 
     def snapshot(self) -> dict:
         """JSON-serializable state for the web client."""
