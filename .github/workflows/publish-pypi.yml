@@ -1,7 +1,8 @@
-# Publish flatworld to PyPI via Trusted Publisher (OIDC). No API tokens.
-# After configuring the Trusted Publisher on pypi.org, users can: pip install flatworld
+# Publish flat-world-model to PyPI via Trusted Publisher (OIDC). No API tokens.
+# After configuring the Trusted Publisher on pypi.org: pip install flat-world-model
 #
 # PyPI Trusted Publisher settings (create pending publisher if project is new):
+#   PyPI project name: flat-world-model
 #   Owner: swaggyliu
 #   Repository: FlatWorld
 #   Workflow name: publish-pypi.yml
@@ -22,6 +23,7 @@ jobs:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
     permissions:
+      contents: read   # job perms replace workflow perms; needed for actions/checkout
       id-token: write  # required for OIDC Trusted Publishing
 
     steps:

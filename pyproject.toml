@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flatworld"
+name = "flat-world-model"
 version = "0.20.0"
 description = "Warp-based 2D/3D physics engine with FEM, rigid bodies, and mixed contact"
 readme = "README.md"
@@ -46,12 +46,8 @@ learning = [
 game = [
     "raylib>=5.0",
 ]
-web = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
-]
 all = [
-    "flatworld[dev,learning,game]",
+    "flat-world-model[dev,learning,game]",
 ]
 
 [project.urls]

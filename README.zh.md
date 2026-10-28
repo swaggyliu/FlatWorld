@@ -23,12 +23,16 @@
 发布到 PyPI（Trusted Publisher / OIDC）后可直接：
 
 ```bash
-pip install flatworld
+pip install flat-world-model
 ```
+
+安装后用 `import flatworld`（PyPI 包名与 import 名不同）：
 
 从源码安装：
 
 ```bash
+git clone https://github.com/swaggyliu/FlatWorld.git
+cd FlatWorld
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -74,6 +78,13 @@ pytest test2D -q
 </p>
 
 <p align="center">
+  <video src="docs/media/pusht_promo.mp4" width="680" controls playsinline muted></video>
+</p>
+<p align="center">
+  <video src="docs/media/promo_supermimic.mp4" width="680" controls playsinline muted></video>
+</p>
+
+<p align="center">
   <img src="docs/statelewm_worldmodel.png" width="720" alt="StateLeWM 一步预测" />
 </p>
 
@@ -110,9 +121,7 @@ pytest test2D -q
 FlatWorld 上的 **2D [SuperMimic](https://supermimic.github.io/)**：拟合共享刚体世界模型，再在短想象轨迹上 **BPTT** 改进目标条件策略。说明：**[supermimic2d/README.md](supermimic2d/README.md)**。
 
 <p align="center">
-  <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>▶ 观看宣传片（约 33 秒）</strong></a>
-  ·
-  <a href="https://swaggyliu.github.io/FlatWorld/media.html#dance">dance 对比</a>
+  <video src="docs/media/promo_supermimic.mp4" width="640" controls playsinline muted></video>
 </p>
 
 ```bash

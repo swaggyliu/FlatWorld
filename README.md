@@ -23,8 +23,10 @@ Warp-accelerated **2D** physics engine with **explicit FEM**, **impulse-based ri
 Once published to PyPI (Trusted Publisher / OIDC):
 
 ```bash
-pip install flatworld
+pip install flat-world-model
 ```
+
+Import the installed package as `flatworld` (PyPI name ≠ import name):
 
 From source:
 
@@ -91,15 +93,13 @@ Manuscript: arXiv forthcoming (**cs.RO**, no PDF in-repo).
   <a href="https://swaggyliu.github.io/FlatWorld/media.html#pusht"><strong>▶ Push-T / You vs AI</strong></a>
   ·
   <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>SuperMimic promo</strong></a>
-  ·
-  <a href="https://swaggyliu.github.io/FlatWorld/media.html#dance"><strong>dance overlay</strong></a>
 </p>
 
 <p align="center">
-  <video src="https://swaggyliu.github.io/FlatWorld/media/pusht_promo.mp4" width="680" controls playsinline preload="metadata"></video>
+  <video src="docs/media/pusht_promo.mp4" width="680" controls playsinline muted></video>
 </p>
 <p align="center">
-  <video src="https://swaggyliu.github.io/FlatWorld/media/promo_supermimic.mp4" width="680" controls playsinline preload="metadata"></video>
+  <video src="docs/media/promo_supermimic.mp4" width="680" controls playsinline muted></video>
 </p>
 
 <p align="center">
@@ -147,14 +147,7 @@ imagined rollouts** (walk / run / sprint / dance / jump / crouch / fight /
 fall-getup). Write-up: **[supermimic2d/README.md](supermimic2d/README.md)**.
 
 <p align="center">
-  <a href="https://swaggyliu.github.io/FlatWorld/media.html#supermimic"><strong>▶ Watch the promo (~33s)</strong></a>
-  ·
-  <a href="https://swaggyliu.github.io/FlatWorld/media.html#dance">dance overlay</a>
-</p>
-<p align="center">
-  <video src="https://swaggyliu.github.io/FlatWorld/media/promo_supermimic.mp4" width="640" controls playsinline preload="metadata"></video>
-  &nbsp;
-  <video src="https://swaggyliu.github.io/FlatWorld/media/dance_overlay.mp4" width="640" controls playsinline preload="metadata"></video>
+  <video src="docs/media/promo_supermimic.mp4" width="640" controls playsinline muted></video>
 </p>
 
 ```bash
