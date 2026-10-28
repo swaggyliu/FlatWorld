@@ -9,18 +9,21 @@
   const settingsBtn = document.getElementById("settings");
   const settingsDialog = document.getElementById("settings-dialog");
   const controlSelect = document.getElementById("control-mode");
+  const durationInput = document.getElementById("round-duration");
   const musicToggle = document.getElementById("music-enabled");
   const sfxToggle = document.getElementById("sfx-enabled");
   const hintEl = document.getElementById("control-hint");
   const clockEl = document.getElementById("round-clock");
   const timeEl = document.getElementById("time-left");
   const progressEl = document.getElementById("time-progress");
-  const preferences = { mode: "drag", music: true, sfx: true };
+  const validDuration = value => Number.isInteger(value) && value >= 10 && value <= 180;
+  const preferences = { mode: "drag", music: true, sfx: true, duration: 30 };
   try {
     const saved = JSON.parse(localStorage.getItem("flatworld-pusht-settings") || "null");
     if (saved?.mode === "drag" || saved?.mode === "wasd") preferences.mode = saved.mode;
     if (typeof saved?.music === "boolean") preferences.music = saved.music;
     if (typeof saved?.sfx === "boolean") preferences.sfx = saved.sfx;
+    if (validDuration(saved?.duration)) preferences.duration = saved.duration;
   } catch (_) {}
   const sound = window.PushTAudio ? new window.PushTAudio() : {
     unlock() {}, configure() {}, setPlaying() {}, push() {},
@@ -38,6 +41,8 @@
 
   let stick = { x: 0, y: 0 };
   let state = null;
+  let clock = null;
+  const motion = new window.PushTMotion();
   let ws = null;
   let reconnectAt = 0;
   let everOpened = false;
@@ -103,7 +108,11 @@
       }
     }
     send({ type: "difficulty", level });
-    if (rematch) send({ type: "rematch" });
+    if (rematch) sendRematch();
+  }
+
+  function sendRematch() {
+    send({ type: "rematch", round_duration: preferences.duration });
   }
 
   function rematch() {
@@ -115,7 +124,7 @@
       connect();
       return;
     }
-    send({ type: "rematch" });
+    sendRematch();
   }
 
   function connect() {
@@ -134,12 +143,14 @@
       everOpened = true;
       retryDelay = 1500;
       statusEl.textContent = "connected";
-      send({ type: "hello" });
+      send({ type: "hello", round_duration: preferences.duration });
       send({ type: "difficulty", level: difficulty });
       syncStick(stick.x, stick.y, true);
     };
     ws.onclose = (event) => {
       state = null;
+      clock = null;
+      motion.clear();
       zeroStickIfNeeded();
       updateSound();
       updateClock();
@@ -169,6 +180,8 @@
         }
         if (msg.type !== "state") return;
         state = msg;
+        motion.push(msg, performance.now());
+        receiveClock(msg);
         if (msg.paused || msg.phase === "over") zeroStickIfNeeded();
         updateClock();
         updateSound();
@@ -390,6 +403,7 @@
 
   function updatePreferences() {
     if (controlSelect) controlSelect.value = preferences.mode;
+    if (durationInput) durationInput.value = preferences.duration;
     if (musicToggle) musicToggle.checked = preferences.music;
     if (sfxToggle) sfxToggle.checked = preferences.sfx;
     if (hintEl) hintEl.textContent = preferences.mode === "drag"
@@ -408,18 +422,31 @@
     sound.unlock();
     settingsDialog?.showModal();
   });
-  document.getElementById("settings-close")?.addEventListener("click", () => settingsDialog?.close());
+  function saveDuration() {
+    if (!durationInput) return;
+    const seconds = Number(durationInput.value);
+    if (validDuration(seconds)) preferences.duration = seconds;
+    updatePreferences();
+  }
+  document.getElementById("settings-close")?.addEventListener("click", () => {
+    saveDuration();
+    settingsDialog?.close();
+  });
   settingsDialog?.addEventListener("click", (e) => {
     const rect = settingsDialog.getBoundingClientRect();
     if (e.target === settingsDialog && (e.clientX < rect.left || e.clientX > rect.right
         || e.clientY < rect.top || e.clientY > rect.bottom)) settingsDialog.close();
   });
-  settingsDialog?.addEventListener("close", () => canvas.focus({ preventScroll: true }));
+  settingsDialog?.addEventListener("close", () => {
+    saveDuration();
+    canvas.focus({ preventScroll: true });
+  });
   controlSelect?.addEventListener("change", () => {
     zeroStickIfNeeded();
     preferences.mode = controlSelect.value === "wasd" ? "wasd" : "drag";
     updatePreferences();
   });
+  durationInput?.addEventListener("change", saveDuration);
   musicToggle?.addEventListener("change", () => {
     preferences.music = musicToggle.checked;
     sound.unlock();
@@ -431,16 +458,40 @@
     updatePreferences();
   });
 
+  function receiveClock(msg) {
+    let duration = msg.round_duration;
+    let remaining = msg.time_remaining;
+    if (!(Number.isFinite(duration) && duration > 0 && Number.isFinite(remaining))) {
+      // Protocol v1 has no seconds fields. Use its actual 1,100-step budget;
+      // do not pretend that an old game server includes the new extra 10s.
+      const steps = [msg.left?.t, msg.right?.t].filter(value => Number.isFinite(value) && value >= 0);
+      if (!steps.length) { clock = null; return; }
+      const stepsPerSecond = 30 * 3;
+      duration = 1100 / stepsPerSecond;
+      remaining = msg.phase === "countdown" ? duration : duration - Math.max(...steps) / stepsPerSecond;
+    }
+    clock = { duration, remaining: Math.max(0, Math.min(duration, remaining)),
+      receivedAt: performance.now(), running: msg.phase === "race" && !msg.paused };
+  }
+
   function updateClock() {
     if (!clockEl || !timeEl || !progressEl) return;
-    const duration = Number(state?.round_duration);
-    const remaining = Number(state?.time_remaining);
-    const valid = Number.isFinite(duration) && duration > 0 && Number.isFinite(remaining);
-    progressEl.max = valid ? duration : 1;
-    progressEl.value = valid ? Math.max(0, Math.min(duration, remaining)) : 1;
-    timeEl.textContent = valid ? `${Math.ceil(Math.max(0, remaining) * 10) / 10}s${state.paused ? " · paused" : ""}` : "—";
-    progressEl.setAttribute("aria-valuetext", valid ? `${timeEl.textContent} remaining` : "Waiting for game");
-    clockEl.dataset.urgent = String(valid && remaining <= 5 && state.phase === "race");
+    if (!clock) {
+      progressEl.removeAttribute("value");
+      timeEl.textContent = "—";
+      progressEl.setAttribute("aria-valuetext", "Waiting for game");
+      clockEl.dataset.urgent = "false";
+      return;
+    }
+    // Smooth normal network intervals; stop extrapolating after a second
+    // without a snapshot so an interrupted connection cannot invent a timeout.
+    const elapsed = clock.running ? Math.min(1, Math.max(0, (performance.now() - clock.receivedAt) / 1000)) : 0;
+    const remaining = Math.max(0, clock.remaining - elapsed);
+    progressEl.max = clock.duration;
+    progressEl.value = remaining;
+    timeEl.textContent = `${Math.ceil(remaining * 10) / 10}s${state?.paused ? " · paused" : ""}`;
+    progressEl.setAttribute("aria-valuetext", `${timeEl.textContent} remaining`);
+    clockEl.dataset.urgent = String(remaining <= 5 && clock.running);
   }
 
   function updateSound() {
@@ -582,6 +633,7 @@
     }
     if (stickDragging && canMove()) steerToAim();
     flushStick(false);
+    updateClock();
     resizeCanvas();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -602,10 +654,11 @@
     }
 
     if (state) {
+      const rendered = motion.sample(performance.now()) || state;
       drawPanel(youRect.x, youRect.y, youRect.w, youRect.h,
-        state.left, state.goal, preferences.mode === "drag" ? "YOU · drag" : "YOU · WASD", "#62cfbe", "#182430");
+        rendered.left, state.goal, preferences.mode === "drag" ? "YOU · drag" : "YOU · WASD", "#62cfbe", "#182430");
       drawPanel(aiRect.x, aiRect.y, aiRect.w, aiRect.h,
-        state.right, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
+        rendered.right, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
 
       const overlay = state.phase === "over" ? state.status
         : (state.phase === "countdown"

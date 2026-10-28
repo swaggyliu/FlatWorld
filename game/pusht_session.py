@@ -123,10 +123,13 @@ class PushTVersusSession:
     """You (stick) vs AI — first to seat the T wins."""
 
     COUNTDOWN_S = 3.0
-    EXTRA_ROUND_SECONDS = 10.0
+    DEFAULT_ROUND_SECONDS = 30
+    MIN_ROUND_SECONDS = 10
+    MAX_ROUND_SECONDS = 180
     PLAYER_FORCE = 5.5  # N, within typical force_max=6
     # Physics substeps per web/desktop tick. Player uses latest stick each step;
-    # AI inference is capped to once per tick so WM+PPO cannot stall the loop.
+    # With the default five-step action hold, AI inference runs at most once
+    # per tick. Easier modes advance only the AI simulation more slowly.
     SUBSTEPS = 3
 
     def __init__(
@@ -170,11 +173,12 @@ class PushTVersusSession:
                 _load_policy(wm_path, policy_path, device, hold))
             self._inference_lock = threading.Lock()
 
-        # AI difficulty: stretch hold (rarer replans) + scale force.
-        # Prefer this over wall-clock sleep so the player side stays smooth.
-        self._base_hold = int(self.hold)
+        # Keep the trained control cadence and force at every difficulty.
+        # Only the AI's simulation progress changes with difficulty.
+        self._base_hold = max(1, int(self.hold))
         self.difficulty = "medium"
-        self.ai_force_scale = 1.0
+        self.ai_speed = 1.0
+        self._ai_step_credit = 0.0
 
         from learning.tasks.push_t import PushTTask, push_t_config
         cfg = push_t_config()
@@ -189,11 +193,9 @@ class PushTVersusSession:
             PushTTask(push_t_config(), planner_kwargs=dict(use_servo=True),
                       ee_spawn="support"),
             "AI")
-        # Preserve the old nominal web duration, then add ten playable seconds.
-        # A wall clock keeps the HUD and timeout consistent even under CPU load.
-        self.round_duration = (
-            self.left.task.budget / (max(float(tick_hz), 5.0) * self.SUBSTEPS)
-            + self.EXTRA_ROUND_SECONDS)
+        # A wall clock keeps the HUD and timeout consistent under CPU load.
+        self.selected_round_duration = self.DEFAULT_ROUND_SECONDS
+        self.round_duration = self.selected_round_duration
         self.round_elapsed = 0.0
         self.sg = self.left.task.stem_goal
         self.bg = self.left.task.bar_goal
@@ -201,17 +203,14 @@ class PushTVersusSession:
         self._set_difficulty("medium")
         self.reset()
     def reset(self):
-        seed = self.seed + self.ep
-        rng_l = np.random.default_rng(seed)
-        rng_r = np.random.default_rng(seed)
-
-        for side, rng in ((self.left, rng_l), (self.right, rng_r)):
+        for side in (self.left, self.right):
+            # Original reset: random starting pose per round, identical on both
+            # sides. T geometry and goal stay fixed in push_t_config().
+            rng = np.random.default_rng(self.seed + self.ep)
             side.task.env.reset(rng)
             side.task.env.set_ee_radius(
                 float(side.task.cfg.scene.ee_radius) * side.task.ee_scale)
-            goal = side.task.sample_goal(rng, side.task.observe())
-            side.task.goal = goal
-            # Keep goals identical (sample_goal may be deterministic given state).
+            side.task.goal = side.task.sample_goal(rng, side.task.observe())
             side.trail.clear()
             side.action[:] = 0
             side.hold_left = 0
@@ -220,19 +219,14 @@ class PushTVersusSession:
             side.t = 0
             side.task.env.set_force((0.0, 0.0))
 
-        # Force right side to use left's goal pose targets.
-        self.right.task.stem_goal = np.asarray(
-            self.left.task.stem_goal, dtype=np.float32).copy()
-        self.right.task.bar_goal = np.asarray(
-            self.left.task.bar_goal, dtype=np.float32).copy()
-        self.right.task.goal_theta = float(self.left.task.goal_theta)
-        self.right.task.goal = self.left.task.goal
         self.sg = self.left.task.stem_goal
         self.bg = self.left.task.bar_goal
         self.gth = self.left.task.goal_theta
 
         self.phase = "countdown"
         self.paused = False
+        self._ai_step_credit = 0.0
+        self.round_duration = self.selected_round_duration
         self.round_elapsed = 0.0
         self.countdown_left = self.COUNTDOWN_S
         self._last_wall = time.perf_counter()
@@ -243,6 +237,15 @@ class PushTVersusSession:
     def next_episode(self):
         self.ep += 1
         self.reset()
+
+    def set_round_duration(self, seconds: int):
+        """Apply to the next round, or the opening countdown on connection."""
+        if (type(seconds) is not int
+                or not self.MIN_ROUND_SECONDS <= seconds <= self.MAX_ROUND_SECONDS):
+            raise ValueError("Round duration must be an integer from 10 to 180 seconds.")
+        self.selected_round_duration = seconds
+        if self.phase == "countdown":
+            self.round_duration = seconds
 
     def set_stick(self, x: float, y: float):
         """Virtual joystick: x right, y up, each clamped to [-1, 1].
@@ -292,16 +295,15 @@ class PushTVersusSession:
             if isinstance(a, tuple):
                 a = a[0]
             a = a.detach().float().cpu().numpy().reshape(-1)
-        scale = float(self.fmax) * float(self.ai_force_scale)
-        return (np.clip(a, -1.0, 1.0) * scale).astype(np.float32)
+        return (np.clip(a, -1.0, 1.0) * self.fmax).astype(np.float32)
 
-    # hold_mult: AI keeps an action longer → fewer policy evals (easier).
-    # force_scale: weaker pushes on easier modes.
-    # Slightly longer holds cut CPU WM+PPO cost on multi-session CPU hosts.
+    # Legacy protocol keys remain compatible with existing browser clients.
+    # Slow the complete AI trajectory, preserving its trained force/dynamics
+    # and one decision per base_hold AI physics steps (normally five).
     _DIFFICULTY = {
-        "low": {"hold_mult": 5, "force_scale": 0.55},
-        "medium": {"hold_mult": 3, "force_scale": 0.78},
-        "high": {"hold_mult": 2, "force_scale": 1.0},
+        "low": {"speed": 0.55},
+        "medium": {"speed": 0.78},
+        "high": {"speed": 1.0},
     }
 
     def _set_difficulty(self, level: str) -> str:
@@ -310,17 +312,14 @@ class PushTVersusSession:
             key = "medium"
         cfg = self._DIFFICULTY[key]
         self.difficulty = key
-        self.ai_force_scale = float(cfg["force_scale"])
-        self.hold = max(1, int(self._base_hold) * int(cfg["hold_mult"]))
-        # Refresh hold countdown so the new cadence applies immediately.
-        if hasattr(self, "right") and self.right is not None:
-            self.right.hold_left = 0
+        self.ai_speed = float(cfg["speed"])
+        self.hold = self._base_hold
         return key
     def _step_side(self, side: _Side, action: np.ndarray, hold_every: bool):
         if side.done:
             return
         cur = side.task.observe()
-        st = cur["obj_states"]
+        st = side.task.env.raw_states()
         side.trail.append((float(st[0, 0]), float(st[0, 1])))
         if side.task.succeeded(cur, side.task.goal):
             side.ok = True
@@ -363,31 +362,29 @@ class PushTVersusSession:
             self._finish_round("draw")
             return
 
-        # Several physics steps per frame for readable pace.
-        # Cap WM+PPO to one forward per tick: on CPU hosts (and multi-session
-        # shared inference_lock) repeated encodes were the main hitch source.
-        ai_a = None
+        # Accumulate fractional AI steps so difficulty changes playback speed,
+        # rather than stretching actions or weakening their contact forces.
         for _ in range(self.SUBSTEPS):
             if self.phase != "race":
                 break
             # Latest stick each substep (may be updated mid-tick by WS reader).
             self._step_side(self.left, self._player_force(), hold_every=False)
-            if self.right.hold_left <= 0:
-                if ai_a is None:
-                    ai_a = self._ai_action(self.right.task.observe())
-                step_a = ai_a
-            else:
-                step_a = self.right.action
-            self._step_side(self.right, step_a, hold_every=True)
+            if not self.right.done:
+                self._ai_step_credit += self.ai_speed
+                if self._ai_step_credit >= 1.0 - 1e-9:
+                    self._ai_step_credit = max(0.0, self._ai_step_credit - 1.0)
+                    step_a = (self._ai_action(self.right.task.observe())
+                              if self.right.hold_left <= 0 else self.right.action)
+                    self._step_side(self.right, step_a, hold_every=True)
 
             if self.left.ok and not self.right.ok:
                 self.winner = "player"
             elif self.right.ok and not self.left.ok:
                 self.winner = "ai"
             elif self.left.ok and self.right.ok:
-                # Same tick — closer time wins; treat as draw if both.
-                self.winner = "draw" if self.left.t == self.right.t else (
-                    "player" if self.left.t < self.right.t else "ai")
+                # Both completed on this race substep. AI physics-step counts
+                # differ by speed and cannot be used as elapsed race time.
+                self.winner = "draw"
             elif self.left.done and self.right.done:
                 self.winner = "draw"
 
@@ -424,9 +421,10 @@ class PushTVersusSession:
     def snapshot(self) -> dict:
         """JSON-serializable state for the web client."""
         def _side(side: _Side) -> dict:
-            obs = side.task.observe()
-            st = np.asarray(obs["obj_states"], dtype=np.float32)
-            geom = np.asarray(obs["obj_geom"], dtype=np.float32)
+            # Sensor noise belongs to the policy's observations, never the HUD.
+            # Reading raw state also avoids consuming the policy's noise RNG.
+            st = side.task.env.raw_states()
+            geom = side.task.env.obj_geom
             return {
                 "states": st.tolist(),
                 "geom": geom.tolist(),
@@ -438,6 +436,7 @@ class PushTVersusSession:
             }
 
         return {
+            "round_id": self.ep,
             "phase": self.phase,
             "status": self.status,
             "countdown": float(self.countdown_left),
@@ -446,6 +445,10 @@ class PushTVersusSession:
             "winner": self.winner,
             "paused": bool(self.paused),
             "difficulty": self.difficulty,
+            "shape": {
+                "symmetric": True,
+                "bar_offset": 0.0,
+            },
             "score": {
                 "you": int(self.player_wins),
                 "ai": int(self.ai_wins),

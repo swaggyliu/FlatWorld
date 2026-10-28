@@ -199,6 +199,18 @@ h1 {
   font-size: 0.85rem;
 }
 .setting-row input { width: 22px; height: 22px; margin: 0 0.6rem; accent-color: var(--accent); flex-shrink: 0; }
+.setting-row input[type="number"] {
+  width: 5rem;
+  height: 44px;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
 .settings-note { margin: 0.5rem 0 0; color: var(--muted); font-size: 0.75rem; line-height: 1.5; }
 
 @media (max-width: 720px), (pointer: coarse) {

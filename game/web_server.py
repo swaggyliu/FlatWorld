@@ -9,7 +9,7 @@ Each WebSocket connection gets an isolated game session (shared WM/PPO weights).
 
 Protocol (JSON text frames)::
 
-    client -> {"type":"hello"}
+    client -> {"type":"hello","round_duration":30}
     client -> {"type":"stick","x":0.5,"y":-0.2}  # virtual joystick [-1,1]
     client -> {"type":"keys","down":["w","a"]}    # legacy WASD/D-pad (mapped to stick)
     client -> {"type":"rematch"}
@@ -337,7 +337,17 @@ def _build_app(
                             if fx or fy:
                                 last_activity = now
                             continue
+                        # Optional on hello/rematch for cached clients. Reject
+                        # booleans, floats and unbounded values before mutation.
+                        if typ in {"hello", "rematch"} and "round_duration" in msg:
+                            seconds = msg["round_duration"]
+                            if type(seconds) is not int or not 10 <= seconds <= 180:
+                                close_code, close_reason = 1008, "Invalid round duration."
+                                return
                         if typ == "hello":
+                            if "round_duration" in msg:
+                                async with session_lock:
+                                    obj.set_round_duration(msg["round_duration"])
                             continue
                         if typ not in {"rematch", "pause", "difficulty"}:
                             close_code, close_reason = 1008, "Unknown game message."
@@ -358,6 +368,8 @@ def _build_app(
                             last_control = now
                         async with session_lock:
                             if typ == "rematch":
+                                if "round_duration" in msg:
+                                    obj.set_round_duration(msg["round_duration"])
                                 await _in_thread(obj.next_episode)
                             elif typ == "pause":
                                 obj.paused = not obj.paused
@@ -459,7 +471,8 @@ def main():
     ap.add_argument("--policy",
                     default="learning/checkpoints/push_t_wm_rsl/best.pt")
     ap.add_argument("--hold", type=int, default=5)
-    ap.add_argument("--seed", type=int, default=1000)
+    ap.add_argument("--seed", type=int, default=1000,
+                    help="Seed for the original randomized starting poses.")
     # 30Hz broadcast; tick sleep accounts for AI overrun (see writer).
     ap.add_argument("--hz", type=float, default=30.0)
     ap.add_argument("--max-sessions", type=int, default=8,

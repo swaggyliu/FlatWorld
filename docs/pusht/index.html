@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="mobile-web-app-capable" content="yes" />
   <title>FlatWorld — You vs AI (Push-T)</title>
-  <link rel="stylesheet" href="style.css?v=play3" />
+  <link rel="stylesheet" href="style.css?v=round5" />
 </head>
 <body>
   <header>
@@ -19,9 +19,9 @@
   <div class="toolbar">
     <div id="difficulty" class="difficulty" aria-label="AI difficulty">
       <span>AI</span>
-      <button type="button" data-level="low">Low</button>
-      <button type="button" data-level="medium" class="active">Medium</button>
-      <button type="button" data-level="high">High</button>
+      <button type="button" data-level="low">Easy</button>
+      <button type="button" data-level="medium" class="active">Normal</button>
+      <button type="button" data-level="high">Hard</button>
     </div>
     <div class="actions">
       <button type="button" id="rematch" class="action-btn">Rematch</button>
@@ -44,6 +44,10 @@
       <span>Controls<small>Choose how you move</small></span>
       <select id="control-mode"><option value="drag">Drag on the board</option><option value="wasd">W A S D</option></select>
     </label>
+    <label class="setting-row" for="round-duration">
+      <span>Round length<small>10–180 seconds · applies next round</small></span>
+      <input type="number" id="round-duration" min="10" max="180" step="1" value="30" aria-label="Round length in seconds" />
+    </label>
     <label class="setting-row" for="music-enabled">
       <span>Music<small>A gentle background melody</small></span>
       <input type="checkbox" id="music-enabled" role="switch" checked />
@@ -56,6 +60,7 @@
   </dialog>
   <script src="config.js?v=play3"></script>
   <script src="audio.js?v=play3"></script>
-  <script src="app.js?v=play3"></script>
+  <script src="motion.js?v=round5"></script>
+  <script src="app.js?v=round5"></script>
 </body>
 </html>
