@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlatWorld — You vs AI (Push-T)</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>You vs AI</h1>
+    <p class="sub">Push-T · WASD left · frozen WM+PPO right</p>
+  </header>
+  <div class="bar">
+    <span id="score">YOU 0 — AI 0</span>
+    <span id="status">connecting…</span>
+    <span id="backend"></span>
+  </div>
+  <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
+  <p class="hint">WASD move · Space/R rematch · P pause · click canvas to focus</p>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

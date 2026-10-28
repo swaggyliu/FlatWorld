@@ -53,7 +53,8 @@ def _load_policy(wm_path: str, policy_path: str, device: str, hold: int):
     log_dir = os.path.join(os.path.dirname(policy_path), "_game_logs")
     os.makedirs(log_dir, exist_ok=True)
     runner = OnPolicyRunner(env, cfg, log_dir=log_dir, device=device)
-    runner.load(policy_path)
+    # Checkpoints may be CUDA-saved; map onto the requested device (CPU node OK).
+    runner.load(policy_path, map_location=device)
     policy = runner.get_inference_policy(device=device)
     return wm, policy, env, hold, task_features
 
@@ -290,6 +291,42 @@ class PushTVersusSession:
     def close(self):
         if hasattr(self, "_train_env") and hasattr(self._train_env, "close"):
             self._train_env.close()
+
+    def snapshot(self) -> dict:
+        """JSON-serializable state for the web client."""
+        def _side(side: _Side) -> dict:
+            obs = side.task.observe()
+            st = np.asarray(obs["obj_states"], dtype=np.float32)
+            geom = np.asarray(obs["obj_geom"], dtype=np.float32)
+            return {
+                "states": st.tolist(),
+                "geom": geom.tolist(),
+                "action": [float(side.action[0]), float(side.action[1])],
+                "trail": [[float(x), float(y)] for x, y in side.trail],
+                "ok": bool(side.ok),
+                "done": bool(side.done),
+                "t": int(side.t),
+            }
+
+        return {
+            "phase": self.phase,
+            "status": self.status,
+            "countdown": float(self.countdown_left),
+            "winner": self.winner,
+            "paused": bool(self.paused),
+            "score": {
+                "you": int(self.player_wins),
+                "ai": int(self.ai_wins),
+                "draw": int(self.draws),
+            },
+            "goal": {
+                "stem": [float(self.sg[0]), float(self.sg[1])],
+                "bar": [float(self.bg[0]), float(self.bg[1])],
+                "theta": float(self.gth),
+            },
+            "left": _side(self.left),
+            "right": _side(self.right),
+        }
 
 
 # Back-compat alias for older imports.
