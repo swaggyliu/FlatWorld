@@ -3,7 +3,7 @@
 Usage (repo root):
     python -m game
     python -m game --checkpoint learning/checkpoints/push_game
-    python -m game --mode pusht          # split-screen: WASD vs WM+PPO
+    python -m game --mode pusht          # split-screen: stick/WASD vs WM+PPO
 """
 
 from __future__ import annotations
@@ -186,9 +186,6 @@ def _run_pusht(args, device: str):
     except Exception as exc:
         error = str(exc)
 
-    key_map = {
-        rl.KEY_W: "w", rl.KEY_A: "a", rl.KEY_S: "s", rl.KEY_D: "d",
-    }
     while not rl.window_should_close():
         if rl.is_key_pressed(rl.KEY_ESCAPE):
             break
@@ -197,11 +194,17 @@ def _run_pusht(args, device: str):
                 session.next_episode()
             if rl.is_key_pressed(rl.KEY_P):
                 session.paused = not session.paused
-            for code, name in key_map.items():
-                if rl.is_key_down(code):
-                    session.set_key(name, True)
-                else:
-                    session.set_key(name, False)
+            # Desktop local play: map WASD → stick (web is stick-only).
+            fx = fy = 0.0
+            if rl.is_key_down(rl.KEY_A):
+                fx -= 1.0
+            if rl.is_key_down(rl.KEY_D):
+                fx += 1.0
+            if rl.is_key_down(rl.KEY_W):
+                fy += 1.0
+            if rl.is_key_down(rl.KEY_S):
+                fy -= 1.0
+            session.set_stick(fx, fy)
             session.tick()
 
         rl.begin_drawing()
@@ -238,7 +241,7 @@ def _run_pusht(args, device: str):
                 score_line=(
                     f"YOU {session.player_wins}   vs   AI {session.ai_wins}"
                     f"   (draw {session.draws})"),
-                hint=("WASD move   Space/R rematch   P pause   Esc quit"
+                hint=("WASD→stick   Space/R rematch   P pause   Esc quit"
                       + ("   · PAUSED" if session.paused else "")),
                 goal_theta=float(session.gth))
         rl.end_drawing()

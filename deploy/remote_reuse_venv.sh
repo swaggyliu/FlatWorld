@@ -41,8 +41,11 @@ Type=simple
 WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=FLATWORLD_DEVICE=cpu
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
 Environment=VIRTUAL_ENV=${VENV}
-ExecStart=${PY} -m game.web_server --host 0.0.0.0 --port 8765
+ExecStart=${PY} -m game.web_server --host 0.0.0.0 --port 8765 --hz 30
 Restart=on-failure
 RestartSec=5
 

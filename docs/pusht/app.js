@@ -6,7 +6,9 @@
   const diffEl = document.getElementById("difficulty");
   const rematchBtn = document.getElementById("rematch");
   const pauseBtn = document.getElementById("pause");
-  const padEl = document.getElementById("pad");
+  const stickEl = document.getElementById("stick");
+  const stickBase = stickEl?.querySelector(".stick-base");
+  const stickKnob = document.getElementById("stick-knob");
 
   const params = new URLSearchParams(location.search);
   const endpoints = [
@@ -17,44 +19,69 @@
   let epIndex = 0;
   let wsUrl = endpoints[0] || "";
 
-  const keys = new Set();
+  let stick = { x: 0, y: 0 };
   let state = null;
   let ws = null;
   let reconnectAt = 0;
   let everOpened = false;
   let difficulty = "medium";
   let portrait = false;
-  let aimActive = false;
-  let aimWorld = null; // [x, y] in world coords on YOU panel
   let scale = 280;
   let padY = 100;
+
+  // Stick drag state (widget or YOU panel).
+  let stickDragging = false;
+  let stickSource = null; // "widget" | "panel"
+  let panelAim = null;
+
+  // Coalesce stick WS sends (~40Hz) while always keeping the latest vector.
+  const STICK_SEND_MS = 25;
+  let stickDirty = false;
+  let stickLastSend = 0;
 
   function send(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
 
-  function syncKeys() {
-    send({ type: "keys", down: [...keys] });
+  function flushStick(force) {
+    if (!stickDirty && !force) return;
+    const now = performance.now();
+    if (!force && now - stickLastSend < STICK_SEND_MS) return;
+    stickDirty = false;
+    stickLastSend = now;
+    send({ type: "stick", x: stick.x, y: stick.y });
   }
 
-  function setKey(k, down) {
-    if (!["w", "a", "s", "d"].includes(k)) return;
-    const had = keys.has(k);
-    if (down && !had) {
-      keys.add(k);
-      syncKeys();
-    } else if (!down && had) {
-      keys.delete(k);
-      syncKeys();
-    }
+  function syncStick(x, y, immediate) {
+    stick.x = x;
+    stick.y = y;
+    stickDirty = true;
+    updateKnob(x, y);
+    if (immediate) flushStick(true);
   }
 
-  function clearMoveKeys() {
-    let changed = false;
-    for (const k of ["w", "a", "s", "d"]) {
-      if (keys.delete(k)) changed = true;
+  function setStickFromVector(dx, dy, maxR) {
+    const r = Math.hypot(dx, dy);
+    let x = 0;
+    let y = 0;
+    if (r > 1e-6) {
+      const clipped = Math.min(r, maxR) / maxR;
+      x = (dx / r) * clipped;
+      y = (dy / r) * clipped;
     }
-    if (changed) syncKeys();
+    // Deadzone
+    if (Math.hypot(x, y) < 0.06) {
+      x = 0;
+      y = 0;
+    }
+    syncStick(x, y, false);
+  }
+
+  function updateKnob(x, y) {
+    if (!stickKnob || !stickBase) return;
+    const maxPx = stickBase.clientWidth * 0.28;
+    stickKnob.style.transform =
+      `translate(${x * maxPx}px, ${-y * maxPx}px)`;
   }
 
   function setDifficulty(level, rematch) {
@@ -89,7 +116,7 @@
       statusEl.textContent = "connected";
       send({ type: "hello" });
       send({ type: "difficulty", level: difficulty });
-      syncKeys();
+      syncStick(stick.x, stick.y, true);
     };
     ws.onclose = () => {
       if (!everOpened && epIndex + 1 < endpoints.length) {
@@ -116,7 +143,8 @@
           difficulty = msg.difficulty;
           if (diffEl) {
             for (const btn of diffEl.querySelectorAll("button")) {
-              btn.classList.toggle("active", btn.dataset.level === difficulty);
+              btn.classList.toggle(
+                "active", btn.dataset.level === difficulty);
             }
           }
         }
@@ -138,7 +166,6 @@
   function resizeCanvas() {
     portrait = layoutMode();
     const cssW = Math.min(canvas.clientWidth || window.innerWidth - 24, 1100);
-    // Landscape split / portrait stacked — pick internal pixel size.
     let w;
     let h;
     if (portrait) {
@@ -152,7 +179,6 @@
       canvas.width = w;
       canvas.height = h;
     }
-    // Fit world units into a panel.
     const panelW = portrait ? w : w / 2;
     const panelH = portrait ? h / 2 : h;
     scale = Math.min(panelW * 0.42, panelH * 0.55);
@@ -185,69 +211,119 @@
     return [(sx - ox) / scale, (oy - sy) / scale];
   }
 
-  function updateAimKeys() {
-    if (!aimActive || !aimWorld || !state || !state.left || !state.left.states) {
-      return;
-    }
-    const st = state.left.states[0];
-    if (!st) return;
-    const dx = aimWorld[0] - st[0];
-    const dy = aimWorld[1] - st[1];
-    const mag = Math.hypot(dx, dy);
-    const next = new Set();
-    if (mag > 0.03) {
-      const ax = Math.abs(dx);
-      const ay = Math.abs(dy);
-      // Allow diagonals when both axes matter.
-      if (ax >= ay * 0.45) next.add(dx > 0 ? "d" : "a");
-      if (ay >= ax * 0.45) next.add(dy > 0 ? "w" : "s");
-    }
-    let changed = false;
-    for (const k of ["w", "a", "s", "d"]) {
-      const want = next.has(k);
-      const have = keys.has(k);
-      if (want && !have) {
-        keys.add(k);
-        changed = true;
-      } else if (!want && have) {
-        keys.delete(k);
-        changed = true;
-      }
-    }
-    if (changed) syncKeys();
+  // ---- virtual joystick widget ----
+  function onStickPointerDown(e) {
+    if (!stickBase) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    stickDragging = true;
+    stickSource = "widget";
+    stickBase.setPointerCapture?.(e.pointerId);
+    moveStickFromEvent(e);
+    flushStick(true);
+    e.preventDefault();
   }
 
-  function onPointerDown(e) {
+  function moveStickFromEvent(e) {
+    const r = stickBase.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const dx = e.clientX - cx;
+    // Screen Y down → stick Y up
+    const dy = cy - e.clientY;
+    setStickFromVector(dx, dy, r.width * 0.42);
+  }
+
+  function onStickPointerMove(e) {
+    if (!stickDragging || stickSource !== "widget") return;
+    moveStickFromEvent(e);
+    e.preventDefault();
+  }
+
+  function endStickDrag(source, e) {
+    if (!stickDragging || (source && stickSource !== source)) return;
+    stickDragging = false;
+    stickSource = null;
+    panelAim = null;
+    syncStick(0, 0, true);
+    if (e) {
+      try {
+        const el = source === "panel" ? canvas : stickBase;
+        el?.releasePointerCapture?.(e.pointerId);
+      } catch (_) {}
+    }
+  }
+
+  function onStickPointerUp(e) {
+    endStickDrag("widget", e);
+  }
+
+  if (stickBase) {
+    stickBase.addEventListener("pointerdown", onStickPointerDown);
+    stickBase.addEventListener("pointermove", onStickPointerMove);
+    stickBase.addEventListener("pointerup", onStickPointerUp);
+    stickBase.addEventListener("pointercancel", onStickPointerUp);
+    stickBase.addEventListener("lostpointercapture", () => endStickDrag("widget"));
+  }
+
+  // ---- drag on YOU panel also drives the same stick ----
+  function onCanvasPointerDown(e) {
     if (e.pointerType === "mouse" && e.button !== 0) return;
-    canvas.setPointerCapture?.(e.pointerId);
+    if (stickDragging && stickSource === "widget") return;
     const [sx, sy] = canvasPointFromEvent(e);
     const you = youPanelRect();
     if (sx >= you.x && sx <= you.x + you.w && sy >= you.y && sy <= you.y + you.h) {
-      aimActive = true;
-      aimWorld = screenToWorld(you.x, you.y, you.w, you.h, sx, sy);
-      updateAimKeys();
+      stickDragging = true;
+      stickSource = "panel";
+      canvas.setPointerCapture?.(e.pointerId);
+      updatePanelStick(sx, sy);
+      flushStick(true);
       e.preventDefault();
     }
   }
 
-  function onPointerMove(e) {
-    if (!aimActive) return;
-    const [sx, sy] = canvasPointFromEvent(e);
+  function updatePanelStick(sx, sy) {
     const you = youPanelRect();
-    aimWorld = screenToWorld(you.x, you.y, you.w, you.h, sx, sy);
-    updateAimKeys();
+    const world = screenToWorld(you.x, you.y, you.w, you.h, sx, sy);
+    panelAim = world;
+    let ox = 0.95;
+    let oy = 0.55;
+    if (state?.left?.states?.[0]) {
+      ox = state.left.states[0][0];
+      oy = state.left.states[0][1];
+    }
+    setStickFromVector(world[0] - ox, world[1] - oy, 0.55);
+  }
+
+  function onCanvasPointerMove(e) {
+    if (!stickDragging || stickSource !== "panel") return;
+    const [sx, sy] = canvasPointFromEvent(e);
+    updatePanelStick(sx, sy);
     e.preventDefault();
   }
 
-  function onPointerUp(e) {
-    if (!aimActive) return;
-    aimActive = false;
-    aimWorld = null;
-    clearMoveKeys();
-    try {
-      canvas.releasePointerCapture?.(e.pointerId);
-    } catch (_) {}
+  function onCanvasPointerUp(e) {
+    endStickDrag("panel", e);
   }
+
+  canvas.addEventListener("pointerdown", onCanvasPointerDown);
+  canvas.addEventListener("pointermove", onCanvasPointerMove);
+  canvas.addEventListener("pointerup", onCanvasPointerUp);
+  canvas.addEventListener("pointercancel", onCanvasPointerUp);
+  canvas.addEventListener("lostpointercapture", () => endStickDrag("panel"));
+
+  // Safety: blur / tab hide zeros the stick so force never sticks.
+  function zeroStickIfNeeded() {
+    if (stickDragging || stick.x || stick.y) {
+      stickDragging = false;
+      stickSource = null;
+      panelAim = null;
+      syncStick(0, 0, true);
+    }
+  }
+  window.addEventListener("blur", zeroStickIfNeeded);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) zeroStickIfNeeded();
+  });
 
   if (diffEl) {
     diffEl.addEventListener("click", (e) => {
@@ -259,35 +335,10 @@
   rematchBtn?.addEventListener("click", () => rematch());
   pauseBtn?.addEventListener("click", () => send({ type: "pause" }));
 
-  function bindPadButton(btn) {
-    const k = btn.dataset.key;
-    const down = (e) => {
-      e.preventDefault();
-      btn.classList.add("active");
-      setKey(k, true);
-    };
-    const up = (e) => {
-      e.preventDefault();
-      btn.classList.remove("active");
-      setKey(k, false);
-    };
-    btn.addEventListener("pointerdown", down);
-    btn.addEventListener("pointerup", up);
-    btn.addEventListener("pointercancel", up);
-    btn.addEventListener("pointerleave", up);
-  }
-  if (padEl) {
-    for (const btn of padEl.querySelectorAll("button[data-key]")) {
-      bindPadButton(btn);
-    }
-  }
-
+  // Shortcuts: rematch / pause / difficulty only (stick is the sole move input).
   window.addEventListener("keydown", (e) => {
     const k = e.key.toLowerCase();
-    if (["w", "a", "s", "d"].includes(k)) {
-      e.preventDefault();
-      setKey(k, true);
-    } else if (k === " " || k === "r") {
+    if (k === " " || k === "r") {
       e.preventDefault();
       rematch();
     } else if (k === "p") {
@@ -304,15 +355,6 @@
       setDifficulty("high", true);
     }
   });
-  window.addEventListener("keyup", (e) => {
-    const k = e.key.toLowerCase();
-    if (["w", "a", "s", "d"].includes(k)) setKey(k, false);
-  });
-
-  canvas.addEventListener("pointerdown", onPointerDown);
-  canvas.addEventListener("pointermove", onPointerMove);
-  canvas.addEventListener("pointerup", onPointerUp);
-  canvas.addEventListener("pointercancel", onPointerUp);
   window.addEventListener("resize", resizeCanvas);
   window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 150));
 
@@ -400,15 +442,16 @@
       drawSpirit(panelX, panelY, panelW, panelH, st[0][0], st[0][1], geom[0][0],
         lookX, lookY, !!side.ok);
     }
-    if (aimActive && aimWorld && label.startsWith("YOU")) {
+    if (panelAim && label.startsWith("YOU") && stickDragging
+        && stickSource === "panel" && st && st.length > 0) {
       const [ax, ay] = worldToScreen(
-        panelX, panelY, panelW, panelH, aimWorld[0], aimWorld[1]);
+        panelX, panelY, panelW, panelH, panelAim[0], panelAim[1]);
+      const [sx, sy] = worldToScreen(
+        panelX, panelY, panelW, panelH, st[0][0], st[0][1]);
       ctx.beginPath();
       ctx.strokeStyle = "rgba(98,207,190,0.85)";
       ctx.lineWidth = 2;
       ctx.setLineDash([5, 4]);
-      const [sx, sy] = worldToScreen(
-        panelX, panelY, panelW, panelH, st[0][0], st[0][1]);
       ctx.moveTo(sx, sy);
       ctx.lineTo(ax, ay);
       ctx.stroke();
@@ -427,7 +470,7 @@
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       if (performance.now() >= reconnectAt) connect();
     }
-    if (aimActive) updateAimKeys();
+    flushStick(false);
     resizeCanvas();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -449,8 +492,7 @@
 
     if (state) {
       drawPanel(youRect.x, youRect.y, youRect.w, youRect.h,
-        state.left, state.goal, portrait ? "YOU · drag / pad" : "YOU · WASD / drag",
-        "#62cfbe", "#182430");
+        state.left, state.goal, "YOU · stick", "#62cfbe", "#182430");
       drawPanel(aiRect.x, aiRect.y, aiRect.w, aiRect.h,
         state.right, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
 

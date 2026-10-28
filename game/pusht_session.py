@@ -1,6 +1,6 @@
 ﻿"""Spirit Push-T: split-screen You vs AI.
 
-Left  — player WASD force on the spirit, push T to the goal.
+Left  — player stick force on the spirit, push T to the goal.
 Right — frozen WM-obs PPO.
 First side to succeed wins. Each round starts with a 3s countdown.
 
@@ -120,10 +120,13 @@ class _Side:
 
 
 class PushTVersusSession:
-    """You (WASD) vs AI — first to seat the T wins."""
+    """You (stick) vs AI — first to seat the T wins."""
 
     COUNTDOWN_S = 3.0
     PLAYER_FORCE = 5.5  # N, within typical force_max=6
+    # Physics substeps per web/desktop tick. Player uses latest stick each step;
+    # AI inference is capped to once per tick so WM+PPO cannot stall the loop.
+    SUBSTEPS = 3
 
     def __init__(
         self,
@@ -145,7 +148,8 @@ class PushTVersusSession:
         self.countdown_left = self.COUNTDOWN_S
         self._last_wall = time.perf_counter()
         self.status = "LOADING"
-        self.player_keys = set()  # 'w','a','s','d'
+        # Continuous stick in [-1, 1]^2 (virtual joystick / 360° drag).
+        self.player_stick = np.zeros(2, dtype=np.float32)
         self._shared = shared
         self._owns_assets = shared is None
 
@@ -224,35 +228,42 @@ class PushTVersusSession:
         self._last_wall = time.perf_counter()
         self.winner = None
         self.status = "Get ready…"
-        self.player_keys.clear()
+        self.player_stick[:] = 0.0
 
     def next_episode(self):
         self.ep += 1
         self.reset()
 
-    def set_key(self, key: str, down: bool):
-        k = key.lower()
-        if k not in ("w", "a", "s", "d"):
-            return
-        if down:
-            self.player_keys.add(k)
+    def set_stick(self, x: float, y: float):
+        """Virtual joystick: x right, y up, each clamped to [-1, 1].
+
+        Safe to call concurrently with tick (float stores); web reader applies
+        stick without waiting for the AI/physics session lock.
+        """
+        sx = float(np.clip(x, -1.0, 1.0))
+        sy = float(np.clip(y, -1.0, 1.0))
+        n = float(np.hypot(sx, sy))
+        if n > 1.0:
+            sx /= n
+            sy /= n
+        if n < 0.05:
+            self.player_stick[0] = 0.0
+            self.player_stick[1] = 0.0
         else:
-            self.player_keys.discard(k)
+            self.player_stick[0] = sx
+            self.player_stick[1] = sy
 
     def _player_force(self) -> np.ndarray:
-        fx = fy = 0.0
-        if "a" in self.player_keys:
-            fx -= 1.0
-        if "d" in self.player_keys:
-            fx += 1.0
-        if "w" in self.player_keys:
-            fy += 1.0
-        if "s" in self.player_keys:
-            fy -= 1.0
-        v = np.array([fx, fy], dtype=np.float32)
+        fcap = min(self.PLAYER_FORCE, self.fmax)
+        sx = float(self.player_stick[0])
+        sy = float(self.player_stick[1])
+        v = np.array([sx, sy], dtype=np.float32)
         n = float(np.linalg.norm(v))
         if n > 1e-6:
-            v = v / n * min(self.PLAYER_FORCE, self.fmax)
+            # Analog magnitude: deflection in unit disk scales force.
+            v = v / n * (fcap * min(n, 1.0))
+        else:
+            v[:] = 0.0
         return v
 
     @torch.no_grad()
@@ -276,10 +287,11 @@ class PushTVersusSession:
 
     # hold_mult: AI keeps an action longer → fewer policy evals (easier).
     # force_scale: weaker pushes on easier modes.
+    # Slightly longer holds cut CPU WM+PPO cost on multi-session CPU hosts.
     _DIFFICULTY = {
-        "low": {"hold_mult": 4, "force_scale": 0.55},
-        "medium": {"hold_mult": 2, "force_scale": 0.78},
-        "high": {"hold_mult": 1, "force_scale": 1.0},
+        "low": {"hold_mult": 5, "force_scale": 0.55},
+        "medium": {"hold_mult": 3, "force_scale": 0.78},
+        "high": {"hold_mult": 2, "force_scale": 1.0},
     }
 
     def _set_difficulty(self, level: str) -> str:
@@ -341,15 +353,21 @@ class PushTVersusSession:
             return
 
         # Several physics steps per frame for readable pace.
-        for _ in range(3):
+        # Cap WM+PPO to one forward per tick: on CPU hosts (and multi-session
+        # shared inference_lock) repeated encodes were the main hitch source.
+        ai_a = None
+        for _ in range(self.SUBSTEPS):
             if self.phase != "race":
                 break
+            # Latest stick each substep (may be updated mid-tick by WS reader).
             self._step_side(self.left, self._player_force(), hold_every=False)
             if self.right.hold_left <= 0:
-                ai_a = self._ai_action(self.right.task.observe())
+                if ai_a is None:
+                    ai_a = self._ai_action(self.right.task.observe())
+                step_a = ai_a
             else:
-                ai_a = self.right.action
-            self._step_side(self.right, ai_a, hold_every=True)
+                step_a = self.right.action
+            self._step_side(self.right, step_a, hold_every=True)
 
             if self.left.ok and not self.right.ok:
                 self.winner = "player"

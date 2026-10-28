@@ -114,8 +114,7 @@
       max-width: none;
     }
     .play-shell .difficulty button,
-    .play-shell .action-btn.ghost,
-    .play-shell .pad-btn {
+    .play-shell .action-btn.ghost {
       border-color: var(--line);
       background: #fff;
       color: var(--muted);
@@ -126,10 +125,46 @@
       border-color: var(--accent);
       color: #fff;
     }
-    .play-shell .pad {
-      margin-left: 0.35rem;
-      margin-right: 0.35rem;
+    .play-shell .stick {
+      margin: 0.65rem 0.35rem 0.15rem;
     }
+    .play-shell .stick-base {
+      border-color: #9bb0a4;
+      background:
+        radial-gradient(circle at 50% 50%, transparent 28%, rgba(11, 110, 79, 0.12) 29%, transparent 31%),
+        radial-gradient(circle at 50% 50%, transparent 46%, rgba(155, 176, 164, 0.45) 47%, transparent 49%),
+        repeating-conic-gradient(from 0deg, transparent 0deg 8deg, rgba(11, 110, 79, 0.06) 8deg 10deg),
+        radial-gradient(circle at 50% 42%, #eef5f1 0%, #d7e4dc 62%, #c5d5cb 100%);
+      box-shadow: inset 0 0 0 1px rgba(11, 110, 79, 0.18),
+                  0 8px 20px rgba(20, 40, 30, 0.12);
+    }
+    .play-shell .stick-base::before {
+      background: linear-gradient(
+        to bottom,
+        rgba(11, 110, 79, 0.45) 0%,
+        rgba(11, 110, 79, 0.45) 10%,
+        transparent 10%,
+        transparent 90%,
+        rgba(11, 110, 79, 0.45) 90%,
+        rgba(11, 110, 79, 0.45) 100%
+      );
+    }
+    .play-shell .stick-base::after {
+      background: linear-gradient(
+        to right,
+        rgba(11, 110, 79, 0.45) 0%,
+        rgba(11, 110, 79, 0.45) 10%,
+        transparent 10%,
+        transparent 90%,
+        rgba(11, 110, 79, 0.45) 90%,
+        rgba(11, 110, 79, 0.45) 100%
+      );
+    }
+    .play-shell .stick-knob {
+      background: radial-gradient(circle at 35% 30%, #7ad9b8, #0b6e4f 58%, #08553d);
+      border-color: rgba(255, 255, 255, 0.55);
+    }
+    .play-shell .stick-label { color: var(--muted); }
     @media (max-width: 720px) {
       .wrap { padding: 0.85rem 0.7rem 2.5rem; }
       .brand { font-size: 1.7rem; }
@@ -219,7 +254,7 @@
       Warp-accelerated 2D physics with explicit FEM, impulse rigid bodies, and
       mixed-domain contact — plus StateLeWM, one latent world model with three
       controllers (CEM, BPTT, PPO). Play <strong>You vs AI</strong> below
-      (drag / D-pad on mobile, WASD on desktop).
+      (drag the 360° stick or YOU panel).
     </p>
 
     <div class="play-shell">
@@ -244,17 +279,15 @@
         </div>
       </div>
       <canvas id="c" width="1100" height="560" tabindex="0"></canvas>
-      <div id="pad" class="pad" aria-label="Move">
-        <button type="button" class="pad-btn" data-key="w" aria-label="Up">▲</button>
-        <div class="pad-mid">
-          <button type="button" class="pad-btn" data-key="a" aria-label="Left">◀</button>
-          <button type="button" class="pad-btn" data-key="s" aria-label="Down">▼</button>
-          <button type="button" class="pad-btn" data-key="d" aria-label="Right">▶</button>
+      <div id="stick" class="stick" aria-label="Move stick">
+        <div class="stick-base">
+          <div class="stick-knob" id="stick-knob"></div>
         </div>
+        <p class="stick-label">Drag to move · 360°</p>
       </div>
       <p class="hint">
-        Mobile: drag on YOU panel or D-pad · Rematch / difficulty buttons ·
-        Desktop: WASD · 1/2/3 · Space/R · P
+        Drag the stick (mouse or finger) · also drag on the YOU panel ·
+        Rematch / difficulty · 1/2/3 · Space/R · P
       </p>
     </div>
 
@@ -321,7 +354,7 @@
 
     <footer>Apache-2.0 · Dongyu Liu</footer>
   </div>
-  <script src="pusht/config.js"></script>
-  <script src="pusht/app.js"></script>
+  <script src="pusht/config.js?v=stick1"></script>
+  <script src="pusht/app.js?v=stick1"></script>
 </body>
 </html>

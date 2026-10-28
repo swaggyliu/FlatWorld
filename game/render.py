@@ -758,7 +758,7 @@ def draw_pusht_versus(width: int, height: int,
         stem_goal, bar_goal, left_trail,
         action=left_action, happy=left_happy, restitution=0.45,
         goal_theta=goal_theta)
-    text("YOU  ·  WASD", 24, height - 36, 16, HP_OK)
+    text("YOU  ·  stick", 24, height - 36, 16, HP_OK)
     rl.end_scissor_mode()
 
     rl.begin_scissor_mode(mid + 1, 0, width - mid - 1, height)

@@ -77,7 +77,7 @@ h1 {
 #c {
   width: min(1100px, 100%);
   height: auto;
-  max-height: min(62vh, 560px);
+  max-height: min(58vh, 560px);
   background: #0e141c;
   border-radius: 12px;
   border: 1px solid #2a3544;
@@ -88,7 +88,7 @@ h1 {
 .hint {
   color: var(--muted);
   font-size: 0.8rem;
-  margin: 0.65rem 0 0;
+  margin: 0.55rem 0 0;
   text-align: center;
   max-width: 36rem;
   line-height: 1.4;
@@ -102,8 +102,7 @@ h1 {
   justify-content: center;
 }
 .difficulty span { margin-right: 0.15rem; color: var(--muted); font-size: 0.85rem; }
-.difficulty button,
-.pad-btn {
+.difficulty button {
   font: inherit;
   font-size: 0.88rem;
   font-weight: 700;
@@ -124,33 +123,103 @@ h1 {
   border-color: var(--accent);
   color: #fff;
 }
-.pad {
-  display: none;
-  margin-top: 0.75rem;
-  width: min(280px, 86vw);
-  user-select: none;
-}
-.pad-btn {
-  font-size: 1.15rem;
-  width: 100%;
-}
-.pad-mid {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+
+/* Virtual joystick (360° wheel) */
+.stick {
+  margin-top: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   gap: 0.4rem;
-  margin-top: 0.4rem;
+  user-select: none;
+  -webkit-user-select: none;
 }
-.pad > .pad-btn[data-key="w"] { margin-bottom: 0; }
-.pad-btn.active,
-.pad-btn:active {
-  background: var(--you);
-  border-color: var(--you);
-  color: #102018;
+.stick-base {
+  position: relative;
+  width: min(168px, 42vw);
+  height: min(168px, 42vw);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 50%, transparent 28%, rgba(98, 207, 190, 0.12) 29%, transparent 31%),
+    radial-gradient(circle at 50% 50%, transparent 46%, rgba(61, 81, 102, 0.55) 47%, transparent 49%),
+    repeating-conic-gradient(from 0deg, transparent 0deg 8deg, rgba(98, 207, 190, 0.07) 8deg 10deg),
+    radial-gradient(circle at 50% 42%, #2a3848 0%, #151c26 62%, #0c1218 100%);
+  border: 2px solid #4a627a;
+  box-shadow: inset 0 0 0 1px rgba(98, 207, 190, 0.22),
+              inset 0 -10px 22px rgba(0, 0, 0, 0.35),
+              0 8px 24px rgba(0, 0, 0, 0.35);
+  touch-action: none;
+  cursor: grab;
+  -webkit-tap-highlight-color: transparent;
+}
+.stick-base::before,
+.stick-base::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  pointer-events: none;
+  z-index: 0;
+}
+.stick-base::before {
+  width: 2px;
+  height: 88%;
+  transform: translate(-50%, -50%);
+  background: linear-gradient(
+    to bottom,
+    rgba(98, 207, 190, 0.45) 0%,
+    rgba(98, 207, 190, 0.45) 10%,
+    transparent 10%,
+    transparent 90%,
+    rgba(98, 207, 190, 0.45) 90%,
+    rgba(98, 207, 190, 0.45) 100%
+  );
+}
+.stick-base::after {
+  width: 88%;
+  height: 2px;
+  transform: translate(-50%, -50%);
+  background: linear-gradient(
+    to right,
+    rgba(98, 207, 190, 0.45) 0%,
+    rgba(98, 207, 190, 0.45) 10%,
+    transparent 10%,
+    transparent 90%,
+    rgba(98, 207, 190, 0.45) 90%,
+    rgba(98, 207, 190, 0.45) 100%
+  );
+}
+.stick-base:active { cursor: grabbing; }
+.stick-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 42%;
+  height: 42%;
+  margin-left: -21%;
+  margin-top: -21%;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #9aefe0, #62cfbe 55%, #2f8f82);
+  border: 2px solid rgba(230, 255, 248, 0.55);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4),
+              inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  pointer-events: none;
+  transform: translate(0px, 0px);
+  will-change: transform;
+  z-index: 1;
+}
+.stick-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 @media (max-width: 720px), (pointer: coarse) {
-  .pad { display: block; }
-  #c { max-height: min(54vh, 520px); border-radius: 10px; }
+  #c { max-height: min(48vh, 480px); border-radius: 10px; }
+  .stick-base {
+    width: min(190px, 52vw);
+    height: min(190px, 52vw);
+  }
   .hint { font-size: 0.75rem; }
   body { padding-top: 0.55rem; }
 }

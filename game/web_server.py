@@ -10,7 +10,8 @@ Each WebSocket connection gets an isolated game session (shared WM/PPO weights).
 Protocol (JSON text frames)::
 
     client -> {"type":"hello"}
-    client -> {"type":"keys","down":["w","a"]}   # currently held keys
+    client -> {"type":"stick","x":0.5,"y":-0.2}  # virtual joystick [-1,1]
+    client -> {"type":"keys","down":["w","a"]}    # legacy WASD/D-pad (mapped to stick)
     client -> {"type":"rematch"}
     client -> {"type":"pause"}
     client -> {"type":"difficulty","level":"low"|"medium"|"high"}
@@ -33,6 +34,18 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 
+def _tune_cpu_threads() -> None:
+    """Avoid torch/OMP oversubscription on small multi-session CPU boxes."""
+    try:
+        import torch
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ.setdefault(key, "1")
+
+
 def _build_app(
     wm: str,
     policy: str,
@@ -52,7 +65,9 @@ def _build_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         def _load():
+            _tune_cpu_threads()
             from game.pusht_session import load_shared_pusht_assets
+            # Aliyun game host has no GPU; map_location=cpu is intentional.
             return load_shared_pusht_assets(
                 wm_path=wm, policy_path=policy, device="cpu", hold=hold)
 
@@ -116,6 +131,8 @@ def _build_app(
             session_seed = next(state["seed_seq"])
 
         session = None
+        # Protects rematch/pause/difficulty vs tick/snapshot. Stick updates are
+        # intentionally lock-free so AI inference never delays player input.
         session_lock = asyncio.Lock()
         stop = asyncio.Event()
         dt = 1.0 / max(float(hz), 5.0)
@@ -155,14 +172,36 @@ def _build_app(
                         except json.JSONDecodeError:
                             continue
                         typ = msg.get("type")
+                        obj = session
+                        # Stick / legacy keys: apply immediately — never wait
+                        # for tick/AI lock (that was the lag source).
+                        if typ == "stick":
+                            try:
+                                sx = float(msg.get("x", 0.0))
+                                sy = float(msg.get("y", 0.0))
+                            except (TypeError, ValueError):
+                                sx = sy = 0.0
+                            obj.set_stick(sx, sy)
+                            continue
+                        if typ == "keys":
+                            # Pages cache / older clients still send WASD.
+                            down = {
+                                str(k).lower()
+                                for k in (msg.get("down") or [])
+                            }
+                            fx = fy = 0.0
+                            if "a" in down:
+                                fx -= 1.0
+                            if "d" in down:
+                                fx += 1.0
+                            if "w" in down:
+                                fy += 1.0
+                            if "s" in down:
+                                fy -= 1.0
+                            obj.set_stick(fx, fy)
+                            continue
                         async with session_lock:
-                            obj = session
-                            if typ == "keys":
-                                down = {str(k).lower() for k in msg.get("down", [])}
-                                down &= {"w", "a", "s", "d"}
-                                for k in ("w", "a", "s", "d"):
-                                    obj.set_key(k, k in down)
-                            elif typ == "rematch":
+                            if typ == "rematch":
                                 obj.next_episode()
                             elif typ == "pause":
                                 obj.paused = not obj.paused
@@ -178,12 +217,16 @@ def _build_app(
             async def writer():
                 try:
                     while not stop.is_set():
+                        t0 = asyncio.get_event_loop().time()
                         async with session_lock:
                             await asyncio.to_thread(session.tick)
                             snap = session.snapshot()
                         snap["type"] = "state"
                         await ws.send_json(snap)
-                        await asyncio.sleep(dt)
+                        # Sleep the remainder of the tick period so slow AI
+                        # ticks do not stack extra delay on top of overruns.
+                        elapsed = asyncio.get_event_loop().time() - t0
+                        await asyncio.sleep(max(0.0, dt - elapsed))
                 except WebSocketDisconnect:
                     stop.set()
                 except Exception:
@@ -230,6 +273,7 @@ def _build_app(
 
 
 def main():
+    _tune_cpu_threads()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8765)
@@ -238,7 +282,8 @@ def main():
                     default="learning/checkpoints/push_t_wm_rsl/best.pt")
     ap.add_argument("--hold", type=int, default=5)
     ap.add_argument("--seed", type=int, default=1000)
-    ap.add_argument("--hz", type=float, default=20.0)
+    # 30Hz broadcast; tick sleep accounts for AI overrun (see writer).
+    ap.add_argument("--hz", type=float, default=30.0)
     ap.add_argument("--max-sessions", type=int, default=8,
                     help="Max concurrent players (each gets an isolated game).")
     args = ap.parse_args()

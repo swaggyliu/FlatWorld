@@ -6,11 +6,16 @@ import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = Path(os.environ.get("TEMP", "/tmp")) / "flatworld-pusht.tgz"
+# Prefer deploy/_pusht_sync.tgz so sync_pusht_aliyun.ps1 finds the archive.
+OUT = Path(os.environ.get(
+    "PUSHT_PACK_OUT",
+    str(ROOT / "deploy" / "_pusht_sync.tgz"),
+))
 
 INCLUDE = [
     "flatworld",
     "game",
+    "docs/pusht",
     "pyproject.toml",
     "requirements.txt",
     "README.md",
