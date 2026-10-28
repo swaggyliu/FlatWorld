@@ -20,6 +20,14 @@ Warp-accelerated **2D** physics engine with **explicit FEM**, **impulse-based ri
 
 ## Quick start
 
+Once published to PyPI (Trusted Publisher / OIDC):
+
+```bash
+pip install flatworld
+```
+
+From source:
+
 ```bash
 git clone https://github.com/swaggyliu/FlatWorld.git
 cd FlatWorld

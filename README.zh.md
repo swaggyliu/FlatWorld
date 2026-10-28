@@ -20,6 +20,14 @@
 
 ## 安装与运行
 
+发布到 PyPI（Trusted Publisher / OIDC）后可直接：
+
+```bash
+pip install flatworld
+```
+
+从源码安装：
+
 ```bash
 pip install -r requirements.txt
 pip install -e .
