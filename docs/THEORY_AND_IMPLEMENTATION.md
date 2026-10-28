@@ -1,352 +1,354 @@
-# Flat World 物理引擎 — 理论与实现文档
+# Flat World Physics Engine — Theory and Implementation
 
-> **Flat World**（FlatWorld）是基于 [NVIDIA Warp](https://nvidia.github.io/warp/) 的实时多物理场仿真平台，支持 **刚体动力学**、**有限元法（FEM）**、**弹簧-质量系统**，以及三种静态地面表示：**解析平面（Ground）**、**高度场（HeightField）**、**体素网格（Voxel）**。
+**English** | [中文](THEORY_AND_IMPLEMENTATION.zh.md)
 
----
-
-## 目录
-
-1. [项目概览](#1-项目概览)
-2. [整体架构](#2-整体架构)
-3. [有限元法（FEM）](#3-有限元法fem)
-4. [刚体动力学](#4-刚体动力学)
-5. [地面类型](#5-地面类型)
-6. [接触与碰撞](#6-接触与碰撞)
-7. [时间积分与自适应步长](#7-时间积分与自适应步长)
-8. [test2D 测试案例](#8-test2d-测试案例)
-9. [快速入门示例](#9-快速入门示例)
+> **Flat World** (FlatWorld) is a real-time multiphysics simulation platform built on [NVIDIA Warp](https://nvidia.github.io/warp/). It supports **rigid-body dynamics**, the **finite element method (FEM)**, **spring–mass systems**, and three static ground representations: **analytical plane (Ground)**, **height field (HeightField)**, and **voxel grid (Voxel)**.
 
 ---
 
-## 1. 项目概览
+## Table of Contents
 
-### 1.1 技术栈
+1. [Project Overview](#1-project-overview)
+2. [Overall Architecture](#2-overall-architecture)
+3. [Finite Element Method (FEM)](#3-finite-element-method-fem)
+4. [Rigid-Body Dynamics](#4-rigid-body-dynamics)
+5. [Ground Types](#5-ground-types)
+6. [Contact and Collision](#6-contact-and-collision)
+7. [Time Integration and Adaptive Step Size](#7-time-integration-and-adaptive-step-size)
+8. [test2D Test Cases](#8-test2d-test-cases)
+9. [Quick-Start Examples](#9-quick-start-examples)
 
-| 组件 | 说明 |
-|------|------|
-| 语言 | Python 3 |
-| 计算后端 | NVIDIA Warp（GPU/CPU 并行内核） |
-| 依赖 | warp-lang, numpy, scipy, meshio, pytest |
+---
 
-### 1.2 目录结构
+## 1. Project Overview
+
+### 1.1 Tech Stack
+
+| Component | Description |
+|-----------|-------------|
+| Language | Python 3 |
+| Compute backend | NVIDIA Warp (GPU/CPU parallel kernels) |
+| Dependencies | warp-lang, numpy, scipy, meshio, pytest |
+
+### 1.2 Directory Structure
 
 ```
 FlatWorld/
-├── flatworld/                  # 核心引擎
-│   ├── explicitloop.py         # 主仿真循环（ExplicitLoop）
-│   ├── femspringmanager.py     # FEM / 弹簧统一数据管理与积分
-│   ├── rigidmanager.py         # 刚体状态、碰撞检测、PGS 约束求解
-│   ├── femdomain.py            # FEM 域封装
-│   ├── rigiddomain.py          # 刚体域封装
-│   ├── grounddomain.py         # 解析平面地面（GroundDomain）
-│   ├── heightfielddomain.py    # 高度场地面
-│   ├── voxeldomain.py          # 体素网格地面
-│   ├── femcontact.py           # 软体惩罚接触
-│   ├── mesh.py                 # 网格、形函数、B 矩阵
-│   ├── contact_detection.py    # 点-边、点-面接触检测
-│   ├── sat.py / gjk.py         # 2D SAT / GJK-EPA 碰撞
-│   ├── bvh.py                  # 宽相碰撞检测
-│   ├── joints.py               # 关节定义
-│   ├── bcs.py                  # 边界条件
-│   └── materials/              # 本构模型
-└── test2D/                     # 2D 测试与演示（51 个文件）
+├── flatworld/                  # Core engine
+│   ├── explicitloop.py         # Main simulation loop (ExplicitLoop)
+│   ├── femspringmanager.py     # Unified FEM / spring data management and integration
+│   ├── rigidmanager.py         # Rigid-body state, collision detection, PGS constraint solver
+│   ├── femdomain.py            # FEM domain wrapper
+│   ├── rigiddomain.py          # Rigid-body domain wrapper
+│   ├── grounddomain.py         # Analytical plane ground (GroundDomain)
+│   ├── heightfielddomain.py    # Height-field ground
+│   ├── voxeldomain.py          # Voxel-grid ground
+│   ├── femcontact.py           # Soft-body penalty contact
+│   ├── mesh.py                 # Mesh, shape functions, B matrix
+│   ├── contact_detection.py    # Point–edge, point–face contact detection
+│   ├── sat.py / gjk.py         # 2D SAT / GJK-EPA collision
+│   ├── bvh.py                  # Broad-phase collision detection
+│   ├── joints.py               # Joint definitions
+│   ├── bcs.py                  # Boundary conditions
+│   └── materials/              # Constitutive models
+└── test2D/                     # 2D tests and demos (51 files)
 ```
 
-### 1.3 域类型（DomainType）
+### 1.3 Domain Types (DomainType)
 
-| 类型 | 常量 | 典型类 |
-|------|------|--------|
-| 解析平面 | `ANALYTICAL` | `GroundDomain` |
-| 有限元 | `FEM` | `FemDomain` |
-| 刚体 | `RIGID` | `RigidBodyDomain` |
-| 弹簧-质量 | `SPRINGMASS` | `SpringMassDomain` |
-| 高度场 | `HEIGHTFIELD` | `HeightFieldDomain` |
-| 体素地图 | `VOXELMAP` | `VoxelGridDomain` |
+| Type | Constant | Typical class |
+|------|----------|---------------|
+| Analytical plane | `ANALYTICAL` | `GroundDomain` |
+| Finite element | `FEM` | `FemDomain` |
+| Rigid body | `RIGID` | `RigidBodyDomain` |
+| Spring–mass | `SPRINGMASS` | `SpringMassDomain` |
+| Height field | `HEIGHTFIELD` | `HeightFieldDomain` |
+| Voxel map | `VOXELMAP` | `VoxelGridDomain` |
 
 ---
 
-## 2. 整体架构
+## 2. Overall Architecture
 
-### 2.1 仿真流程
+### 2.1 Simulation Pipeline
 
-`ExplicitLoop` 是仿真入口，负责协调各子系统：
+`ExplicitLoop` is the simulation entry point and coordinates all subsystems:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      ExplicitLoop                           │
 │  advanceWithTime(frame_dt)                                  │
-│    └─ 按 stableTime 自适应子步进                             │
+│    └─ Adaptive substeps by stableTime                       │
 │         └─ advance()                                        │
-│              1. BVH 宽相 → 候选碰撞对                        │
-│              2. 批处理接触力（FEM ↔ 地面/刚体）              │
-│              3. FemSpringManager.substep() → FEM 积分        │
-│              4. RigidManager.substep() → 刚体积分 + PGS      │
+│              1. BVH broad phase → candidate collision pairs │
+│              2. Batched contact forces (FEM ↔ ground/rigid) │
+│              3. FemSpringManager.substep() → FEM integration│
+│              4. RigidManager.substep() → rigid + PGS        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 双管理器设计
+### 2.2 Dual-Manager Design
 
-| 管理器 | 负责域 | 接触方式 |
-|--------|--------|----------|
-| `FemSpringManager` | FEM、SpringMass | **惩罚力**（力级，加入 `Fext`） |
-| `RigidManager` | Rigid、Ground、HeightField、Voxel | **冲量 + PGS**（速度级约束） |
+| Manager | Domains | Contact method |
+|---------|---------|----------------|
+| `FemSpringManager` | FEM, SpringMass | **Penalty forces** (force level, added to `Fext`) |
+| `RigidManager` | Rigid, Ground, HeightField, Voxel | **Impulses + PGS** (velocity-level constraints) |
 
-### 2.3 接触类型矩阵
+### 2.3 Contact-Type Matrix
 
-| 接触对 | 状态 | 方法 |
-|--------|------|------|
-| FEM ↔ 解析平面 | ✅ | 惩罚接触 |
-| FEM ↔ 高度场 | ✅ | 惩罚接触 |
-| FEM ↔ 体素 | ✅ | 惩罚接触 |
-| FEM ↔ FEM | ✅ | 惩罚接触 |
-| FEM ↔ 刚体 | ✅ | 惩罚接触 |
-| 刚体 ↔ 解析平面 | ✅ | 冲量 + PGS |
-| 刚体 ↔ 高度场 | ✅ | 冲量 + PGS |
-| 刚体 ↔ 体素 | ✅ | 冲量 + PGS |
-| 刚体 ↔ 刚体 | ✅ | SAT/GJK + PGS |
+| Contact pair | Status | Method |
+|--------------|--------|--------|
+| FEM ↔ analytical plane | ✅ | Penalty contact |
+| FEM ↔ height field | ✅ | Penalty contact |
+| FEM ↔ voxel | ✅ | Penalty contact |
+| FEM ↔ FEM | ✅ | Penalty contact |
+| FEM ↔ rigid | ✅ | Penalty contact |
+| Rigid ↔ analytical plane | ✅ | Impulse + PGS |
+| Rigid ↔ height field | ✅ | Impulse + PGS |
+| Rigid ↔ voxel | ✅ | Impulse + PGS |
+| Rigid ↔ rigid | ✅ | SAT/GJK + PGS |
 
 ---
 
-## 3. 有限元法（FEM）
+## 3. Finite Element Method (FEM)
 
-### 3.1 理论基础
+### 3.1 Theoretical Background
 
-本引擎采用 **显式动力学** 与 **Total Lagrangian** 混合方案：
+The engine uses a hybrid of **explicit dynamics** and a **Total Lagrangian** formulation:
 
-#### 3.1.1 单元与形函数
+#### 3.1.1 Elements and Shape Functions
 
-- **2D**：线性三角形单元（3 节点）
-- **3D**：线性四面体单元（4 节点）
-- 形函数（2D 三角形，重心坐标）：
+- **2D**: Linear triangular elements (3 nodes)
+- **3D**: Linear tetrahedral elements (4 nodes)
+- Shape functions (2D triangle, barycentric coordinates):
 
 \[
 N_1 = \psi,\quad N_2 = \eta,\quad N_3 = 1 - \psi - \eta
 \]
 
-- 在单元形心（\(\psi = \eta = 0\)）处计算 Jacobian 与 B 矩阵（常应变/常应力）
+- The Jacobian and B matrix are evaluated at the element centroid (\(\psi = \eta = 0\)) (constant strain / constant stress)
 
-#### 3.1.2 变形梯度
+#### 3.1.2 Deformation Gradient
 
-参考构形 Jacobian \(J_{\text{ref}}\) 在初始化时存储，当前构形：
+The reference-configuration Jacobian \(J_{\text{ref}}\) is stored at initialization. In the current configuration:
 
 \[
 J = \frac{\partial x}{\partial \xi},\quad F = J \cdot J_{\text{ref}}^{-1}
 \]
 
-#### 3.1.3 应变与应力
+#### 3.1.3 Strain and Stress
 
-**Green-Lagrange 应变**（Voigt 形式）：
+**Green–Lagrange strain** (Voigt form):
 
 \[
 \varepsilon = \tfrac{1}{2}(F^T F - I)
 \]
 
-**本构关系**（PK2 应力 → Cauchy 应力存储）：
+**Constitutive relation** (PK2 stress → stored as Cauchy stress):
 
 \[
 \sigma_{\text{Cauchy}} = \frac{1}{J} F S F^T
 \]
 
-#### 3.1.4 内力组装
+#### 3.1.4 Internal Force Assembly
 
 \[
 f_{\text{int}} = B^T \sigma \cdot V_{\text{elem}}
 \]
 
-其中 \(B\) 为应变-位移矩阵，\(V_{\text{elem}}\) 为单元体积（2D 为面积）。
+where \(B\) is the strain–displacement matrix and \(V_{\text{elem}}\) is the element volume (area in 2D).
 
-#### 3.1.5 时间积分
+#### 3.1.5 Time Integration
 
-显式中心差分风格：
+Explicit central-difference style:
 
 \[
 a = \frac{F_{\text{ext}} - c \cdot v}{m},\quad v \leftarrow v + a \cdot \Delta t,\quad u \leftarrow u + v \cdot \Delta t
 \]
 
-实现位置：`femspringmanager.py` → `femStep()` 内核。
+Implementation: `femspringmanager.py` → `femStep()` kernel.
 
-#### 3.1.6 稳定时间步
+#### 3.1.6 Stable Time Step
 
 \[
 \Delta t_{\text{stable}} \approx 0.4 \cdot \frac{L_{\text{char}}}{\sqrt{E/\rho}}
 \]
 
-其中 \(L_{\text{char}}\) 为网格最小边长，\(E\) 为杨氏模量，\(\rho\) 为密度。
+where \(L_{\text{char}}\) is the mesh minimum edge length, \(E\) is Young’s modulus, and \(\rho\) is density.
 
-实现位置：`femdomain.py`。
+Implementation: `femdomain.py`.
 
-### 3.2 材料模型
+### 3.2 Material Models
 
-| 类型 | 枚举 | 说明 |
-|------|------|------|
-| 线性弹性 | `MaterialType.ELASTIC` | Lamé 参数 \(\lambda, \mu\)，Hooke 定律 |
-| Neo-Hookean | `MaterialType.NEOHOOKEAN` | 可压缩超弹性 |
-| J2 von Mises | `MaterialType.MISES` | 径向回归塑性，各向同性硬化 |
+| Type | Enum | Description |
+|------|------|-------------|
+| Linear elastic | `MaterialType.ELASTIC` | Lamé parameters \(\lambda, \mu\), Hooke’s law |
+| Neo-Hookean | `MaterialType.NEOHOOKEAN` | Compressible hyperelasticity |
+| J2 von Mises | `MaterialType.MISES` | Radial-return plasticity, isotropic hardening |
 
-**线性弹性 Lamé 参数**：
+**Linear elastic Lamé parameters**:
 
 \[
 \lambda = \frac{E\nu}{(1+\nu)(1-2\nu)},\quad \mu = \frac{E}{2(1+\nu)}
 \]
 
-**J2 塑性**：采用径向回归映射（radial return mapping），当 von Mises 等效应力超过屈服面时修正偏应力并更新塑性应变历史。
+**J2 plasticity**: Uses radial return mapping. When the von Mises equivalent stress exceeds the yield surface, the deviatoric stress is corrected and the plastic strain history is updated.
 
-实现位置：`materials/materialfunctions.py`。
+Implementation: `materials/materialfunctions.py`.
 
-### 3.3 实现要点
+### 3.3 Implementation Notes
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| 域封装 | `femdomain.py` | 网格、材料、BC、稳定步长 |
-| 统一管理 | `femspringmanager.py` | 全局节点/单元数组，批处理 `femStep` |
-| 网格工具 | `mesh.py` | 形函数、Jacobian、B 矩阵、边界边提取 |
-| 网格生成 | `femesher.py` | 圆形网格、Gmsh/VTU 导入 |
-| 边界条件 | `bcs.py` | 重力、力、固定、速度/加速度约束 |
+| Module | File | Responsibility |
+|--------|------|----------------|
+| Domain wrapper | `femdomain.py` | Mesh, material, BCs, stable step size |
+| Unified manager | `femspringmanager.py` | Global node/element arrays, batched `femStep` |
+| Mesh utilities | `mesh.py` | Shape functions, Jacobian, B matrix, boundary-edge extraction |
+| Mesh generation | `femesher.py` | Circle meshes, Gmsh/VTU import |
+| Boundary conditions | `bcs.py` | Gravity, forces, fixed, velocity/acceleration constraints |
 
-**边界边提取**：遍历所有单元边，仅出现一次的边为边界边，用于接触检测。
-
----
-
-## 4. 刚体动力学
-
-### 4.1 理论基础
-
-刚体采用 **半隐式 Euler 积分** + **冲量法接触** + **投影 Gauss-Seidel（PGS）** 约束求解。
-
-#### 4.1.1 状态变量（2D）
-
-| 变量 | 含义 |
-|------|------|
-| `U` | 参考点位置 |
-| `V` | 线速度 |
-| `quat` | 标量转角（2D 绕 z 轴） |
-| `RotV` | 角速度 |
-
-#### 4.1.2 转动惯量
-
-| 形状 | 2D 转动惯量 |
-|------|-------------|
-| 球（Ball） | \(I = \tfrac{1}{2} m r^2\) |
-| 矩形（Box） | \(I = \tfrac{1}{12} m (w^2 + h^2)\) |
-
-#### 4.1.3 接触响应
-
-- **法向**：Baumgarte ERP（\( \text{ERP} = 0.2 \)）修正穿透
-- **切向**：Coulomb 摩擦锥
-- **恢复系数**：可配置 restitution
-
-约束在速度空间求解，PGS 迭代更新冲量。
-
-#### 4.1.4 关节约束
-
-支持的关节类型（`JointType`）：
-
-| 关节 | 约束自由度 |
-|------|-----------|
-| Revolute（转动） | 保留 1 个转动 DOF |
-| Weld（焊接） | 完全固定相对位姿 |
-| Prismatic（滑动） | 保留 1 个平移 DOF |
-| Spherical（球铰） | 保留 3 个转动 DOF |
-
-### 4.2 刚体形状
-
-| 类型 | 类 | 碰撞检测 |
-|------|-----|----------|
-| 球 | `BallRigid` | 解析 SDF |
-| 矩形 | `BoxRigid` | 2D SAT |
-| 胶囊 | `CapsuleRigid` | 线段-点/球 |
-| 网格 | `MeshRigid` | 边界边 + GJK-EPA |
-
-实现位置：`rigid.py`、`rigiddomain.py`、`rigidmanager.py`。
-
-### 4.3 刚体接触流水线
-
-`RigidManager.substep()` 每子步执行：
-
-1. 速度积分（含阻尼）
-2. **宽相**：BVH 或空间哈希
-3. **窄相**：按对类型分发（ball-ball、box-box、mesh-mesh 等）
-4. 组装接触行 + 关节行 → PGS 矩阵
-5. `solve_pgs(iterations)` 迭代求解
-6. 位置积分 + AABB 更新
-
-### 4.4 碰撞过滤
-
-采用 ODE 风格的 category/collide 位掩码：
-
-```
-配对 (a, b) 有效 ⟺ (collide_bits[a] & category_bits[b]) ≠ 0
-              且 (collide_bits[b] & category_bits[a]) ≠ 0
-```
-
-预定义类别：`COLLISION_CATEGORY_GROUND`、`COLLISION_CATEGORY_FEM`、`COLLISION_CATEGORY_ORDINARY_RIGID` 等。
+**Boundary-edge extraction**: Traverse all element edges; edges that appear only once are boundary edges, used for contact detection.
 
 ---
 
-## 5. 地面类型
+## 4. Rigid-Body Dynamics
 
-三种地面均为 **静态障碍物**，`category_bits = COLLISION_CATEGORY_GROUND`，但几何表示与接触检测方式不同。
+### 4.1 Theoretical Background
 
-### 5.1 GroundDomain — 解析平面
+Rigid bodies use **semi-implicit Euler integration** + **impulse-based contact** + a **projected Gauss–Seidel (PGS)** constraint solver.
 
-**文件**：`grounddomain.py`  
-**类型**：`DomainType.ANALYTICAL`
+#### 4.1.1 State Variables (2D)
 
-#### 理论
+| Variable | Meaning |
+|----------|---------|
+| `U` | Reference-point position |
+| `V` | Linear velocity |
+| `quat` | Scalar rotation angle (2D about the z-axis) |
+| `RotV` | Angular velocity |
 
-无限平面由参考点 \(\mathbf{p}\) 和单位法向 \(\mathbf{n}\) 定义：
+#### 4.1.2 Moment of Inertia
+
+| Shape | 2D moment of inertia |
+|-------|----------------------|
+| Ball | \(I = \tfrac{1}{2} m r^2\) |
+| Box | \(I = \tfrac{1}{12} m (w^2 + h^2)\) |
+
+#### 4.1.3 Contact Response
+
+- **Normal**: Baumgarte ERP (\(\text{ERP} = 0.2\)) corrects penetration
+- **Tangential**: Coulomb friction cone
+- **Restitution**: Configurable restitution coefficient
+
+Constraints are solved in velocity space; PGS iterations update impulses.
+
+#### 4.1.4 Joint Constraints
+
+Supported joint types (`JointType`):
+
+| Joint | Constrained DOFs |
+|-------|------------------|
+| Revolute | Keeps 1 rotational DOF |
+| Weld | Fully fixes relative pose |
+| Prismatic | Keeps 1 translational DOF |
+| Spherical | Keeps 3 rotational DOFs |
+
+### 4.2 Rigid-Body Shapes
+
+| Type | Class | Collision detection |
+|------|-------|---------------------|
+| Ball | `BallRigid` | Analytical SDF |
+| Box | `BoxRigid` | 2D SAT |
+| Capsule | `CapsuleRigid` | Segment–point / ball |
+| Mesh | `MeshRigid` | Boundary edges + GJK-EPA |
+
+Implementation: `rigid.py`, `rigiddomain.py`, `rigidmanager.py`.
+
+### 4.3 Rigid Contact Pipeline
+
+Each substep of `RigidManager.substep()` performs:
+
+1. Velocity integration (including damping)
+2. **Broad phase**: BVH or spatial hashing
+3. **Narrow phase**: Dispatch by pair type (ball–ball, box–box, mesh–mesh, etc.)
+4. Assemble contact rows + joint rows → PGS matrix
+5. Iterative solve via `solve_pgs(iterations)`
+6. Position integration + AABB update
+
+### 4.4 Collision Filtering
+
+Uses ODE-style category/collide bitmasks:
+
+```
+Pair (a, b) is valid ⟺ (collide_bits[a] & category_bits[b]) ≠ 0
+                    and (collide_bits[b] & category_bits[a]) ≠ 0
+```
+
+Predefined categories: `COLLISION_CATEGORY_GROUND`, `COLLISION_CATEGORY_FEM`, `COLLISION_CATEGORY_ORDINARY_RIGID`, etc.
+
+---
+
+## 5. Ground Types
+
+All three grounds are **static obstacles** with `category_bits = COLLISION_CATEGORY_GROUND`, but differ in geometric representation and contact detection.
+
+### 5.1 GroundDomain — Analytical Plane
+
+**File**: `grounddomain.py`  
+**Type**: `DomainType.ANALYTICAL`
+
+#### Theory
+
+An infinite plane is defined by a reference point \(\mathbf{p}\) and a unit normal \(\mathbf{n}\):
 
 \[
 (\mathbf{x} - \mathbf{p}) \cdot \mathbf{n} = 0
 \]
 
-2D 中切向量为 \([ -n_y, n_x ]\)。平面可通过 `RigidManager` 绑定 BC 实现平移/旋转。
+In 2D the tangent is \([ -n_y, n_x ]\). The plane can translate/rotate via BCs bound through `RigidManager`.
 
-#### 接触检测
+#### Contact Detection
 
-- **刚体**：点到平面有符号距离 → 冲量施加于接触点
-- **FEM**：边界节点穿透检测 → 惩罚法向力
+- **Rigid**: Signed distance from point to plane → impulse applied at the contact point
+- **FEM**: Boundary-node penetration check → penalty normal force
 
-#### 使用示例
+#### Usage Example
 
 ```python
 from flatworld import GroundDomain
 
-# 水平地面：y=0.1，法向朝上
+# Horizontal ground: y=0.1, normal upward
 ground = GroundDomain(2, point=[0, 0.1], normal=[0, 1])
 ```
 
 ---
 
-### 5.2 HeightFieldDomain — 高度场
+### 5.2 HeightFieldDomain — Height Field
 
-**文件**：`heightfielddomain.py`  
-**类型**：`DomainType.HEIGHTFIELD`
+**File**: `heightfielddomain.py`  
+**Type**: `DomainType.HEIGHTFIELD`
 
-#### 理论
+#### Theory
 
-- **2D**：曲线 \(z = h(x)\)，存储为 1D 数组
-- **3D**：曲面 \(z = h(x, y)\)，存储为 2D 数组
+- **2D**: Curve \(z = h(x)\), stored as a 1D array
+- **3D**: Surface \(z = h(x, y)\), stored as a 2D array
 
-采样采用 **线性插值**，法向由高度梯度计算：
+Sampling uses **linear interpolation**; normals are computed from the height gradient:
 
 \[
 \mathbf{n} = \text{normalize}([-dh/dx,\ 1]) \quad \text{(2D)}
 \]
 
-#### 核心方法
+#### Core Methods
 
-| 方法 | 功能 |
-|------|------|
-| `sample_height_2d(x)` | 线性插值采样高度 |
-| `sample_normal_2d(x)` | 由 \(dh/dx\) 计算法向 |
-| `nearest_on_curve_2d(x, z)` | 最近点、法向、有符号距离 |
+| Method | Function |
+|--------|----------|
+| `sample_height_2d(x)` | Linearly interpolate height |
+| `sample_normal_2d(x)` | Compute normal from \(dh/dx\) |
+| `nearest_on_curve_2d(x, z)` | Nearest point, normal, and signed distance |
 
-#### 适用场景
+#### Typical Use Cases
 
-平滑地形：碗形凹槽、正弦波、斜坡等。
+Smooth terrain: bowl-shaped grooves, sine waves, slopes, etc.
 
-#### 使用示例
+#### Usage Example
 
 ```python
 from flatworld import HeightFieldDomain
@@ -359,253 +361,253 @@ hf = HeightFieldDomain(2, heights, lb=[0.0, 0.0], ub=[1.0, 1.0])
 
 ---
 
-### 5.3 VoxelGridDomain — 体素网格
+### 5.3 VoxelGridDomain — Voxel Grid
 
-**文件**：`voxeldomain.py`  
-**类型**：`DomainType.VOXELMAP`
+**File**: `voxeldomain.py`  
+**Type**: `DomainType.VOXELMAP`
 
-#### 理论
+#### Theory
 
-轴对齐 **占据网格** `occ[i,j] = 1` 表示固体单元。初始化时预计算 **边界边**（固体与空单元交界处）。
+An axis-aligned **occupancy grid** with `occ[i,j] = 1` for solid cells. At initialization, **boundary edges** (interfaces between solid and empty cells) are precomputed.
 
-#### 有符号距离
+#### Signed Distance
 
-- **内部**（占据单元内）：到最近面的距离（负值表示穿透）
-- **外部**：遍历预计算边界边，求最近边及法向
+- **Interior** (inside an occupied cell): Distance to the nearest face (negative for penetration)
+- **Exterior**: Traverse precomputed boundary edges to find the nearest edge and normal
 
-#### 适用场景
+#### Typical Use Cases
 
-凹形静态几何：坑洞、台阶、墙体、复杂障碍。
+Concave static geometry: pits, steps, walls, complex obstacles.
 
-#### 使用示例
+#### Usage Example
 
 ```python
 from flatworld import VoxelGridDomain
 import numpy as np
 
 occ = np.zeros((10, 10), dtype=np.int32)
-occ[:3, :] = 1  # 底部 3 行填充
+occ[:3, :] = 1  # Fill bottom 3 rows
 vox = VoxelGridDomain(2, nx=10, ny=10, lb=[0, 0], ub=[1, 1], occupancy_np=occ)
 ```
 
 ---
 
-### 5.4 三种地面对比
+### 5.4 Comparison of the Three Ground Types
 
-| 特性 | Ground | HeightField | Voxel |
-|------|--------|-------------|-------|
-| 几何 | 无限平面 | 参数曲线/曲面 | 占据网格 |
-| 凹形支持 | ❌ | 部分（单值函数） | ✅ |
-| 内存 | 极低 | O(nx) 或 O(nx·ny) | O(nx·ny) |
-| FEM 接触 | 惩罚力 | 惩罚力 | 惩罚力 |
-| 刚体接触 | PGS 冲量 | PGS 冲量 | PGS 冲量 |
-| 可运动 | ✅（BC 驱动） | ❌ 静态 | ❌ 静态 |
+| Property | Ground | HeightField | Voxel |
+|----------|--------|-------------|-------|
+| Geometry | Infinite plane | Parametric curve/surface | Occupancy grid |
+| Concave support | ❌ | Partial (single-valued function) | ✅ |
+| Memory | Very low | O(nx) or O(nx·ny) | O(nx·ny) |
+| FEM contact | Penalty force | Penalty force | Penalty force |
+| Rigid contact | PGS impulse | PGS impulse | PGS impulse |
+| Movable | ✅ (BC-driven) | ❌ Static | ❌ Static |
 
 ---
 
-## 6. 接触与碰撞
+## 6. Contact and Collision
 
-### 6.1 软体惩罚接触（FEM / Spring）
+### 6.1 Soft-Body Penalty Contact (FEM / Spring)
 
-#### 惩罚刚度（LS-DYNA 风格）
+#### Penalty Stiffness (LS-DYNA style)
 
 \[
 k = \text{slsfac} \cdot K \cdot \frac{A_{\text{seg}}^2}{V_{\text{elem}}}
 \]
 
-其中体积模量 \(K = E / [3(1-2\nu)]\)。
+where the bulk modulus is \(K = E / [3(1-2\nu)]\).
 
-2D 三角形简化：\(k = 2 \cdot \text{slsfac} \cdot K\)。
+2D triangle simplification: \(k = 2 \cdot \text{slsfac} \cdot K\).
 
-#### 稳定接触步长
+#### Stable Contact Step Size
 
 \[
 \Delta t_{\text{contact}} = 0.9 \sqrt{\frac{m_{\text{node}}}{k}}
 \]
 
-#### 接触力
+#### Contact Force
 
-穿透深度 \(d > 0\) 时：
+When penetration depth \(d > 0\):
 
 \[
 F_n = k \cdot d \cdot \mathbf{n}
 \]
 
-可选切向阻尼：\(F_t = -\mu k v_n \Delta t\)。
+Optional tangential damping: \(F_t = -\mu k v_n \Delta t\).
 
-实现位置：`femcontact.py`、`explicitloop.py` 批处理内核。
+Implementation: `femcontact.py`, batched kernels in `explicitloop.py`.
 
-### 6.2 刚体冲量接触
+### 6.2 Rigid Impulse Contact
 
-速度级约束，PGS 迭代求解：
+Velocity-level constraints solved iteratively with PGS:
 
 \[
 J \lambda = b
 \]
 
-其中 \(J\) 为约束 Jacobian，\(\lambda\) 为冲量，\(b\) 含 Baumgarte 修正项。
+where \(J\) is the constraint Jacobian, \(\lambda\) is the impulse, and \(b\) includes Baumgarte correction terms.
 
-### 6.3 宽相 / 窄相
+### 6.3 Broad Phase / Narrow Phase
 
-| 阶段 | 方法 | 文件 |
-|------|------|------|
-| 宽相 | BVH（LBVH） | `bvh.py` |
-| 宽相（备选） | 空间哈希 | `spatialmanager.py` |
-| 2D 凸体 | SAT | `sat.py` |
-| 3D 凸网格 | GJK-EPA | `gjk.py` |
-| 点-边 | `pointToEdgeContact` | `contact_detection.py` |
+| Stage | Method | File |
+|-------|--------|------|
+| Broad phase | BVH (LBVH) | `bvh.py` |
+| Broad phase (alt.) | Spatial hashing | `spatialmanager.py` |
+| 2D convex | SAT | `sat.py` |
+| 3D convex mesh | GJK-EPA | `gjk.py` |
+| Point–edge | `pointToEdgeContact` | `contact_detection.py` |
 
 ---
 
-## 7. 时间积分与自适应步长
+## 7. Time Integration and Adaptive Step Size
 
-### 7.1 固定帧率子步进
+### 7.1 Fixed-Frame-Rate Substepping
 
-`ExplicitLoop.advanceWithTime(frame_dt)` 将每帧（默认 1/60 s）拆分为多个子步：
+`ExplicitLoop.advanceWithTime(frame_dt)` splits each frame (default 1/60 s) into multiple substeps:
 
 ```python
 while remaining > 0:
     sub_dt = min(stableTime, remaining)
-    advance()          # 单个子步
+    advance()          # single substep
     remaining -= sub_dt
 ```
 
-### 7.2 稳定步长来源
+### 7.2 Sources of the Stable Step Size
 
-全局 `stableTime` 取各域最小值：
+Global `stableTime` is the minimum across domains:
 
 \[
 \Delta t_{\text{global}} = \min(\Delta t_{\text{FEM}},\ \Delta t_{\text{contact}},\ \Delta t_{\text{rigid}})
 \]
 
-### 7.3 可选质量缩放
+### 7.3 Optional Mass Scaling
 
-`mass_scaling_dt > 0` 时启用 LS-DYNA 风格选择性质量缩放，使小单元满足目标时间步。
+When `mass_scaling_dt > 0`, LS-DYNA-style selective mass scaling is enabled so that small elements meet the target time step.
 
 ---
 
-## 8. test2D 测试案例
+## 8. test2D Test Cases
 
-运行全部测试：
+Run all tests:
 
 ```bash
 pytest test2D
 ```
 
-### 8.1 FEM / 软体
+### 8.1 FEM / Soft Body
 
-| 测试文件 | 验证内容 |
-|----------|----------|
-| `test_2Dfem_elastic.py` | 2 三角形 FEM 块自由落体，自适应 dt |
-| `test_2Dfem_elastic10000.py` | 100×100 网格（~2 万元）性能与稳定性 |
-| `test_2Dfem_bcs.py` | FEM 边界条件 |
-| `test_2Dfem_force.py` | 施加力 BC |
-| `test_2Dfem_ics.py` | 初始速度/条件 |
-| `test_2Dfem_contact.py` | FEM 自接触 |
-| `test_2Dfem2domain_elastic.py` | 双 FEM 域共存 |
-| `test_2Dfemanalytic_contact.py` | FEM ↔ 解析平面接触 |
-| `test_2Dfem_heightfield_contact.py` | FEM 圆盘落入碗形高度场 |
-| `test_2Dfem_voxel_contact.py` | FEM 圆盘落入凹形体素坑 |
-| `test_2dfemrigid_contact.py` | FEM 与球/盒/网格刚体接触 |
-| `test_2Dfemcontact_types.py` | 接触类型与惩罚刚度单元测试 |
-| `test_2Dmaterial_functions.py` | 本构模型单元测试 |
+| Test file | What it verifies |
+|-----------|------------------|
+| `test_2Dfem_elastic.py` | 2-triangle FEM block freefall, adaptive dt |
+| `test_2Dfem_elastic10000.py` | 100×100 mesh (~20k elements) performance and stability |
+| `test_2Dfem_bcs.py` | FEM boundary conditions |
+| `test_2Dfem_force.py` | Applied force BCs |
+| `test_2Dfem_ics.py` | Initial velocities / conditions |
+| `test_2Dfem_contact.py` | FEM self-contact |
+| `test_2Dfem2domain_elastic.py` | Two coexisting FEM domains |
+| `test_2Dfemanalytic_contact.py` | FEM ↔ analytical plane contact |
+| `test_2Dfem_heightfield_contact.py` | FEM disk falling into a bowl height field |
+| `test_2Dfem_voxel_contact.py` | FEM disk falling into a concave voxel pit |
+| `test_2dfemrigid_contact.py` | FEM contact with ball/box/mesh rigid bodies |
+| `test_2Dfemcontact_types.py` | Contact types and penalty-stiffness unit tests |
+| `test_2Dmaterial_functions.py` | Constitutive-model unit tests |
 
-### 8.2 刚体
+### 8.2 Rigid Body
 
-| 测试文件 | 验证内容 |
-|----------|----------|
-| `test_2Drigid_contact.py` | 两球相向碰撞 |
-| `test_2Drigid_contact100.py` | 25 球网格 + 随机重力 |
-| `test_2Drigid_contact100_boxes.py` | 100 盒体接触压力测试 |
-| `test_2Drigid_contact100_capsules.py` | 100 胶囊接触 |
-| `test_2Drigid_contact100_mesh.py` | 100 网格刚体接触 |
-| `test_2Drigid_bcs.py` | 刚体 BC（固定、速度、加速度、旋转） |
-| `test_2Drigid_rot.py` | 刚体旋转动力学 |
-| `test_2Drigid_rotation_benchmark.py` | 旋转 BC 基准 |
-| `test_2Drigidanalytic_contact.py` | 刚体 ↔ 解析地面 |
-| `test_2Dbox_collision_response.py` | 盒-盒碰撞冲量响应 |
-| `test_2Dbox_friction.py` | Coulomb 摩擦（静/动摩擦） |
-| `test_2Dball_rolling_friction.py` | 圆盘滚动阻力（地面接触耗散） |
-| `test_2Dmeshrigid.py` | 网格刚体接触 |
-| `test_2Dcapsule_bbox.py` | 胶囊 AABB 正确性 |
-| `test_2Ddomino.py` | 多米诺骨牌连锁 |
+| Test file | What it verifies |
+|-----------|------------------|
+| `test_2Drigid_contact.py` | Two balls colliding head-on |
+| `test_2Drigid_contact100.py` | 25-ball grid + random gravity |
+| `test_2Drigid_contact100_boxes.py` | 100-box contact stress test |
+| `test_2Drigid_contact100_capsules.py` | 100-capsule contact |
+| `test_2Drigid_contact100_mesh.py` | 100 mesh-rigid contact |
+| `test_2Drigid_bcs.py` | Rigid BCs (fixed, velocity, acceleration, rotation) |
+| `test_2Drigid_rot.py` | Rigid rotational dynamics |
+| `test_2Drigid_rotation_benchmark.py` | Rotation BC benchmark |
+| `test_2Drigidanalytic_contact.py` | Rigid ↔ analytical ground |
+| `test_2Dbox_collision_response.py` | Box–box collision impulse response |
+| `test_2Dbox_friction.py` | Coulomb friction (static/dynamic) |
+| `test_2Dball_rolling_friction.py` | Disk rolling resistance (ground-contact dissipation) |
+| `test_2Dmeshrigid.py` | Mesh rigid-body contact |
+| `test_2Dcapsule_bbox.py` | Capsule AABB correctness |
+| `test_2Ddomino.py` | Domino chain reaction |
 
-### 8.3 地面类型
+### 8.3 Ground Types
 
-| 测试文件 | 验证内容 |
-|----------|----------|
-| `test_2Danalyticaldomain.py` | Ground / HeightField / Voxel 创建与球体落地 |
-| `test_2Danalytical_bcs.py` | 解析地面 + BC |
-| `test_2Danalytical_rotation_benchmark.py` | 旋转解析平面 |
+| Test file | What it verifies |
+|-----------|------------------|
+| `test_2Danalyticaldomain.py` | Ground / HeightField / Voxel creation and ball landing |
+| `test_2Danalytical_bcs.py` | Analytical ground + BCs |
+| `test_2Danalytical_rotation_benchmark.py` | Rotating analytical plane |
 
-### 8.4 关节 / 机构
+### 8.4 Joints / Mechanisms
 
-| 测试文件 | 验证内容 |
-|----------|----------|
-| `test_2Drevolute_joint.py` | 转动关节 |
-| `test_2Djoint_bcs.py` | 关节 + 旋转 BC |
-| `test_2Djoint_bcs_pdvel.py` | PD 速度控制 |
-| `test_2Djoint_bcs_pdforce.py` | PD 力矩控制 |
-| `test_2Djoint_kernels_unit.py` | 关节内核单元测试 |
-| `test_2Dpendulum_simple.py` | 多体摆链 |
-| `test_2Dlinkage.py` | 复杂连杆机构 |
-| `test_2Drobot.py` | 多体机器人 |
-| `test_2Dsolar_system.py` | 嵌套转动关节（地月系统） |
-| `test_2D_wheel_rolling.py` | 滚轮 + 摩擦 |
-| `test_2Dwheel_rolling_initials.py` | 滚轮初始条件变体 |
+| Test file | What it verifies |
+|-----------|------------------|
+| `test_2Drevolute_joint.py` | Revolute joint |
+| `test_2Djoint_bcs.py` | Joint + rotation BC |
+| `test_2Djoint_bcs_pdvel.py` | PD velocity control |
+| `test_2Djoint_bcs_pdforce.py` | PD torque control |
+| `test_2Djoint_kernels_unit.py` | Joint kernel unit tests |
+| `test_2Dpendulum_simple.py` | Multibody pendulum chain |
+| `test_2Dlinkage.py` | Complex linkage mechanism |
+| `test_2Drobot.py` | Multibody robot |
+| `test_2Dsolar_system.py` | Nested revolute joints (Earth–Moon system) |
+| `test_2D_wheel_rolling.py` | Wheel + friction |
+| `test_2Dwheel_rolling_initials.py` | Wheel initial-condition variants |
 
-### 8.5 弹簧-质量
+### 8.5 Spring–Mass
 
-| 测试文件 | 验证内容 |
-|----------|----------|
-| `test_2Dspring_bcs.py` | 弹簧网络 BC |
-| `test_2Dspring_10000.py` | 100×100 弹簧格点性能 |
+| Test file | What it verifies |
+|-----------|------------------|
+| `test_2Dspring_bcs.py` | Spring-network BCs |
+| `test_2Dspring_10000.py` | 100×100 spring lattice performance |
 
-### 8.6 碰撞 / 几何单元测试
+### 8.6 Collision / Geometry Unit Tests
 
-| 测试文件 | 验证内容 |
-|----------|----------|
-| `test_2Dcontact_detection.py` | 点-平面、点-边原语 |
+| Test file | What it verifies |
+|-----------|------------------|
+| `test_2Dcontact_detection.py` | Point–plane, point–edge primitives |
 | `test_2Dsat_collision.py` | 2D SAT |
-| `test_2Dgjk_collision.py` | GJK 占位测试 |
-| `test_2Dsegment_segment.py` | 线段-线段最近点 |
-| `test_2Dbvh.py` | BVH 宽相 |
+| `test_2Dgjk_collision.py` | GJK placeholder test |
+| `test_2Dsegment_segment.py` | Segment–segment nearest point |
+| `test_2Dbvh.py` | BVH broad phase |
 
-### 8.7 代表性案例说明
+### 8.7 Representative Case Notes
 
-#### 案例 A：FEM 自由落体（`test_2Dfem_elastic.py`）
+#### Case A: FEM Freefall (`test_2Dfem_elastic.py`)
 
-- 2 个三角形组成的小方块，重力 \(g = -1\)
-- 验证约 1 s 后落出视野（\(y < 0\)）
-- 演示 `ExplicitLoop(useAdapativeDT=True)` 自适应步长
+- Small square made of 2 triangles, gravity \(g = -1\)
+- Verifies fall out of view after ~1 s (\(y < 0\))
+- Demonstrates `ExplicitLoop(useAdapativeDT=True)` adaptive step size
 
-#### 案例 B：FEM 落入碗形高度场（`test_2Dfem_heightfield_contact.py`）
+#### Case B: FEM into Bowl Height Field (`test_2Dfem_heightfield_contact.py`)
 
-- 用 `FEMesher.createCircle` 生成圆盘 FEM 体
-- 高度场为半圆碗：\(h(x) = z_c - \sqrt{r^2 - (x-c_x)^2}\)
-- 验证节点未穿透碗底（\(y_{\min} > 0.05\)）
+- Disk FEM body generated with `FEMesher.createCircle`
+- Height field is a semicircle bowl: \(h(x) = z_c - \sqrt{r^2 - (x-c_x)^2}\)
+- Verifies nodes do not penetrate the bowl bottom (\(y_{\min} > 0.05\))
 
-#### 案例 C：FEM 落入体素坑（`test_2Dfem_voxel_contact.py`）
+#### Case C: FEM into Voxel Pit (`test_2Dfem_voxel_contact.py`)
 
-- 体素占据场形成碗状凹坑
-- FEM 圆盘从上方落下
-- 验证未穿透坑底（\(y_{\min} > 0.02\)）
+- Voxel occupancy forms a bowl-shaped pit
+- FEM disk falls from above
+- Verifies no penetration of the pit bottom (\(y_{\min} > 0.02\))
 
-#### 案例 D：FEM-刚体多类型接触（`test_2dfemrigid_contact.py`）
+#### Case D: FEM–Rigid Multi-Type Contact (`test_2dfemrigid_contact.py`)
 
-- 同一仿真中包含：FEM 圆盘 + BallRigid + BoxRigid + MeshRigid + Ground
-- 演示多物理场耦合
+- Same simulation includes: FEM disk + BallRigid + BoxRigid + MeshRigid + Ground
+- Demonstrates multiphysics coupling
 
-#### 案例 E：三种地面对比（`test_2Danalyticaldomain.py`）
+#### Case E: Three Ground Types Compared (`test_2Danalyticaldomain.py`)
 
-- 分别测试 GroundDomain、HeightFieldDomain、VoxelGridDomain
-- 球体自由落体，验证未穿透地面
+- Separately tests GroundDomain, HeightFieldDomain, VoxelGridDomain
+- Ball freefall; verifies no ground penetration
 
 ---
 
-## 9. 快速入门示例
+## 9. Quick-Start Examples
 
-### 9.1 FEM 自由落体
+### 9.1 FEM Freefall
 
 ```python
 import numpy as np
@@ -626,7 +628,7 @@ for _ in range(60):
     looper.advanceWithTime(1.0 / 60.0)
 ```
 
-### 9.2 刚体 + 解析地面
+### 9.2 Rigid Body + Analytical Ground
 
 ```python
 from flatworld import BallRigid, RigidBodyDomain, GroundDomain, Gravity, ExplicitLoop
@@ -640,7 +642,7 @@ for _ in range(120):
     looper.advanceWithTime(1.0 / 60.0)
 ```
 
-### 9.3 FEM + 高度场地面
+### 9.3 FEM + Height-Field Ground
 
 ```python
 from flatworld import FEMesher, FemDomain, HeightFieldDomain, Elastic, SolidProp, Gravity, ExplicitLoop
@@ -659,21 +661,21 @@ for _ in range(60):
 
 ---
 
-## 附录：关键源码索引
+## Appendix: Key Source Index
 
-| 主题 | 文件 | 关键符号 |
-|------|------|----------|
-| 主循环 | `explicitloop.py` | `ExplicitLoop`, `advanceWithTime`, `advance` |
-| FEM 积分 | `femspringmanager.py` | `femStep`, `FemSpringManager` |
-| 刚体求解 | `rigidmanager.py` | `substep`, `solve_pgs` |
-| 形函数/B 矩阵 | `mesh.py` | `getJacobian2D`, `getBMatrix2D` |
-| 本构 | `materials/materialfunctions.py` | `getStress2D`, `misesReturnMap2D` |
-| 惩罚接触 | `femcontact.py` | `ContactFlexAnalytical`, `_segment_penalty` |
-| 解析地面 | `grounddomain.py` | `GroundDomain` |
-| 高度场 | `heightfielddomain.py` | `sample_height_2d`, `nearest_on_curve_2d` |
-| 体素 | `voxeldomain.py` | `signed_distance_to_edges_2d`, `build_edges` |
-| 接触检测 | `contact_detection.py` | `pointToEdgeContact` |
+| Topic | File | Key symbols |
+|-------|------|-------------|
+| Main loop | `explicitloop.py` | `ExplicitLoop`, `advanceWithTime`, `advance` |
+| FEM integration | `femspringmanager.py` | `femStep`, `FemSpringManager` |
+| Rigid solver | `rigidmanager.py` | `substep`, `solve_pgs` |
+| Shape functions / B matrix | `mesh.py` | `getJacobian2D`, `getBMatrix2D` |
+| Constitutive | `materials/materialfunctions.py` | `getStress2D`, `misesReturnMap2D` |
+| Penalty contact | `femcontact.py` | `ContactFlexAnalytical`, `_segment_penalty` |
+| Analytical ground | `grounddomain.py` | `GroundDomain` |
+| Height field | `heightfielddomain.py` | `sample_height_2d`, `nearest_on_curve_2d` |
+| Voxel | `voxeldomain.py` | `signed_distance_to_edges_2d`, `build_edges` |
+| Contact detection | `contact_detection.py` | `pointToEdgeContact` |
 
 ---
 
-*文档基于 FlatWorld 当前代码库自动生成，反映 test2D 中已验证的功能。*
+*This document is auto-generated from the current FlatWorld codebase and reflects functionality verified in test2D.*

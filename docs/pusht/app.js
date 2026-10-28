@@ -6,13 +6,20 @@
   const backendEl = document.getElementById("backend");
 
   const params = new URLSearchParams(location.search);
-  const wsUrl = params.get("ws") || window.PUSHT_WS;
-  backendEl.textContent = wsUrl;
+  const endpoints = [
+    params.get("ws"),
+    window.PUSHT_WS,
+    window.PUSHT_WS_FALLBACK,
+  ].filter(Boolean);
+  let epIndex = 0;
+  let wsUrl = endpoints[0] || "";
+  if (backendEl) backendEl.textContent = wsUrl;
 
   const keys = new Set();
   let state = null;
   let ws = null;
   let reconnectAt = 0;
+  let everOpened = false;
 
   function send(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -23,14 +30,32 @@
   }
 
   function connect() {
+    if (!wsUrl) {
+      statusEl.textContent = "no backend configured";
+      return;
+    }
     statusEl.textContent = "connecting…";
-    ws = new WebSocket(wsUrl);
+    if (backendEl) backendEl.textContent = wsUrl;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (_) {
+      statusEl.textContent = "bad websocket url";
+      return;
+    }
     ws.onopen = () => {
+      everOpened = true;
       statusEl.textContent = "connected";
       send({ type: "hello" });
       syncKeys();
     };
     ws.onclose = () => {
+      if (!everOpened && epIndex + 1 < endpoints.length) {
+        epIndex += 1;
+        wsUrl = endpoints[epIndex];
+        statusEl.textContent = "trying fallback…";
+        reconnectAt = performance.now() + 400;
+        return;
+      }
       statusEl.textContent = "disconnected — retrying";
       reconnectAt = performance.now() + 1500;
     };

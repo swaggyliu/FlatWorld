@@ -63,7 +63,6 @@ depracted/
 !docs/statelewm_worldmodel.png
 !docs/statelewm_worldmodel.svg
 !docs/push_t_*.png
-# Manuscript stays local — author uploads to arXiv (cs.RO); not on GitHub.
 paper/
 
 # Local files
@@ -111,3 +110,7 @@ supermimic2d/**/__pycache__/
 supermimic2d/**/last.pt
 supermimic2d/**/_diag*/
 supermimic2d/**/frames/
+
+# Local notes (keep on disk, not in git)
+wechat_statelewm_update.md
+

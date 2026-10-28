@@ -2,30 +2,24 @@
 
 Host: `numericsv@8.138.152.185` (CPU, `cn-guangzhou`). Key: `D:/power-center/keys/id_ed25519`.
 
-## 1. 阿里云安全组放行 TCP 8765
+## 1. 安全组
 
-1. 打开 [ECS 控制台](https://ecs.console.aliyun.com/) → 地域选 **华南1（广州）**
-2. 实例 `i-7xv2m1atdhnhh0i890xw`（公网 IP `8.138.152.185`）→ **安全组** → 点安全组 ID 进入
-3. **入方向** → **手动添加**：
-   - 协议：自定义 TCP
-   - 端口：`8765/8765`
-   - 授权对象：`0.0.0.0/0`（或你自己的 IP）
-   - 策略：允许
-4. 保存后测：`http://8.138.152.185:8765/health` 应返回 `{"ok":true,...}`
+| 端口 | 用途 |
+|------|------|
+| **8765** | 游戏 HTTP / WS（已开即可 `http://8.138.152.185:8765/`） |
+| **80 + 443** | 可选：给 Pages 用的真 TLS（Caddy + `sslip.io`）。需 **root/`setcap`** 才能监听 443 |
 
-> **注意：** GitHub Pages 是 **https**，浏览器会拦截 `ws://IP:8765`（混合内容）。  
-> Pages 前端必须连 **wss://**（下面 Cloudflare 隧道，或你自己给 8765 配 TLS）。  
-> 放行 8765 方便本机 `http://` 直连调试；挂 Pages 仍用隧道 WSS。
+GitHub Pages 页面是 **https**。浏览器会拦截到 `ws://…` 的 WebSocket（混合内容），
+跟机器能不能出网无关——所以 Pages 上的画布必须连 **wss://**。
 
-## 2. Cloudflare 隧道（给 Pages 用的 WSS）
+可选两条路：
 
-```bash
-bash /tmp/remote_tunnel_service.sh   # 装成 user systemd
-journalctl --user -u flatworld-pusht-tunnel -n 50 --no-pager \
-  | grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -1
-```
+1. **Caddy + sslip.io**（直连阿里云 IP，无 Cloudflare）：放行 80/443，且能 bind 443  
+   `bash /tmp/remote_caddy_sslip.sh` → `wss://8.138.152.185.sslip.io/ws`
+2. **Cloudflare quick tunnel**（当前默认，无 root）：TLS 终止在隧道上，后端仍是本机 8765  
+   `bash /tmp/remote_tunnel_service.sh`
 
-把打印的 `https://….trycloudflare.com` 写进 `docs/pusht/config.js` 的 `PUSHT_WS`（`wss://…/ws`），再 push 触发 Pages。
+Pages 的 `docs/pusht/config.js` 会先试 sslip.io，失败再回退隧道。
 
 ## 3. 后端服务
 
