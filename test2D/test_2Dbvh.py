@@ -64,7 +64,8 @@ def test_bvh_overlapping_2d():
     assert len(cd.get_collision_pairs()) >= 1
 
 
-def test_bvh_same_env_no_collision_2d():
+def test_bvh_same_env_collision_2d():
+    """Overlapping AABBs that share env_id>=0 must still collide."""
     from flatworld.bvh import CollisionDetector
 
     cd = CollisionDetector(2, max_nodes=64)
@@ -75,6 +76,23 @@ def test_bvh_same_env_no_collision_2d():
     _set_aabb(aabbs, 1, [0.1, 0.1], [0.6, 0.6])
 
     cd.addObjects_batch(aabbs, np.array([0, 1], dtype=np.int32), np.array([0, 0], dtype=np.int32))
+    cd.build()
+    cd.detectInnerCollision()
+    assert len(cd.get_collision_pairs()) >= 1
+
+
+def test_bvh_diff_env_no_collision_2d():
+    """Overlapping AABBs with different env_id>=0 must be isolated."""
+    from flatworld.bvh import CollisionDetector
+
+    cd = CollisionDetector(2, max_nodes=64)
+    cd.reset()
+
+    aabbs = _ensure_aabbs_2d(64)
+    _set_aabb(aabbs, 0, [0.0, 0.0], [0.5, 0.5])
+    _set_aabb(aabbs, 1, [0.1, 0.1], [0.6, 0.6])
+
+    cd.addObjects_batch(aabbs, np.array([0, 1], dtype=np.int32), np.array([0, 1], dtype=np.int32))
     cd.build()
     cd.detectInnerCollision()
     assert len(cd.get_collision_pairs()) == 0
