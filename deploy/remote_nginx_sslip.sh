@@ -7,7 +7,7 @@
 # existing cert under ~/.local/nginx/certs or generates a self-signed one
 # (browsers will reject WSS from GitHub Pages until a public CA cert is used).
 #
-# Aliyun SG: open TCP 8443 (or 443 if using the root helper). Port 8765 can stay.
+# Aliyun SG: open TCP 8443 (or 443 if using the root helper). Keep 8765 closed.
 set -euo pipefail
 
 HOST="${PUSHT_TLS_HOST:?set PUSHT_TLS_HOST (e.g. \$IP.sslip.io)}"
@@ -61,6 +61,8 @@ events {
 }
 
 http {
+    limit_req_zone \$binary_remote_addr zone=pusht_requests:1m rate=5r/s;
+    limit_conn_zone \$binary_remote_addr zone=pusht_connections:1m;
     include       ${PREFIX}/conf/mime.types;
     default_type  application/octet-stream;
     access_log    ${PREFIX}/logs/access.log;
@@ -88,11 +90,13 @@ http {
         ssl_protocols       TLSv1.2 TLSv1.3;
 
         location / {
+            limit_req zone=pusht_requests burst=10 nodelay;
+            limit_conn pusht_connections 10;
             proxy_pass http://${UPSTREAM};
             proxy_http_version 1.1;
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_set_header X-Forwarded-Proto \$scheme;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection \$connection_upgrade;

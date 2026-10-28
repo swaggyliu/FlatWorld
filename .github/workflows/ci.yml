@@ -33,6 +33,12 @@ jobs:
         run: |
           python -m pytest test2D -q --tb=short --timeout=120
 
+      - name: Web game security regressions
+        run: |
+          pip install -e ".[web]"
+          python -m pytest tests/game -q --tb=short --timeout=30
+          node --test tests/game/web_client.test.cjs
+
       - name: Learning import smoke (optional)
         continue-on-error: true
         run: |

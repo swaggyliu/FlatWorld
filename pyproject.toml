@@ -46,6 +46,10 @@ learning = [
 game = [
     "raylib>=5.0",
 ]
+web = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
 all = [
     "flatworld[dev,learning,game]",
 ]

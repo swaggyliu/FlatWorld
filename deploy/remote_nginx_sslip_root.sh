@@ -8,7 +8,7 @@
 # Prerequisites (Aliyun 安全组 inbound):
 #   TCP 80  — ACME HTTP-01
 #   TCP 443 — HTTPS / WSS
-# (Port 8765 can remain open for direct health checks.)
+# Keep public TCP 8765 closed; health checks use the HTTPS endpoint.
 set -euo pipefail
 
 HOST="${PUSHT_TLS_HOST:?set PUSHT_TLS_HOST (e.g. \$IP.sslip.io)}"
@@ -31,15 +31,20 @@ systemctl stop caddy 2>/dev/null || true
 pkill -u "$APP_USER" -f 'caddy run' 2>/dev/null || true || true
 
 cat > /etc/nginx/sites-available/flatworld-pusht <<EOF
+limit_req_zone \$binary_remote_addr zone=pusht_requests:1m rate=5r/s;
+limit_conn_zone \$binary_remote_addr zone=pusht_connections:1m;
 server {
     listen 80;
     server_name ${HOST};
     location / {
+        limit_req zone=pusht_requests burst=10 nodelay;
+        limit_conn pusht_connections 10;
         proxy_pass http://${UPSTREAM};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        # Replace client-supplied forwarding headers at the public edge.
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";

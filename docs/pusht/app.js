@@ -24,6 +24,7 @@
   let ws = null;
   let reconnectAt = 0;
   let everOpened = false;
+  let retryDelay = 1500;
   let difficulty = "medium";
   let portrait = false;
   let scale = 280;
@@ -96,6 +97,14 @@
   }
 
   function rematch() {
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      epIndex = 0;
+      wsUrl = endpoints[0] || "";
+      everOpened = false;
+      retryDelay = 1500;
+      connect();
+      return;
+    }
     send({ type: "rematch" });
   }
 
@@ -113,12 +122,19 @@
     }
     ws.onopen = () => {
       everOpened = true;
+      retryDelay = 1500;
       statusEl.textContent = "connected";
       send({ type: "hello" });
       send({ type: "difficulty", level: difficulty });
       syncStick(stick.x, stick.y, true);
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      state = null;
+      if ([1000, 1008, 1009].includes(event.code)) {
+        statusEl.textContent = event.reason || "Session ended — press Rematch to reconnect";
+        reconnectAt = Infinity;
+        return;
+      }
       if (!everOpened && epIndex + 1 < endpoints.length) {
         epIndex += 1;
         wsUrl = endpoints[epIndex];
@@ -127,7 +143,8 @@
         return;
       }
       statusEl.textContent = "disconnected — retrying";
-      reconnectAt = performance.now() + 1500;
+      reconnectAt = performance.now() + retryDelay + Math.random() * 500;
+      retryDelay = Math.min(30000, retryDelay * 2);
     };
     ws.onerror = () => {};
     ws.onmessage = (ev) => {
