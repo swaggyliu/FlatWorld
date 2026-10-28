@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Reuse CI compute-venv (already has torch+warp). Install only missing deps
-# via Aliyun PyPI mirror.
+# Reuse CI compute-venv (torch+warp). Install only missing deps via Aliyun PyPI.
 set -euo pipefail
 
-VENV=/opt/flexphysics/compute-venv
+APP_DIR="${PUSHT_REMOTE_DIR:-$HOME/flatworld}"
+VENV="${PUSHT_VENV:-/opt/flexphysics/compute-venv}"
 PY="$VENV/bin/python"
 export VIRTUAL_ENV="$VENV"
 export UV_PROJECT_ENVIRONMENT="$VENV"
 export UV_INDEX_URL="${UV_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 
-echo "Using $PY"
-"$PY" /tmp/probe_imports.py || true
+echo "Using $PY (app=$APP_DIR)"
+if [ -f /tmp/probe_imports.py ]; then
+  "$PY" /tmp/probe_imports.py || true
+fi
 
 uv_install() {
   local pkg="$1"
@@ -24,11 +26,8 @@ uv_install() {
 "$PY" -c "import hydra" 2>/dev/null || uv_install hydra-core
 "$PY" -c "import omegaconf" 2>/dev/null || uv_install omegaconf
 
-echo "--- after installs ---"
-"$PY" /tmp/probe_imports.py
-
-cd /home/numericsv/flatworld
-rm -rf /home/numericsv/flatworld/.venv
+cd "$APP_DIR"
+rm -rf "$APP_DIR/.venv"
 uv pip install -e . --no-deps
 
 mkdir -p "$HOME/.config/systemd/user"
@@ -39,7 +38,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/numericsv/flatworld
+WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=FLATWORLD_DEVICE=cpu
 Environment=VIRTUAL_ENV=${VENV}
@@ -51,7 +50,6 @@ RestartSec=5
 WantedBy=default.target
 EOF
 
-# linger so user services survive logout
 loginctl enable-linger "$(whoami)" 2>/dev/null || true
 systemctl --user daemon-reload
 systemctl --user enable flatworld-pusht.service

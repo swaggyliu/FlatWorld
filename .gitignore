@@ -114,3 +114,8 @@ supermimic2d/**/frames/
 # Local notes (keep on disk, not in git)
 wechat_statelewm_update.md
 
+# Deploy secrets / machine-specific ops (never commit)
+deploy/local.env
+deploy/*.local.*
+deploy/_pusht_sync.tgz
+

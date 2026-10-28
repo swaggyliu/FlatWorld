@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # User-space nginx TLS front for Push-T (no root).
-# Default listen: 8443 → 127.0.0.1:8765  (hostname 8.138.152.185.sslip.io)
+# Default listen: 8443 → 127.0.0.1:8765  (set PUSHT_TLS_HOST)
 #
 # Real Let's Encrypt certs require binding :80/:443 (root/setcap) — see
 # deploy/remote_nginx_sslip_root.sh. Without that, this script uses an
@@ -10,7 +10,7 @@
 # Aliyun SG: open TCP 8443 (or 443 if using the root helper). Port 8765 can stay.
 set -euo pipefail
 
-HOST="${PUSHT_TLS_HOST:-8.138.152.185.sslip.io}"
+HOST="${PUSHT_TLS_HOST:?set PUSHT_TLS_HOST (e.g. \$IP.sslip.io)}"
 LISTEN_PORT="${PUSHT_NGINX_PORT:-8443}"
 UPSTREAM="${PUSHT_UPSTREAM:-127.0.0.1:8765}"
 PREFIX="${HOME}/.local/nginx"

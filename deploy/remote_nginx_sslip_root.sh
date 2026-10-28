@@ -3,7 +3,7 @@
 # Run on aliyun-node2 as a user with passwordless or interactive sudo, e.g.:
 #   sudo bash /tmp/remote_nginx_sslip_root.sh
 #   # or from your laptop after scp:
-#   ssh -t numericsv@8.138.152.185 'sudo bash -s' < deploy/remote_nginx_sslip_root.sh
+#   ssh -t "$PUSHT_SSH_USER@$PUSHT_SSH_HOST" 'sudo bash -s' < deploy/remote_nginx_sslip_root.sh
 #
 # Prerequisites (Aliyun 安全组 inbound):
 #   TCP 80  — ACME HTTP-01
@@ -11,9 +11,9 @@
 # (Port 8765 can remain open for direct health checks.)
 set -euo pipefail
 
-HOST="${PUSHT_TLS_HOST:-8.138.152.185.sslip.io}"
+HOST="${PUSHT_TLS_HOST:?set PUSHT_TLS_HOST (e.g. \$IP.sslip.io)}"
 UPSTREAM="${PUSHT_UPSTREAM:-127.0.0.1:8765}"
-APP_USER="${PUSHT_APP_USER:-numericsv}"
+APP_USER="${PUSHT_APP_USER:-${SUDO_USER:-$USER}}"
 APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6)"
 
 if [ "$(id -u)" -ne 0 ]; then

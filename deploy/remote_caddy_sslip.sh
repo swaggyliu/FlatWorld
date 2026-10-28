@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Terminate TLS on Aliyun for GitHub Pages WSS (no Cloudflare relay).
-# Hostname: 8.138.152.185.sslip.io  →  127.0.0.1:8765
-# Requires Aliyun SG inbound TCP 80 + 443 (ACME + HTTPS).
+# Hostname: set PUSHT_TLS_HOST (e.g. $IP.sslip.io) → 127.0.0.1:8765
+# Requires cloud SG inbound TCP 80 + 443 (ACME + HTTPS).
 set -euo pipefail
 
-HOST="8.138.152.185.sslip.io"
+HOST="${PUSHT_TLS_HOST:?set PUSHT_TLS_HOST}"
 BIN="$HOME/.local/bin/caddy"
 mkdir -p "$(dirname "$BIN")" "$HOME/.config/caddy"
 

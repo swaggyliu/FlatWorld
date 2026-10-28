@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /home/numericsv/flatworld
+APP_DIR="${PUSHT_REMOTE_DIR:-$HOME/flatworld}"
+cd "$APP_DIR"
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 rm -rf .venv
 uv venv .venv --python python3
@@ -14,17 +15,17 @@ uv pip install -e .
 python -c 'import flatworld, torch, fastapi; print("imports_ok", torch.__version__)'
 
 mkdir -p "$HOME/.config/systemd/user"
-cat > "$HOME/.config/systemd/user/flatworld-pusht.service" <<'EOF'
+cat > "$HOME/.config/systemd/user/flatworld-pusht.service" <<EOF
 [Unit]
 Description=FlatWorld Push-T You vs AI WebSocket
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/numericsv/flatworld
+WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=FLATWORLD_DEVICE=cpu
-ExecStart=/home/numericsv/flatworld/.venv/bin/python -m game.web_server --host 0.0.0.0 --port 8765
+ExecStart=${APP_DIR}/.venv/bin/python -m game.web_server --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=5
 
