@@ -5,16 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="mobile-web-app-capable" content="yes" />
   <title>FlatWorld — You vs AI (Push-T)</title>
-  <link rel="stylesheet" href="style.css?v=round5" />
+  <link rel="stylesheet" href="style.css?v=score7" />
 </head>
 <body>
   <header>
     <h1>You vs AI</h1>
     <p class="sub">Push-T · seat the T on the ghost goal before the AI</p>
   </header>
-  <div class="bar">
-    <span id="score">YOU 0 — AI 0</span>
-    <span id="status">connecting…</span>
+  <div class="bar match-hud">
+    <section id="score" class="scoreboard" aria-label="Match score">
+      <div id="score-you-panel" class="score-side score-you">
+        <span class="score-name"><span class="score-dot" aria-hidden="true"></span>YOU</span>
+        <strong id="score-you" class="score-value">0</strong>
+        <span id="score-you-label" class="score-caption">WINS</span>
+      </div>
+      <div class="score-center">
+        <span class="score-versus">VS</span>
+        <span class="score-draws"><strong id="score-draw">0</strong> DRAWS</span>
+      </div>
+      <div id="score-ai-panel" class="score-side score-ai">
+        <span class="score-name"><span class="score-dot" aria-hidden="true"></span>AI</span>
+        <strong id="score-ai" class="score-value">0</strong>
+        <span id="score-ai-label" class="score-caption">WINS</span>
+      </div>
+    </section>
+    <div class="match-status"><span class="status-dot" aria-hidden="true"></span><span id="status" role="status">connecting…</span></div>
   </div>
   <div class="toolbar">
     <div id="difficulty" class="difficulty" aria-label="AI difficulty">
@@ -61,6 +76,6 @@
   <script src="config.js?v=play3"></script>
   <script src="audio.js?v=play3"></script>
   <script src="motion.js?v=round5"></script>
-  <script src="app.js?v=clock6"></script>
+  <script src="app.js?v=score7"></script>
 </body>
 </html>

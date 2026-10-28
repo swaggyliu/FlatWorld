@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>FlatWorld — 2D physics + StateLeWM</title>
-  <link rel="stylesheet" href="pusht/style.css?v=round5" />
+  <link rel="stylesheet" href="pusht/style.css?v=score7" />
   <style>
     :root {
       --ink: #152018;
@@ -25,6 +25,7 @@
       min-height: 100vh;
     }
     .wrap {
+      width: 100%;
       max-width: 1120px;
       margin: 0 auto;
       padding: 1.4rem 1.1rem 3.5rem;
@@ -93,6 +94,8 @@
       font-size: 0.9rem;
       color: var(--muted);
     }
+    .play-shell .match-status #status { color: #87610d; }
+    .play-shell .status-dot { background: #a1710d; }
     .play-shell canvas {
       width: 100%;
       height: auto;
@@ -227,9 +230,24 @@
         <h2>You vs AI — Push-T</h2>
         <p class="sub">Seat the T on the ghost goal. First side to succeed wins.</p>
       </header>
-      <div class="bar">
-        <span id="score">YOU 0 — AI 0</span>
-        <span id="status">connecting…</span>
+      <div class="bar match-hud">
+        <section id="score" class="scoreboard" aria-label="Match score">
+          <div id="score-you-panel" class="score-side score-you">
+            <span class="score-name"><span class="score-dot" aria-hidden="true"></span>YOU</span>
+            <strong id="score-you" class="score-value">0</strong>
+            <span id="score-you-label" class="score-caption">WINS</span>
+          </div>
+          <div class="score-center">
+            <span class="score-versus">VS</span>
+            <span class="score-draws"><strong id="score-draw">0</strong> DRAWS</span>
+          </div>
+          <div id="score-ai-panel" class="score-side score-ai">
+            <span class="score-name"><span class="score-dot" aria-hidden="true"></span>AI</span>
+            <strong id="score-ai" class="score-value">0</strong>
+            <span id="score-ai-label" class="score-caption">WINS</span>
+          </div>
+        </section>
+        <div class="match-status"><span class="status-dot" aria-hidden="true"></span><span id="status" role="status">connecting…</span></div>
       </div>
       <div class="toolbar">
         <div id="difficulty" class="difficulty" aria-label="AI difficulty">
@@ -342,6 +360,6 @@
   <script src="pusht/config.js?v=play3"></script>
   <script src="pusht/audio.js?v=play3"></script>
   <script src="pusht/motion.js?v=round5"></script>
-  <script src="pusht/app.js?v=clock6"></script>
+  <script src="pusht/app.js?v=score7"></script>
 </body>
 </html>

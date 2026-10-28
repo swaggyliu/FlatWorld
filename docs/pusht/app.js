@@ -3,6 +3,20 @@
   const ctx = canvas.getContext("2d");
   const statusEl = document.getElementById("status");
   const scoreEl = document.getElementById("score");
+  const scoreValues = {
+    you: document.getElementById("score-you"),
+    ai: document.getElementById("score-ai"),
+    draw: document.getElementById("score-draw"),
+  };
+  const scorePanels = {
+    you: document.getElementById("score-you-panel"),
+    ai: document.getElementById("score-ai-panel"),
+  };
+  const scoreLabels = {
+    you: document.getElementById("score-you-label"),
+    ai: document.getElementById("score-ai-label"),
+  };
+  let previousScore = null;
   const diffEl = document.getElementById("difficulty");
   const rematchBtn = document.getElementById("rematch");
   const pauseBtn = document.getElementById("pause");
@@ -65,6 +79,40 @@
 
   function send(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  function updateScore(msg) {
+    const score = msg.score;
+    if (!score || !scoreEl) return;
+    // Keep cached pages with the original single-line score working too.
+    if (!scoreValues.you || !scoreValues.ai || !scoreValues.draw) {
+      scoreEl.textContent = `YOU ${score.you} — AI ${score.ai}` +
+        (score.draw ? ` (draw ${score.draw})` : "");
+      return;
+    }
+    for (const key of ["you", "ai", "draw"]) {
+      const value = score[key] ?? 0;
+      const el = scoreValues[key];
+      if (el.textContent !== String(value)) el.textContent = String(value);
+      el.classList.toggle("is-long", String(value).length > 3);
+      if (previousScore && value > (previousScore[key] ?? 0)
+          && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        el.animate?.([
+          { transform: "scale(1)" },
+          { transform: "scale(1.2)", filter: "brightness(1.5)", offset: 0.4 },
+          { transform: "scale(1)" },
+        ], { duration: 420, easing: "ease-out" });
+      }
+    }
+    for (const key of ["you", "ai"]) {
+      const won = msg.phase === "over" && msg.winner === (key === "you" ? "player" : "ai");
+      const leading = score[key] > score[key === "you" ? "ai" : "you"];
+      const result = won ? "winner" : leading ? "leading" : "";
+      if (scorePanels[key]) scorePanels[key].dataset.result = result;
+      if (scoreLabels[key]) scoreLabels[key].textContent = won ? "ROUND WINNER" : leading ? "LEADING" : "WINS";
+    }
+    scoreEl.setAttribute("aria-label", `Match score: You ${score.you}, AI ${score.ai}, draws ${score.draw ?? 0}`);
+    previousScore = { ...score };
   }
 
   function flushStick(force) {
@@ -148,6 +196,7 @@
       syncStick(stick.x, stick.y, true);
     };
     ws.onclose = (event) => {
+      previousScore = null;
       state = null;
       clock = null;
       motion.clear();
@@ -190,7 +239,7 @@
           pauseBtn.textContent = msg.paused ? "Resume" : "Pause";
           pauseBtn.setAttribute("aria-pressed", String(!!msg.paused));
         }
-        if (msg.status) statusEl.textContent = msg.status;
+        if (msg.status && statusEl.textContent !== msg.status) statusEl.textContent = msg.status;
         if (msg.difficulty && msg.difficulty !== difficulty) {
           difficulty = msg.difficulty;
           if (diffEl) {
@@ -200,11 +249,7 @@
             }
           }
         }
-        if (msg.score) {
-          scoreEl.textContent =
-            `YOU ${msg.score.you} — AI ${msg.score.ai}` +
-            (msg.score.draw ? ` (draw ${msg.score.draw})` : "");
-        }
+        updateScore(msg);
       } catch (_) {}
     };
   }
