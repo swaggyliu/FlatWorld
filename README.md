@@ -64,7 +64,8 @@ pytest test2D/test_2Dfem_elastic.py
 One **state + tactile latent world model** (~320K params), three controllers.
 Full architecture / losses: **[learning/README.md](learning/README.md)**.
 Paradigm comparison + roadmap: **[docs/PARADIGMS.md](docs/PARADIGMS.md)**.
-Site: [GitHub Pages](https://swaggyliu.github.io/FlatWorld/) ·
+Site: [GitHub Pages](https://swaggyliu.github.io/FlatWorld/)
+(enable once: **Settings → Pages → Source = GitHub Actions**) ·
 Play: `python -m game --mode pusht` (**You vs AI**) ·
 Manuscript: arXiv forthcoming (**cs.RO**, no PDF in-repo).
 

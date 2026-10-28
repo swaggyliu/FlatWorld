@@ -1,3 +1,9 @@
+# Deploy docs/ to GitHub Pages.
+#
+# One-time repo setup (required before this workflow can succeed):
+#   Settings → Pages → Build and deployment → Source: GitHub Actions
+# `actions/configure-pages` enablement needs a PAT and cannot create the
+# site with GITHUB_TOKEN alone; enable Pages in the UI first.
 name: Pages
 
 on:
@@ -25,9 +31,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        continue-on-error: true
+
+      - name: Require Pages enabled
+        if: steps.pages.outcome != 'success'
+        run: |
+          echo "::error::GitHub Pages is not enabled for this repository (API 404)."
+          echo "Fix once: Settings → Pages → Build and deployment → Source: GitHub Actions"
+          echo "Then re-run this workflow (Actions → Pages → Re-run, or push to docs/)."
+          exit 1
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs
+
       - id: deployment
         uses: actions/deploy-pages@v4
