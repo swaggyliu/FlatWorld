@@ -459,19 +459,42 @@
   });
 
   function receiveClock(msg) {
+    const now = performance.now();
+    const steps = [msg.left?.t, msg.right?.t].filter(value => Number.isFinite(value) && value >= 0);
+    const step = steps.length ? Math.max(...steps) : null;
     let duration = msg.round_duration;
     let remaining = msg.time_remaining;
-    if (!(Number.isFinite(duration) && duration > 0 && Number.isFinite(remaining))) {
-      // Protocol v1 has no seconds fields. Use its actual 1,100-step budget;
-      // do not pretend that an old game server includes the new extra 10s.
-      const steps = [msg.left?.t, msg.right?.t].filter(value => Number.isFinite(value) && value >= 0);
-      if (!steps.length) { clock = null; return; }
+    const authoritative = Number.isFinite(duration) && duration > 0 && Number.isFinite(remaining);
+    const source = authoritative ? "server" : "legacy";
+    const reset = !clock || msg.phase === "countdown"
+      || (msg.round_id != null && clock.roundId != null && msg.round_id !== clock.roundId)
+      || (step != null && clock.step != null && step < clock.step)
+      || (authoritative && clock.source === "server" && duration !== clock.duration);
+    if (!authoritative) {
+      // Old servers have a 1,100-step budget but may omit or repeat counters.
+      // Carry elapsed time between messages instead of restarting the clock
+      // on every snapshot. Step progress can move the estimate forward too.
       const stepsPerSecond = 30 * 3;
       duration = 1100 / stepsPerSecond;
-      remaining = msg.phase === "countdown" ? duration : duration - Math.max(...steps) / stepsPerSecond;
+      remaining = duration;
+      if (!reset && clock.source === source) remaining = clockRemaining(now);
+      if (step != null && msg.phase !== "countdown") {
+        remaining = Math.min(remaining, duration - step / stepsPerSecond);
+      }
+    }
+    // Repeated server timestamps must not undo progress between snapshots.
+    if (!reset && clock.source === source && clock.running && msg.phase === "race") {
+      remaining = Math.min(remaining, clockRemaining(now));
     }
     clock = { duration, remaining: Math.max(0, Math.min(duration, remaining)),
-      receivedAt: performance.now(), running: msg.phase === "race" && !msg.paused };
+      receivedAt: now, running: msg.phase === "race" && !msg.paused,
+      source, step, roundId: msg.round_id };
+  }
+
+  function clockRemaining(now) {
+    // Stop extrapolating after a second without snapshots on a stale connection.
+    const elapsed = clock.running ? Math.min(1, Math.max(0, (now - clock.receivedAt) / 1000)) : 0;
+    return Math.max(0, clock.remaining - elapsed);
   }
 
   function updateClock() {
@@ -483,10 +506,7 @@
       clockEl.dataset.urgent = "false";
       return;
     }
-    // Smooth normal network intervals; stop extrapolating after a second
-    // without a snapshot so an interrupted connection cannot invent a timeout.
-    const elapsed = clock.running ? Math.min(1, Math.max(0, (performance.now() - clock.receivedAt) / 1000)) : 0;
-    const remaining = Math.max(0, clock.remaining - elapsed);
+    const remaining = clockRemaining(performance.now());
     progressEl.max = clock.duration;
     progressEl.value = remaining;
     timeEl.textContent = `${Math.ceil(remaining * 10) / 10}s${state?.paused ? " · paused" : ""}`;
