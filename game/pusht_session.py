@@ -302,7 +302,7 @@ class PushTVersusSession:
     # Slow the complete AI trajectory, preserving its trained force/dynamics
     # and one decision per base_hold AI physics steps (normally five).
     _DIFFICULTY = {
-        "low": {"speed": 0.55},
+        "low": {"speed": 0.35},
         "medium": {"speed": 0.78},
         "high": {"speed": 1.0},
     }
