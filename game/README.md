@@ -26,9 +26,9 @@ round. Both players receive identical starting poses and dynamics. `--seed`
 reproduces the sequence of openings (default: 1000).
 The web difficulty buttons are Easy / Normal / Hard. All three use the trained
 action hold (default: five AI physics steps per decision) and full policy force.
-Difficulty only changes the AI's simulation speed to 35% / 78% / 100%; the player
+Difficulty only changes the AI's simulation speed to 10% / 40% / 100%; the player
 and round clock keep their normal pace. At the default 30 Hz server tick and three
-physics steps per tick, this averages 6.3 / 14.04 / 18 decisions per real second
+physics steps per tick, this averages 1.8 / 7.2 / 18 decisions per real second
 when the server keeps up. This restores the training cadence.
 No ground horizon — top-down table feel. Bounce on the spirit is a jelly
 squash/stretch aura (not a coil spring).
