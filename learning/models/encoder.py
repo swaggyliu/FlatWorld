@@ -145,11 +145,15 @@ def knn_adjacency(dist, gap, k_nn: int = 2, gap_cut: float = 0.12):
     """
     B, N, _ = dist.shape
     k = min(int(k_nn), max(N - 1, 1))
-    eye = torch.eye(N, device=dist.device, dtype=torch.bool).unsqueeze(0)
+    # Index equality (not torch.eye) so ONNX/ORT avoid unsupported EyeLike.
+    idx = torch.arange(N, device=dist.device)
+    eye = (idx.unsqueeze(0) == idx.unsqueeze(1)).unsqueeze(0)  # (1,N,N)
     dist_nn = dist.masked_fill(eye, 1e6)
     knn = dist_nn.topk(k, dim=-1, largest=False).indices
+    # Use a bool tensor (not scalar True) so TorchScript/ONNX can lower scatter_.
     adj = torch.zeros(B, N, N, dtype=torch.bool, device=dist.device)
-    adj.scatter_(2, knn, True)
+    knn_true = torch.ones(knn.shape, dtype=torch.bool, device=dist.device)
+    adj.scatter_(2, knn, knn_true)
     adj = adj | (gap < gap_cut)
     return adj & ~eye.expand(B, -1, -1)
 

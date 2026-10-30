@@ -25,6 +25,7 @@ uv_install() {
 "$PY" -c "import rsl_rl" 2>/dev/null || uv_install rsl-rl-lib
 "$PY" -c "import hydra" 2>/dev/null || uv_install hydra-core
 "$PY" -c "import omegaconf" 2>/dev/null || uv_install omegaconf
+"$PY" -c "import onnxruntime" 2>/dev/null || uv_install "onnxruntime>=1.17"
 
 cd "$APP_DIR"
 rm -rf "$APP_DIR/.venv"
@@ -45,7 +46,7 @@ Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=VIRTUAL_ENV=${VENV}
-ExecStart=${PY} -m game.web_server --host 127.0.0.1 --port 8765 --hz 30 --allow-no-origin
+ExecStart=${PY} -m game.web_server --host 127.0.0.1 --port 8765 --hz 20 --max-sessions 8 --max-sessions-per-ip 8 --allow-no-origin
 Restart=on-failure
 RestartSec=5
 

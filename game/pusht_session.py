@@ -14,33 +14,38 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
-import torch
-from tensordict import TensorDict
 
 
 @dataclass
 class SharedPushTAssets:
-    """WM + PPO loaded once and reused across concurrent web sessions."""
+    """Policy backend loaded once and reused across concurrent web sessions.
 
-    wm: Any
+    ``policy`` exposes ``.act(cur, stem_goal, bar_goal, goal_theta) -> [-1,1]^2``
+    and ``.hold``. Prefer ONNX Runtime on CPU game hosts when
+    ``pusht_infer.onnx`` sits next to the PPO checkpoint.
+
+    ``active_sessions`` is updated by the web server so ticks can shed AI
+    work under Warp's effectively-serialized CPU physics.
+    """
+
     policy: Any
     hold: int
-    task_features: Callable
     device: str
+    backend: str
     inference_lock: threading.Lock
-    _train_env: Any = None
+    # Warp module/kernel load is not safe across concurrent env constructors.
+    env_init_lock: threading.Lock = None  # type: ignore[assignment]
+    active_sessions: int = 0
+
+    def __post_init__(self):
+        if self.env_init_lock is None:
+            self.env_init_lock = threading.Lock()
 
     def close(self):
-        env = self._train_env
-        if env is not None and hasattr(env, "close"):
-            try:
-                env.close()
-            except Exception:
-                pass
-            self._train_env = None
+        return
 
 
 def load_shared_pusht_assets(
@@ -49,59 +54,34 @@ def load_shared_pusht_assets(
     device: str | None = None,
     hold: int = 5,
 ) -> SharedPushTAssets:
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    wm, policy, env, hold_i, task_features = _load_policy(
-        wm_path, policy_path, device, hold)
-    return SharedPushTAssets(
-        wm=wm,
-        policy=policy,
-        hold=int(hold_i),
-        task_features=task_features,
-        device=device,
-        inference_lock=threading.Lock(),
-        _train_env=env,
-    )
-
-
-def _load_policy(wm_path: str, policy_path: str, device: str, hold: int):
-    from learning.tasks.push_to_goal import load_ensemble
-    from learning.rl.imagine import WMBundle, task_features
-    from learning.train_rsl_wm_push_t import WMObsVecEnv
-    from learning.rl.push_t_vec_env import PushTVecEnv
-    from learning.train_rsl_push_t import make_train_cfg
-    from rsl_rl.runners import OnPolicyRunner
-    import argparse
-
     if not os.path.exists(policy_path):
         raise FileNotFoundError(
             f"Push-T policy not found: {policy_path}\n"
             "Train with: python -m learning.train_rsl_wm_push_t "
             "--wm learning/checkpoints/push_t "
-            "--out learning/checkpoints/push_t_wm_rsl --target-rate 0.9")
+            "--out learning/checkpoints/push_t_wm_rsl --target-rate 0.9\n"
+            "Optional ONNX: python -m learning.export_pusht_onnx "
+            f"--wm {wm_path} --policy {policy_path}")
 
-    models, norm, stride = load_ensemble(wm_path, device)
-    wm = WMBundle(models[0], norm, device, stride=stride)
-    for p in wm.model.parameters():
-        p.requires_grad_(False)
-    wm.model.eval()
-    hold = max(int(hold), int(stride), 1)
+    if device is None:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
 
-    base = PushTVecEnv(
-        num_envs=1, hold=hold, device="cpu", seed=0,
-        num_workers=0, max_ee_t_dist=None)
-    env = WMObsVecEnv(base, wm, device=device)
-    args = argparse.Namespace(
-        num_steps=32, max_iterations=1, save_interval=100,
-        entropy_coef=0.01, lr=1e-3)
-    cfg = make_train_cfg(args)
-    cfg["run_name"] = "pusht_versus"
-    log_dir = os.path.join(os.path.dirname(policy_path), "_game_logs")
-    os.makedirs(log_dir, exist_ok=True)
-    runner = OnPolicyRunner(env, cfg, log_dir=log_dir, device=device)
-    # Checkpoints may be CUDA-saved; map onto the requested device (CPU node OK).
-    runner.load(policy_path, map_location=device)
-    policy = runner.get_inference_policy(device=device)
-    return wm, policy, env, hold, task_features
+    from learning.onnx_pusht import load_pusht_policy
+
+    policy, backend = load_pusht_policy(
+        wm_path, policy_path, device=device, hold=hold, prefer_onnx=True)
+    print(f"[pusht] inference backend={backend} hold={policy.hold}", flush=True)
+    return SharedPushTAssets(
+        policy=policy,
+        hold=int(policy.hold),
+        device=device,
+        backend=backend,
+        inference_lock=threading.Lock(),
+    )
 
 
 class _Side:
@@ -128,10 +108,9 @@ class PushTVersusSession:
     MAX_ROUND_SECONDS = 180
     SUCCESS_TOL = 0.12  # Match the saved WM/PPO evaluation's position tolerance.
     PLAYER_FORCE = 5.5  # N, within typical force_max=6
-    # Physics substeps per web/desktop tick. Player uses latest stick each step;
-    # With the default five-step action hold, AI inference runs at most once
-    # per tick. Easier modes advance only the AI simulation more slowly.
-    SUBSTEPS = 3
+    # One physics frame per net tick. Warp CPU advances serialize across
+    # sessions; old SUBSTEPS=3 blew the 30 Hz budget past ~2 concurrent players.
+    SUBSTEPS = 1
 
     def __init__(
         self,
@@ -141,7 +120,7 @@ class PushTVersusSession:
         hold: int = 5,
         seed: int = 1000,
         shared: SharedPushTAssets | None = None,
-        tick_hz: float = 30.0,
+        tick_hz: float = 20.0,
     ):
         self.seed = int(seed)
         self.ep = 0
@@ -161,25 +140,33 @@ class PushTVersusSession:
 
         if shared is not None:
             self.device = shared.device
-            self.wm = shared.wm
             self.policy = shared.policy
             self.hold = int(shared.hold)
-            self._task_features = shared.task_features
-            self._train_env = None
+            self.backend = shared.backend
             self._inference_lock = shared.inference_lock
         else:
-            device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-            self.device = device
-            self.wm, self.policy, self._train_env, self.hold, self._task_features = (
-                _load_policy(wm_path, policy_path, device, hold))
-            self._inference_lock = threading.Lock()
+            if device is None:
+                try:
+                    import torch
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                except Exception:
+                    device = "cpu"
+            assets = load_shared_pusht_assets(
+                wm_path, policy_path, device=device, hold=hold)
+            self.device = assets.device
+            self.policy = assets.policy
+            self.hold = int(assets.hold)
+            self.backend = assets.backend
+            self._inference_lock = assets.inference_lock
+            self._shared = assets
+            self._owns_assets = True
 
-        # Keep the trained control cadence and force at every difficulty.
-        # Only the AI's simulation progress changes with difficulty.
+        # Difficulty = policy decision rate (Hz), not a playback-speed fraction.
         self._base_hold = max(1, int(self.hold))
         self.difficulty = "medium"
-        self.ai_speed = 1.0
-        self._ai_step_credit = 0.0
+        self.decision_hz = 10.0
+        self._ai_decision_accum = 0.0
+        self.tick_hz = float(max(tick_hz, 5.0))
 
         from learning.tasks.push_t import PushTTask, push_t_config
         cfg = push_t_config()
@@ -226,7 +213,7 @@ class PushTVersusSession:
 
         self.phase = "countdown"
         self.paused = False
-        self._ai_step_credit = 0.0
+        self._ai_decision_accum = 0.0
         self.round_duration = self.selected_round_duration
         self.round_elapsed = 0.0
         self.countdown_left = self.COUNTDOWN_S
@@ -280,31 +267,47 @@ class PushTVersusSession:
             v[:] = 0.0
         return v
 
-    @torch.no_grad()
     def _ai_action(self, cur: dict) -> np.ndarray:
-        # Serialize WM/policy forwards when many web sessions share weights.
+        # Serialize encode+act when many web sessions share one ORT/torch backend.
         with self._inference_lock:
-            z, _, _, _ = self.wm.encode_one(cur, use_tactile=False)
-            pose = torch.as_tensor(
-                cur["obj_states"][:, :3], dtype=torch.float32,
-                device=self.wm.device).unsqueeze(0)
-            feat = self._task_features(pose, self.sg, self.bg, self.gth)
-            x = torch.cat([z.reshape(1, -1), feat], dim=-1)
-            pol_dev = next(self.policy.parameters()).device
-            td = TensorDict({"policy": x.to(pol_dev)}, batch_size=[1])
-            a = self.policy(td, stochastic_output=False)
-            if isinstance(a, tuple):
-                a = a[0]
-            a = a.detach().float().cpu().numpy().reshape(-1)
-        return (np.clip(a, -1.0, 1.0) * self.fmax).astype(np.float32)
+            a = self.policy.act(cur, self.sg, self.bg, self.gth)
+        return (np.asarray(a, dtype=np.float32).reshape(-1) * self.fmax).astype(
+            np.float32)
 
-    # Legacy protocol keys remain compatible with existing browser clients.
-    # Slow the complete AI trajectory, preserving its trained force/dynamics
-    # and one decision per base_hold AI physics steps (normally five).
+    def _policy_obs(self, side: _Side) -> dict:
+        """Minimal obs for ONNX/torch act — skip tactile packing."""
+        env = side.task.env
+        st = env.raw_states()
+        if hasattr(env, "rel_type_mat"):
+            rel = env.rel_type_mat()
+        else:
+            from learning.models.relations import empty_rel
+            rel = empty_rel(st.shape[0])
+        return {
+            "obj_states": st,
+            "obj_types": env.obj_types_np,
+            "obj_geom": env.obj_geom,
+            "rel_type": rel,
+        }
+
+    def _succeeded_raw(self, side: _Side, st: np.ndarray) -> bool:
+        task = side.task
+        d_s = float(np.linalg.norm(st[1, :2] - task.stem_goal))
+        d_b = float(np.linalg.norm(st[2, :2] - task.bar_goal))
+        th = float(st[1, 2])
+        ang = abs(float(np.arctan2(
+            np.sin(th - task.goal_theta), np.cos(th - task.goal_theta))))
+        vel = float(np.linalg.norm(st[1, 3:5]))
+        return (d_s < task.tol and d_b < task.tol
+                and ang < task.ang_tol and vel < task.vel_tol)
+
+    # Decision rate targets (policy queries / wall-clock second). Capped by
+    # tick_hz at runtime so the label stays meaningful as the server rate moves.
+    # Protocol levels stay low|medium|high for existing clients.
     _DIFFICULTY = {
-        "low": {"speed": 0.10},
-        "medium": {"speed": 0.40},
-        "high": {"speed": 1.0},
+        "low": {"decision_hz": 5},
+        "medium": {"decision_hz": 10},
+        "high": {"decision_hz": 20},
     }
 
     def _set_difficulty(self, level: str) -> str:
@@ -313,30 +316,29 @@ class PushTVersusSession:
             key = "medium"
         cfg = self._DIFFICULTY[key]
         self.difficulty = key
-        self.ai_speed = float(cfg["speed"])
+        self.decision_hz = float(cfg["decision_hz"])
         self.hold = self._base_hold
+        self._ai_decision_accum = 0.0
         return key
-    def _step_side(self, side: _Side, action: np.ndarray, hold_every: bool):
+
+    def _decision_period(self) -> float:
+        hz = min(float(self.decision_hz), float(self.tick_hz))
+        return 1.0 / max(hz, 1.0)
+
+    def _step_side(self, side: _Side, action: np.ndarray, hold_every: bool = False):
         if side.done:
             return
-        cur = side.task.observe()
+        # raw_states + advance_action: avoid observe()/tactile twice per frame.
         st = side.task.env.raw_states()
         side.trail.append((float(st[0, 0]), float(st[0, 1])))
-        if side.task.succeeded(cur, side.task.goal):
+        if self._succeeded_raw(side, st):
             side.ok = True
             side.done = True
             side.action[:] = 0
             side.task.env.set_force((0.0, 0.0))
             return
-        if hold_every:
-            if side.hold_left <= 0:
-                side.action = action
-                side.hold_left = self.hold
-            side.task.env.step(side.action)
-            side.hold_left -= 1
-        else:
-            side.action = action
-            side.task.env.step(action)
+        side.action = np.asarray(action, dtype=np.float32).reshape(-1)
+        side.task.env.advance_action(side.action)
         side.t += 1
 
     def tick(self):
@@ -363,28 +365,32 @@ class PushTVersusSession:
             self._finish_round("draw")
             return
 
-        # Accumulate fractional AI steps so difficulty changes playback speed,
-        # rather than stretching actions or weakening their contact forces.
+        # Soft per-tick budget: always advance the player; AI yields first under load.
+        budget = 0.55 / self.tick_hz
+        t_tick = time.perf_counter()
+        period = self._decision_period()
+
         for _ in range(self.SUBSTEPS):
             if self.phase != "race":
                 break
-            # Latest stick each substep (may be updated mid-tick by WS reader).
-            self._step_side(self.left, self._player_force(), hold_every=False)
+            self._step_side(self.left, self._player_force())
             if not self.right.done:
-                self._ai_step_credit += self.ai_speed
-                if self._ai_step_credit >= 1.0 - 1e-9:
-                    self._ai_step_credit = max(0.0, self._ai_step_credit - 1.0)
-                    step_a = (self._ai_action(self.right.task.observe())
-                              if self.right.hold_left <= 0 else self.right.action)
-                    self._step_side(self.right, step_a, hold_every=True)
+                # Wall-clock decision cadence (not a sim-speed percentage).
+                self._ai_decision_accum += dt / max(self.SUBSTEPS, 1)
+                if self._ai_decision_accum > period * 1.25:
+                    self._ai_decision_accum = period * 1.25
+                under_budget = (time.perf_counter() - t_tick) < budget
+                if under_budget and self._ai_decision_accum >= period:
+                    self._ai_decision_accum -= period
+                    self.right.action = self._ai_action(self._policy_obs(self.right))
+                if under_budget:
+                    self._step_side(self.right, self.right.action)
 
             if self.left.ok and not self.right.ok:
                 self.winner = "player"
             elif self.right.ok and not self.left.ok:
                 self.winner = "ai"
             elif self.left.ok and self.right.ok:
-                # Both completed on this race substep. AI physics-step counts
-                # differ by speed and cannot be used as elapsed race time.
                 self.winner = "draw"
             elif self.left.done and self.right.done:
                 self.winner = "draw"
@@ -412,12 +418,9 @@ class PushTVersusSession:
 
     def close(self):
         # Shared web assets are owned by the server lifespan, not each session.
-        if not self._owns_assets:
-            return
-        if hasattr(self, "_train_env") and self._train_env is not None:
-            if hasattr(self._train_env, "close"):
-                self._train_env.close()
-            self._train_env = None
+        if self._owns_assets and self._shared is not None:
+            self._shared.close()
+            self._shared = None
 
     def snapshot(self) -> dict:
         """JSON-serializable state for the web client."""
@@ -446,6 +449,7 @@ class PushTVersusSession:
             "winner": self.winner,
             "paused": bool(self.paused),
             "difficulty": self.difficulty,
+            "decision_hz": float(min(self.decision_hz, self.tick_hz)),
             "shape": {
                 "symmetric": True,
                 "bar_offset": 0.0,

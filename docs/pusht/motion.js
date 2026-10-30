@@ -2,7 +2,8 @@
 // Gameplay, drag steering and success checks still use the latest server state.
 (() => {
   class PushTMotion {
-    constructor(delay = 60) {
+    // 80ms covers 20Hz nominal and brief dips to ~15Hz under 8-player load.
+    constructor(delay = 80) {
       this.delay = delay;
       this.clear();
     }

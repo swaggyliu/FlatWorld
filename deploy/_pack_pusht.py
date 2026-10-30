@@ -24,6 +24,8 @@ INCLUDE = [
     "learning/solver_planner.py",
     "learning/train_rsl_push_t.py",
     "learning/train_rsl_wm_push_t.py",
+    "learning/onnx_pusht.py",
+    "learning/export_pusht_onnx.py",
     "learning/tasks",
     "learning/rl",
     "learning/models",
@@ -36,6 +38,8 @@ INCLUDE = [
     "learning/data/sane.py",
     "learning/checkpoints/push_t",
     "learning/checkpoints/push_t_wm_rsl/best.pt",
+    "learning/checkpoints/push_t_wm_rsl/pusht_infer.onnx",
+    "learning/checkpoints/push_t_wm_rsl/pusht_infer.json",
     "learning/checkpoints/push_t_wm_rsl/train_wm_rsl_summary.json",
 ]
 

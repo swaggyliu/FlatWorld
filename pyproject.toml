@@ -42,6 +42,8 @@ learning = [
     "omegaconf>=2.3",
     "imageio>=2.31",
     "imageio-ffmpeg>=0.4",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
 ]
 game = [
     "raylib>=5.0",
@@ -49,6 +51,7 @@ game = [
 web = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    "onnxruntime>=1.17",
 ]
 all = [
     "flat-world-model[dev,learning,game,web]",

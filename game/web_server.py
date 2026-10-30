@@ -59,7 +59,7 @@ class WebLimits:
     message_burst: int = 90
     rematch_seconds: float = 2.0
     control_seconds: float = 0.25
-    connect_burst: int = 6
+    connect_burst: int = 16
     connect_window: float = 60.0
     tracked_ips: int = 4096
     check_seconds: float = 1.0
@@ -256,11 +256,13 @@ def _build_app(
 
             def _make():
                 nonlocal session
-                session = PushTVersusSession(
-                    shared=state["assets"],
-                    seed=session_seed,
-                    tick_hz=hz,
-                )
+                # Serialize FlatWorld/Warp env construction (kernel load race).
+                with state["assets"].env_init_lock:
+                    session = PushTVersusSession(
+                        shared=state["assets"],
+                        seed=session_seed,
+                        tick_hz=hz,
+                    )
 
             try:
                 await _in_thread(_make)
@@ -273,6 +275,9 @@ def _build_app(
                 await ws.close()
                 return
 
+            assets = state["assets"]
+            if assets is not None:
+                assets.active_sessions = int(admission.active)
             print(
                 f"[pusht-web] session start seed={session_seed} "
                 f"active={admission.active}",
@@ -399,6 +404,15 @@ def _build_app(
                 try:
                     while not stop.is_set():
                         t0 = asyncio.get_event_loop().time()
+                        # Under many concurrent Warp sims, drop broadcast rate
+                        # (client motion buffer is ~60ms) instead of backlog.
+                        n_active = int(admission.active)
+                        if n_active >= 7:
+                            tick_dt = max(dt, 1.0 / 15.0)
+                        elif n_active >= 5:
+                            tick_dt = max(dt, 1.0 / 18.0)
+                        else:
+                            tick_dt = dt
                         async with session_lock:
                             snap = await _in_thread(advance)
                         snap["type"] = "state"
@@ -406,7 +420,7 @@ def _build_app(
                         # Sleep the remainder of the tick period so slow AI
                         # ticks do not stack extra delay on top of overruns.
                         elapsed = asyncio.get_event_loop().time() - t0
-                        await asyncio.sleep(max(0.0, dt - elapsed))
+                        await asyncio.sleep(max(0.0, tick_dt - elapsed))
                 except WebSocketDisconnect:
                     stop.set()
                 except Exception:
@@ -452,6 +466,9 @@ def _build_app(
                 except Exception:
                     pass
             admission.release(ip)
+            assets = state["assets"]
+            if assets is not None:
+                assets.active_sessions = int(admission.active)
             print(
                 f"[pusht-web] session end seed={session_seed} "
                 f"active={admission.active}",
@@ -483,11 +500,12 @@ def main():
     ap.add_argument("--hold", type=int, default=5)
     ap.add_argument("--seed", type=int, default=1000,
                     help="Seed for the original randomized starting poses.")
-    # 30Hz broadcast; tick sleep accounts for AI overrun (see writer).
-    ap.add_argument("--hz", type=float, default=30.0)
+    # 20Hz broadcast (client motion buffer ~60ms). Warp CPU physics serializes
+    # across sessions; 30Hz+3 substeps could not keep 4 players smooth.
+    ap.add_argument("--hz", type=float, default=20.0)
     ap.add_argument("--max-sessions", type=int, default=8,
                     help="Max concurrent players (each gets an isolated game).")
-    ap.add_argument("--max-sessions-per-ip", type=int, default=2)
+    ap.add_argument("--max-sessions-per-ip", type=int, default=8)
     ap.add_argument("--allowed-origin", action="append", default=[],
                     help="Additional exact browser origin (repeatable).")
     ap.add_argument("--allow-no-origin", action="store_true", default=None,
