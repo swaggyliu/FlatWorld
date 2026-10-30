@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>FlatWorld — 2D physics + StateLeWM</title>
-  <link rel="stylesheet" href="pusht/style.css?v=score7" />
+  <link rel="stylesheet" href="pusht/style.css?v=online3" />
   <style>
     :root {
       --ink: #152018;
@@ -96,6 +96,11 @@
     }
     .play-shell .match-status #status { color: #87610d; }
     .play-shell .status-dot { background: #a1710d; }
+    .play-shell .match-status .online-count {
+      color: #3d4a5c;
+      border-color: #b7c2d0;
+      background: #eef2f7;
+    }
     .play-shell canvas {
       width: 100%;
       height: auto;
@@ -247,7 +252,11 @@
             <span id="score-ai-label" class="score-caption">WINS</span>
           </div>
         </section>
-        <div class="match-status"><span class="status-dot" aria-hidden="true"></span><span id="status" role="status">connecting…</span></div>
+        <div class="match-status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="status" role="status">connecting…</span>
+          <span id="online" class="online-count" aria-live="polite" title="Concurrent players on this server">Online · —</span>
+        </div>
       </div>
       <div class="toolbar">
         <div id="difficulty" class="difficulty" aria-label="AI difficulty">
@@ -357,9 +366,9 @@
 
     <footer>Apache-2.0 · Dongyu Liu</footer>
   </div>
-  <script src="pusht/config.js?v=play3"></script>
+  <script src="pusht/config.js?v=online3"></script>
   <script src="pusht/audio.js?v=win8"></script>
-  <script src="pusht/motion.js?v=round5"></script>
-  <script src="pusht/app.js?v=win8"></script>
+  <script src="pusht/motion.js?v=drag1"></script>
+  <script src="pusht/app.js?v=online3"></script>
 </body>
 </html>

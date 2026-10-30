@@ -84,7 +84,7 @@ node2 `:9527`. A small bridge in the compute Starlette app exposes Push-T:
 | `wss://www.flexphysics.com/cal/task-data/ws/_fw` | Game WebSocket |
 | `https://www.flexphysics.com/cal/task-data/ws/_fw/health` | Health |
 
-Install / refresh the bridge (on node2, as `numericsv`):
+Install / refresh the bridge on the game host (app user):
 
 ```bash
 bash deploy/mount_pusht_flexphysics.sh
@@ -94,8 +94,9 @@ Optional cleaner path `/flatworld/` needs a gateway nginx edit (root); see
 `deploy/gateway_nginx_flatworld_pusht.snippet.conf`. Until then the `/_fw`
 bridge is the public entry.
 
-Pages `docs/pusht/config.js` primary is the flexphysics.com WSS URL; sslip.io
-remains the fallback.
+Pages `docs/pusht/config.js` points only at the flexphysics.com WSS URL.
+Do not put raw ECS IPs, sslip hostnames, SSH users, or key paths in tracked
+files — keep those in gitignored `deploy/local.env`.
 
 ## nginx TLS on node2 (sslip.io fallback)
 

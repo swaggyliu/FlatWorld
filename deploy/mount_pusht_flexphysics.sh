@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install Push-T bridge into node2 compute Starlette (flexphysics.com /cal WS).
-# Run on the game host (node2) as numericsv, from a checkout that has deploy/.
+# Run on the game host as the app user, from a checkout that has deploy/.
 set -euo pipefail
 
 RT="${FLEXPHYSICS_RT:-/var/www/flex-physics/webSite/Django-Server/realTimeServer}"
