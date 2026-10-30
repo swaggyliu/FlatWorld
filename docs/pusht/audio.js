@@ -21,8 +21,11 @@
           this.ctx = new AudioContext();
           this.music = this.ctx.createGain();
           this.effects = this.ctx.createGain();
+          this.winGain = this.ctx.createGain();
+          this.winGain.gain.value = 0;
           this.music.connect(this.ctx.destination);
           this.effects.connect(this.ctx.destination);
+          this.winGain.connect(this.ctx.destination);
           this.sync();
         }
         if (this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
@@ -47,6 +50,8 @@
       const active = this.playing && this.visible;
       this.music.gain.setTargetAtTime(active && this.musicEnabled ? 0.22 : 0, this.ctx.currentTime, 0.04);
       this.effects.gain.setTargetAtTime(active && this.sfxEnabled ? 0.3 : 0, this.ctx.currentTime, 0.02);
+      // Victory remains audible after the round stops, while respecting mute and visibility.
+      this.winGain.gain.setTargetAtTime(this.visible && this.sfxEnabled ? 0.5 : 0, this.ctx.currentTime, 0.02);
       if (active && this.musicEnabled) {
         if (this.timer === null) {
           this.nextNote = this.ctx.currentTime + 0.04;
@@ -94,6 +99,21 @@
         this.step += 1;
         this.nextNote += beat;
       }
+    }
+
+    win() {
+      if (!this.ctx || !this.sfxEnabled || !this.visible) return;
+      try {
+        if (this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
+        const now = this.ctx.currentTime + 0.02;
+        const arp = [72, 76, 79, 84]; // Same C5 E5 G5 C6 fanfare as the mini program.
+        for (let i = 0; i < arp.length; i++) {
+          this.tone(arp[i], now + i * 0.09, 0.35, 0.16, this.winGain, "triangle");
+        }
+        for (const midi of [84, 88, 91]) {
+          this.tone(midi, now + 0.3, 0.9, 0.1, this.winGain, "sine");
+        }
+      } catch (_) { /* Sound is optional on browsers without an audio device. */ }
     }
 
     push(strength) {

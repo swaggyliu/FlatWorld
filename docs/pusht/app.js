@@ -40,7 +40,7 @@
     if (validDuration(saved?.duration)) preferences.duration = saved.duration;
   } catch (_) {}
   const sound = window.PushTAudio ? new window.PushTAudio() : {
-    unlock() {}, configure() {}, setPlaying() {}, push() {},
+    unlock() {}, configure() {}, setPlaying() {}, push() {}, win() {},
   };
   sound.configure(preferences.music, preferences.sfx);
 
@@ -228,12 +228,16 @@
           return;
         }
         if (msg.type !== "state") return;
+        const previousPhase = state?.phase;
         state = msg;
         motion.push(msg, performance.now());
         receiveClock(msg);
         if (msg.paused || msg.phase === "over") zeroStickIfNeeded();
         updateClock();
         updateSound();
+        if (msg.phase === "over" && previousPhase && previousPhase !== "over" && msg.winner === "player") {
+          sound.win();
+        }
         playPushSound(msg);
         if (pauseBtn) {
           pauseBtn.textContent = msg.paused ? "Resume" : "Pause";
