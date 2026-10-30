@@ -119,6 +119,17 @@ h1 {
   width: min(1100px, 100%);
   margin: 0 0 0.55rem;
 }
+.online-count {
+  padding: 0.35rem 0.75rem;
+  border: 1px solid #3a4658;
+  border-radius: 999px;
+  background: #121925;
+  color: #9aa6b8;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
 .actions { display: inline-flex; gap: 0.4rem; }
 .action-btn {
   font: inherit;

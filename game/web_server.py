@@ -404,18 +404,23 @@ def _build_app(
                 try:
                     while not stop.is_set():
                         t0 = asyncio.get_event_loop().time()
-                        # Under many concurrent Warp sims, drop broadcast rate
-                        # (client motion buffer is ~60ms) instead of backlog.
+                        # Adaptive broadcast: snappy with few players, shed under load.
+                        # Client draws YOU from latest state (no buffer) so drag feels live.
                         n_active = int(admission.active)
-                        if n_active >= 7:
-                            tick_dt = max(dt, 1.0 / 15.0)
-                        elif n_active >= 5:
-                            tick_dt = max(dt, 1.0 / 18.0)
+                        if n_active <= 2:
+                            tick_dt = 1.0 / 30.0
+                        elif n_active <= 4:
+                            tick_dt = 1.0 / 20.0
+                        elif n_active <= 6:
+                            tick_dt = 1.0 / 18.0
                         else:
-                            tick_dt = dt
+                            tick_dt = 1.0 / 15.0
+                        # Keep decision-Hz math aligned with the actual cadence.
+                        session.tick_hz = 1.0 / max(tick_dt, 1e-3)
                         async with session_lock:
                             snap = await _in_thread(advance)
                         snap["type"] = "state"
+                        snap["online"] = n_active
                         await ws.send_json(snap)
                         # Sleep the remainder of the tick period so slow AI
                         # ticks do not stack extra delay on top of overruns.

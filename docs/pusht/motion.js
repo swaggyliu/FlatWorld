@@ -2,8 +2,9 @@
 // Gameplay, drag steering and success checks still use the latest server state.
 (() => {
   class PushTMotion {
-    // 80ms covers 20Hz nominal and brief dips to ~15Hz under 8-player load.
-    constructor(delay = 80) {
+    // Buffer only the AI panel. YOU is drawn from the latest state for drag feel.
+    // ~50ms smooths 20Hz AI ticks; under load the server may dip toward 15Hz.
+    constructor(delay = 50) {
       this.delay = delay;
       this.clear();
     }

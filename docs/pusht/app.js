@@ -72,10 +72,11 @@
   let panelAim = null;
   const heldKeys = new Set();
 
-  // Coalesce stick WS sends (~40Hz) while always keeping the latest vector.
-  const STICK_SEND_MS = 25;
+  // Coalesce stick WS sends (~60Hz) while always keeping the latest vector.
+  const STICK_SEND_MS = 16;
   let stickDirty = false;
   let stickLastSend = 0;
+  let onlineCount = 0;
 
   function send(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -254,8 +255,37 @@
           }
         }
         updateScore(msg);
+        updateOnline(msg);
       } catch (_) {}
     };
+  }
+
+  function updateOnline(msg) {
+    const n = Number(msg.online);
+    if (!Number.isFinite(n) || n < 1) return;
+    onlineCount = Math.max(1, Math.floor(n));
+    const el = document.getElementById("online");
+    if (!el) return;
+    el.textContent = onlineCount === 1
+      ? "Online · 1 player"
+      : `Online · ${onlineCount} players`;
+  }
+
+  // Display-only EE lead toward the stick so drag doesn't wait on the next tick.
+  function predictYouSide(side) {
+    if (!side?.states?.length) return side;
+    const sx = stick.x;
+    const sy = stick.y;
+    if (!sx && !sy) return side;
+    const lead = 0.045;  // metres of visual anticipation
+    const states = side.states.map((pose, i) => {
+      if (i !== 0) return pose;
+      const out = pose.slice();
+      out[0] = pose[0] + sx * lead;
+      out[1] = pose[1] + sy * lead;
+      return out;
+    });
+    return { ...side, states };
   }
 
   function layoutMode() {
@@ -357,6 +387,7 @@
     if (!stickDragging || e.pointerId !== pointerId) return;
     const [sx, sy] = canvasPointFromEvent(e);
     updatePanelStick(sx, sy);
+    flushStick(true);  // drag must feel live; don't wait for coalesce
     e.preventDefault();
   }
 
@@ -723,11 +754,15 @@
     }
 
     if (state) {
+      // YOU: latest server pose (no interpolation delay) so drag tracks the finger.
+      // AI: short motion buffer to hide network jitter.
       const rendered = motion.sample(performance.now()) || state;
+      const youSide = predictYouSide(state.left);
+      const aiSide = rendered.right || state.right;
       drawPanel(youRect.x, youRect.y, youRect.w, youRect.h,
-        rendered.left, state.goal, preferences.mode === "drag" ? "YOU · drag" : "YOU · WASD", "#62cfbe", "#182430");
+        youSide, state.goal, preferences.mode === "drag" ? "YOU · drag" : "YOU · WASD", "#62cfbe", "#182430");
       drawPanel(aiRect.x, aiRect.y, aiRect.w, aiRect.h,
-        rendered.right, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
+        aiSide, state.goal, "AI · WM+PPO", "#ba8cd6", "#1c2030");
 
       const overlay = state.phase === "over" ? state.status
         : (state.phase === "countdown"

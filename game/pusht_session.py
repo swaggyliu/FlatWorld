@@ -450,6 +450,7 @@ class PushTVersusSession:
             "paused": bool(self.paused),
             "difficulty": self.difficulty,
             "decision_hz": float(min(self.decision_hz, self.tick_hz)),
+            "online": int(getattr(self._shared, "active_sessions", 1) or 1),
             "shape": {
                 "symmetric": True,
                 "bar_offset": 0.0,
