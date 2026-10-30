@@ -399,15 +399,17 @@ def _build_app(
                 try:
                     while not stop.is_set():
                         t0 = asyncio.get_event_loop().time()
-                        # With process workers, 4 sessions can run physics in parallel.
-                        # Still shed a bit above 4 so one box stays responsive.
+                        # Small game hosts are often 2C/4T: keep 30 Hz only for
+                        # 1–2 players; from 3 up prefer 20 Hz so ticks don't pile up.
                         n_active = int(admission.active)
-                        if n_active <= 4:
+                        if n_active <= 2:
                             tick_dt = 1.0 / 30.0
-                        elif n_active <= 6:
+                        elif n_active <= 4:
                             tick_dt = 1.0 / 20.0
-                        else:
+                        elif n_active <= 6:
                             tick_dt = 1.0 / 15.0
+                        else:
+                            tick_dt = 1.0 / 12.0
                         session.tick_hz = 1.0 / max(tick_dt, 1e-3)
                         async with session_lock:
                             def _advance(n=n_active):

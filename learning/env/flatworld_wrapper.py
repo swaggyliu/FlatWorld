@@ -691,7 +691,8 @@ class PushSceneEnv:
             tmax = float(self.cfg.collect.force_max)
             a = np.clip(a[:2], -tmax, tmax)
             self.set_force(a)
-            self.looper.advanceWithTime(sc.frame_dt)
+            self.looper.advanceWithTime(
+                sc.frame_dt, max_substeps=getattr(self, "max_frame_substeps", None))
             return
         if sc.ee_damping > 0.0:
             v = self.rm.V.numpy()[self.ee_idx]
@@ -702,7 +703,8 @@ class PushSceneEnv:
                 fmax = max(fmax, float(override))
             a = np.clip(a, -fmax, fmax)
         self.set_force(a)
-        self.looper.advanceWithTime(sc.frame_dt)
+        self.looper.advanceWithTime(
+            sc.frame_dt, max_substeps=getattr(self, "max_frame_substeps", None))
         self._apply_table_friction(sc.frame_dt)
         if sc.ee_vel_max > 0.0:
             v = self.rm.V.numpy()[self.ee_idx].copy()

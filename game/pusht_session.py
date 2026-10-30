@@ -1,4 +1,4 @@
-﻿"""Spirit Push-T: split-screen You vs AI.
+"""Spirit Push-T: split-screen You vs AI.
 
 Left  — player stick force on the spirit, push T to the goal.
 Right — frozen WM-obs PPO.
@@ -91,12 +91,32 @@ class _Side:
     def __init__(self, task, label: str):
         self.task = task
         self.label = label
-        self.trail = deque(maxlen=80)
+        self.trail = deque(maxlen=40)
         self.action = np.zeros(2, dtype=np.float32)
         self.hold_left = 0
         self.ok = False
         self.done = False
         self.t = 0
+
+
+def _tune_interactive_physics(env) -> None:
+    """Bound Warp cost for the live game (training / eval keep adaptive DT).
+
+    Adaptive contact substeps cause hitch spikes under load while wall CPU%
+    stays low (latency-bound, not throughput-bound). Fixed coarser dt + a
+    substep cap keeps each side near a few ms per tick on CPU.
+    """
+    looper = getattr(env, "looper", None)
+    if looper is None:
+        return
+    base = float(getattr(looper, "_domain_min_stable_time", 0.0) or 0.0)
+    # ~2x fewer substeps than the stability-limited dt for this tiny rigid scene.
+    dt = max(base * 2.0, 1.0 / 280.0) if base > 0.0 else (1.0 / 280.0)
+    looper.useAdapative = False
+    looper.default_dt = float(dt)
+    looper.dt = float(dt)
+    # Hard ceiling: frame_dt=1/60 with dt~1/280 -> ~5 steps; allow headroom.
+    env.max_frame_substeps = 8
 
 
 class PushTVersusSession:
@@ -181,6 +201,8 @@ class PushTVersusSession:
             PushTTask(push_t_config(), tol=self.SUCCESS_TOL, planner_kwargs=dict(use_servo=True),
                       ee_spawn="support"),
             "AI")
+        _tune_interactive_physics(self.left.task.env)
+        _tune_interactive_physics(self.right.task.env)
         # A wall clock keeps the HUD and timeout consistent under CPU load.
         self.selected_round_duration = self.DEFAULT_ROUND_SECONDS
         self.round_duration = self.selected_round_duration
@@ -433,7 +455,8 @@ class PushTVersusSession:
                 "states": st.tolist(),
                 "geom": geom.tolist(),
                 "action": [float(side.action[0]), float(side.action[1])],
-                "trail": [[float(x), float(y)] for x, y in side.trail],
+                # Subsample trail for WS payload; client only needs a light streak.
+                "trail": [[float(x), float(y)] for i, (x, y) in enumerate(side.trail) if i % 2 == 0],
                 "ok": bool(side.ok),
                 "done": bool(side.done),
                 "t": int(side.t),

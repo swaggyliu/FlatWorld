@@ -14,6 +14,7 @@ import itertools
 import threading
 import time
 from dataclasses import dataclass
+from queue import Empty
 from typing import Any
 
 
@@ -45,6 +46,10 @@ def _worker_main(
         assets = load_shared_pusht_assets(
             wm_path=wm_path, policy_path=policy_path, device=device, hold=hold)
         sessions: dict[str, PushTVersusSession] = {}
+        # Stick arrives ~60Hz; keep only the latest vector per session so a
+        # backlog cannot delay physics ticks on the same FIFO.
+        latest_stick: dict[str, tuple[float, float]] = {}
+        deferred: list[dict] = []
         print(
             f"[pusht-worker {worker_id}] ready backend={assets.backend}",
             flush=True,
@@ -63,10 +68,53 @@ def _worker_main(
             return
         rep_q.put({"rid": msg.get("rid"), **payload})
 
+    def _apply_latest_sticks() -> None:
+        if not latest_stick:
+            return
+        pending = latest_stick.copy()
+        latest_stick.clear()
+        for sid, (x, y) in pending.items():
+            sess = sessions.get(sid)
+            if sess is not None:
+                sess.set_stick(x, y)
+
+    def _drain_sticks() -> None:
+        """Fold queued stick msgs into latest_stick; defer everything else."""
+        while True:
+            try:
+                nxt = req_q.get_nowait()
+            except Empty:
+                break
+            if not isinstance(nxt, dict):
+                continue
+            if nxt.get("cmd") == "stick":
+                sid = str(nxt.get("sid", ""))
+                try:
+                    latest_stick[sid] = (float(nxt["x"]), float(nxt["y"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+                _reply(nxt, {"ok": True})
+            else:
+                deferred.append(nxt)
+
     while True:
-        msg = req_q.get()
+        msg = deferred.pop(0) if deferred else req_q.get()
         if not isinstance(msg, dict):
             continue
+        # Always collapse stick spam before any heavier command.
+        if msg.get("cmd") == "stick":
+            sid = str(msg.get("sid", ""))
+            try:
+                latest_stick[sid] = (float(msg["x"]), float(msg["y"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+            _reply(msg, {"ok": True})
+            _drain_sticks()
+            _apply_latest_sticks()
+            continue
+
+        _drain_sticks()
+        _apply_latest_sticks()
         cmd = msg.get("cmd")
         try:
             if cmd == "shutdown":
@@ -76,19 +124,13 @@ def _worker_main(
                     except Exception:
                         pass
                 sessions.clear()
+                latest_stick.clear()
                 try:
                     assets.close()
                 except Exception:
                     pass
                 _reply(msg, {"ok": True})
                 break
-
-            if cmd == "stick":
-                sess = sessions.get(msg["sid"])
-                if sess is not None:
-                    sess.set_stick(float(msg["x"]), float(msg["y"]))
-                _reply(msg, {"ok": True})
-                continue
 
             if cmd == "create":
                 sid = str(msg["sid"])
@@ -150,6 +192,7 @@ def _worker_main(
             if cmd == "close":
                 sid = str(msg["sid"])
                 sess = sessions.pop(sid, None)
+                latest_stick.pop(sid, None)
                 if sess is not None:
                     sess.close()
                 assets.active_sessions = max(0, len(sessions))
@@ -275,8 +318,10 @@ class SessionProcessPool:
         self.policy_path = policy_path
         self.hold = hold
         self.device = device
+        # Prefer physical-core count when hyperthreads inflate cpu_count (e.g. 2C/4T).
         cpu = os.cpu_count() or 2
-        self.n_workers = max(1, int(n_workers if n_workers is not None else min(cpu, 4)))
+        default_workers = max(1, min(cpu // 2 if cpu >= 4 else cpu, 4))
+        self.n_workers = max(1, int(n_workers if n_workers is not None else default_workers))
         self.ctx = mp.get_context("spawn")
         self.workers: list[_Worker] = []
         self._sid = itertools.count(1)

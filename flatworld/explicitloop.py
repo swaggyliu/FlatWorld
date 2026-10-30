@@ -562,7 +562,12 @@ class ExplicitLoop(MixedContact):
         self._counter_py += 1
 
     # ===================== Fixed-frame stepping helpers =====================
-    def advanceWithTime(self, frame_dt: float = 1.0 / 60.0, verbose: bool = False):
+    def advanceWithTime(
+        self,
+        frame_dt: float = 1.0 / 60.0,
+        verbose: bool = False,
+        max_substeps=None,
+    ):
         """Advance the simulation by an exact amount of simulated time using
         adaptive substeps based on current stableTime. This ensures a fixed
         frame time (e.g., 1/60s) regardless of stability constraints.
@@ -570,6 +575,8 @@ class ExplicitLoop(MixedContact):
         Args:
             frame_dt: Target simulated time to advance (seconds), default 1/60.
             verbose: If True, print debug information about substeps.
+            max_substeps: Optional hard cap on substeps per frame (interactive
+                / game paths use this to bound contact-induced hitch spikes).
         """
 
         # Set BVH-related GPU state ONCE per frame (not per substep).
@@ -585,6 +592,8 @@ class ExplicitLoop(MixedContact):
 
         substep_count = 0
         while remaining > eps:
+            if max_substeps is not None and substep_count >= int(max_substeps):
+                break
             current_stable = self.stableTime if self.useAdapative else self.default_dt
             sub_dt = max(min(current_stable, remaining), 1e-8)
             self.dt = sub_dt

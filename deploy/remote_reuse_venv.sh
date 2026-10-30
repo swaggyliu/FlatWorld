@@ -46,7 +46,7 @@ Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=VIRTUAL_ENV=${VENV}
-ExecStart=${PY} -m game.web_server --host 127.0.0.1 --port 8765 --hz 20 --workers 4 --max-sessions 8 --max-sessions-per-ip 8 --allow-no-origin
+ExecStart=${PY} -m game.web_server --host 127.0.0.1 --port 8765 --hz 20 --workers 2 --max-sessions 8 --max-sessions-per-ip 8 --allow-no-origin
 Restart=on-failure
 RestartSec=5
 
