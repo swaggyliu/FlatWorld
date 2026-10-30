@@ -155,6 +155,7 @@ def _build_app(
     hz: float,
     max_sessions: int,
     *,
+    n_workers: int | None = None,
     limits: WebLimits | None = None,
     allowed_origins: set[str] | frozenset[str] | None = None,
     allow_no_origin: bool = False,
@@ -163,33 +164,35 @@ def _build_app(
     origins = DEFAULT_ORIGINS if allowed_origins is None else frozenset(allowed_origins)
     admission = _Admission(max_sessions, limits)
     state = {
-        "assets": None,
+        "pool": None,
         "error": "",
         "seed_seq": count(seed),
     }
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        def _load():
+        def _start_pool():
             _tune_cpu_threads()
-            from game.pusht_session import load_shared_pusht_assets
-            # Aliyun game host has no GPU; map_location=cpu is intentional.
-            return load_shared_pusht_assets(
-                wm_path=wm, policy_path=policy, device="cpu", hold=hold)
+            from game.session_pool import SessionProcessPool
+            # One Warp+ONNX process per worker so multiplayer uses multiple cores.
+            pool = SessionProcessPool(
+                wm_path=wm, policy_path=policy, hold=hold, device="cpu",
+                n_workers=n_workers)
+            pool.start()
+            return pool
 
         try:
-            state["assets"] = await asyncio.to_thread(_load)
+            state["pool"] = await asyncio.to_thread(_start_pool)
             state["error"] = ""
-            print("[pusht-web] shared assets ready", flush=True)
         except Exception as exc:
             state["error"] = f"{type(exc).__name__}: {exc}"
             traceback.print_exc()
-            print(f"[pusht-web] load failed: {state['error']}", flush=True)
+            print(f"[pusht-web] pool start failed: {state['error']}", flush=True)
         yield
-        assets = state["assets"]
-        if assets is not None:
+        pool = state["pool"]
+        if pool is not None:
             try:
-                assets.close()
+                await asyncio.to_thread(pool.shutdown)
             except Exception:
                 pass
 
@@ -202,13 +205,16 @@ def _build_app(
 
     @app.get("/health")
     async def health():
-        ok = state["assets"] is not None
+        pool = state["pool"]
+        ok = pool is not None and pool.alive
         return JSONResponse(
             {
                 "ok": ok,
                 "error": state["error"] or None,
                 "active_sessions": admission.active,
                 "max_sessions": int(max_sessions),
+                "workers": None if pool is None else int(pool.n_workers),
+                "backend": None if pool is None else pool.backend,
             },
             status_code=200 if ok else 503,
         )
@@ -227,7 +233,8 @@ def _build_app(
         elif not allow_no_origin:
             await ws.close(code=1008)
             return
-        if state["assets"] is None:
+        pool = state["pool"]
+        if pool is None or not pool.alive:
             await ws.close(code=1013)
             return
         # Only Uvicorn's explicitly trusted loopback proxy may rewrite client IP.
@@ -240,7 +247,7 @@ def _build_app(
 
         session = None
         # Protects rematch/pause/difficulty vs tick/snapshot. Stick updates are
-        # intentionally lock-free so AI inference never delays player input.
+        # fire-and-forget IPC so AI ticks never delay player input.
         session_lock = asyncio.Lock()
         stop = asyncio.Event()
         dt = 1.0 / max(float(hz), 5.0)
@@ -252,20 +259,14 @@ def _build_app(
 
         try:
             await ws.accept()
-            from game.pusht_session import PushTVersusSession
 
             def _make():
-                nonlocal session
-                # Serialize FlatWorld/Warp env construction (kernel load race).
-                with state["assets"].env_init_lock:
-                    session = PushTVersusSession(
-                        shared=state["assets"],
-                        seed=session_seed,
-                        tick_hz=hz,
-                    )
+                return pool.create(
+                    seed=session_seed, tick_hz=hz,
+                    active_sessions=admission.active)
 
             try:
-                await _in_thread(_make)
+                session = await _in_thread(_make)
             except Exception:
                 traceback.print_exc()
                 await ws.send_json({
@@ -275,9 +276,6 @@ def _build_app(
                 await ws.close()
                 return
 
-            assets = state["assets"]
-            if assets is not None:
-                assets.active_sessions = int(admission.active)
             print(
                 f"[pusht-web] session start seed={session_seed} "
                 f"active={admission.active}",
@@ -362,7 +360,8 @@ def _build_app(
                         if typ == "hello":
                             if "round_duration" in msg:
                                 async with session_lock:
-                                    obj.set_round_duration(msg["round_duration"])
+                                    await _in_thread(
+                                        obj.set_round_duration, msg["round_duration"])
                             continue
                         if typ not in {"rematch", "pause", "difficulty"}:
                             close_code, close_reason = 1008, "Unknown game message."
@@ -383,13 +382,13 @@ def _build_app(
                             last_control = now
                         async with session_lock:
                             if typ == "rematch":
-                                if "round_duration" in msg:
-                                    obj.set_round_duration(msg["round_duration"])
-                                await _in_thread(obj.next_episode)
+                                secs = msg.get("round_duration")
+                                await _in_thread(obj.rematch, secs)
                             elif typ == "pause":
-                                obj.paused = not obj.paused
+                                await _in_thread(obj.toggle_pause)
                             elif typ == "difficulty":
-                                obj._set_difficulty(msg.get("level", "medium"))
+                                await _in_thread(
+                                    obj.set_difficulty, msg.get("level", "medium"))
                         last_activity = now
                 except WebSocketDisconnect:
                     stop.set()
@@ -397,33 +396,27 @@ def _build_app(
                     stop.set()
 
             async def writer():
-                def advance():
-                    session.tick()
-                    return session.snapshot()
-
                 try:
                     while not stop.is_set():
                         t0 = asyncio.get_event_loop().time()
-                        # Adaptive broadcast: snappy with few players, shed under load.
-                        # Client draws YOU from latest state (no buffer) so drag feels live.
+                        # With process workers, 4 sessions can run physics in parallel.
+                        # Still shed a bit above 4 so one box stays responsive.
                         n_active = int(admission.active)
-                        if n_active <= 2:
+                        if n_active <= 4:
                             tick_dt = 1.0 / 30.0
-                        elif n_active <= 4:
-                            tick_dt = 1.0 / 20.0
                         elif n_active <= 6:
-                            tick_dt = 1.0 / 18.0
+                            tick_dt = 1.0 / 20.0
                         else:
                             tick_dt = 1.0 / 15.0
-                        # Keep decision-Hz math aligned with the actual cadence.
                         session.tick_hz = 1.0 / max(tick_dt, 1e-3)
                         async with session_lock:
-                            snap = await _in_thread(advance)
+                            def _advance(n=n_active):
+                                return session.tick_snapshot(
+                                    online=n, active_sessions=n)
+                            snap = await _in_thread(_advance)
                         snap["type"] = "state"
                         snap["online"] = n_active
                         await ws.send_json(snap)
-                        # Sleep the remainder of the tick period so slow AI
-                        # ticks do not stack extra delay on top of overruns.
                         elapsed = asyncio.get_event_loop().time() - t0
                         await asyncio.sleep(max(0.0, tick_dt - elapsed))
                 except WebSocketDisconnect:
@@ -471,9 +464,6 @@ def _build_app(
                 except Exception:
                     pass
             admission.release(ip)
-            assets = state["assets"]
-            if assets is not None:
-                assets.active_sessions = int(admission.active)
             print(
                 f"[pusht-web] session end seed={session_seed} "
                 f"active={admission.active}",
@@ -505,9 +495,10 @@ def main():
     ap.add_argument("--hold", type=int, default=5)
     ap.add_argument("--seed", type=int, default=1000,
                     help="Seed for the original randomized starting poses.")
-    # 20Hz broadcast (client motion buffer ~60ms). Warp CPU physics serializes
-    # across sessions; 30Hz+3 substeps could not keep 4 players smooth.
+    # Default tick hint; live rate adapts with concurrent load (see writer).
     ap.add_argument("--hz", type=float, default=20.0)
+    ap.add_argument("--workers", type=int, default=0,
+                    help="Physics worker processes (0 = min(cpu_count, 4)).")
     ap.add_argument("--max-sessions", type=int, default=8,
                     help="Max concurrent players (each gets an isolated game).")
     ap.add_argument("--max-sessions-per-ip", type=int, default=8)
@@ -528,6 +519,7 @@ def main():
         "PUSHT_ALLOW_NO_ORIGIN", "").strip().lower() in {"1", "true", "yes"}
     app = _build_app(
         args.wm, args.policy, args.hold, args.seed, args.hz, args.max_sessions,
+        n_workers=(None if args.workers <= 0 else args.workers),
         limits=WebLimits(per_ip=args.max_sessions_per_ip),
         allowed_origins=DEFAULT_ORIGINS | set(args.allowed_origin) | {
             value.strip() for value in os.environ.get("PUSHT_ALLOWED_ORIGINS", "").split(",")
