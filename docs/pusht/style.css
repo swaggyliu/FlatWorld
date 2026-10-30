@@ -50,6 +50,12 @@ h1 {
   width: min(1100px, 100%);
   margin: 0.7rem 0 0.65rem;
 }
+.match-status .online-count {
+  margin-left: 0.35rem;
+  color: #d7e0ee;
+  border-color: #5a6b86;
+  background: #1a2434;
+}
 .scoreboard {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 74px minmax(0, 1fr);

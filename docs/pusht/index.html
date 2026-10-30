@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="mobile-web-app-capable" content="yes" />
   <title>FlatWorld — You vs AI (Push-T)</title>
-  <link rel="stylesheet" href="style.css?v=online1" />
+  <link rel="stylesheet" href="style.css?v=online2" />
 </head>
 <body>
   <header>
@@ -29,7 +29,11 @@
         <span id="score-ai-label" class="score-caption">WINS</span>
       </div>
     </section>
-    <div class="match-status"><span class="status-dot" aria-hidden="true"></span><span id="status" role="status">connecting…</span></div>
+    <div class="match-status">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status" role="status">connecting…</span>
+      <span id="online" class="online-count" aria-live="polite" title="Concurrent players on this server">Online · —</span>
+    </div>
   </div>
   <div class="toolbar">
     <div id="difficulty" class="difficulty" aria-label="AI difficulty">
@@ -38,7 +42,6 @@
       <button type="button" data-level="medium" class="active" title="10 decisions/s">Normal</button>
       <button type="button" data-level="high" title="20 decisions/s">Hard</button>
     </div>
-    <div id="online" class="online-count" aria-live="polite">Online · —</div>
     <div class="actions">
       <button type="button" id="rematch" class="action-btn">Rematch</button>
       <button type="button" id="pause" class="action-btn ghost">Pause</button>
@@ -77,6 +80,6 @@
   <script src="config.js?v=play3"></script>
   <script src="audio.js?v=win8"></script>
   <script src="motion.js?v=drag1"></script>
-  <script src="app.js?v=drag1"></script>
+  <script src="app.js?v=drag2"></script>
 </body>
 </html>
