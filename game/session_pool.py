@@ -45,6 +45,12 @@ def _worker_main(
 
         assets = load_shared_pusht_assets(
             wm_path=wm_path, policy_path=policy_path, device=device, hold=hold)
+        # Prefetch DualPushT Warp kernels so the first WebSocket create is fast.
+        from learning.env.lewm_scenes import DualPushTEnv
+        from learning.tasks.push_t import push_t_config
+        warm = DualPushTEnv(push_t_config(), device=device)
+        warm.step_pair([0.0, 0.0], [0.0, 0.0])
+        del warm
         sessions: dict[str, PushTVersusSession] = {}
         # Stick arrives ~60Hz; keep only the latest vector per session so a
         # backlog cannot delay physics ticks on the same FIFO.

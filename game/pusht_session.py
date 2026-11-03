@@ -117,6 +117,13 @@ def _tune_interactive_physics(env) -> None:
     looper.dt = float(dt)
     # Hard ceiling: frame_dt=1/60 with dt~1/280 -> ~5 steps; allow headroom.
     env.max_frame_substeps = 8
+    # Interactive PGS: training ExplicitLoop default stays 50.
+    pgs = 12
+    rm = getattr(env, "rm", None) or getattr(looper, "rigidManager", None)
+    if rm is not None and hasattr(rm, "pgs_iterations"):
+        rm.pgs_iterations = pgs
+    if hasattr(looper, "pgs_iterations"):
+        looper.pgs_iterations = pgs
 
 
 class PushTVersusSession:
@@ -188,21 +195,25 @@ class PushTVersusSession:
         self._ai_decision_accum = 0.0
         self.tick_hz = float(max(tick_hz, 5.0))
 
+        from learning.env.lewm_scenes import DualPushTEnv
         from learning.tasks.push_t import PushTTask, push_t_config
         cfg = push_t_config()
         self.cfg = cfg
         self.fmax = float(cfg.collect.force_max)
-        # Two independent plants, same config.
+        # One ExplicitLoop / RigidManager, two plants (env_id 0=YOU, 1=AI).
+        # Caller (session worker create) already holds env_init_lock when needed.
+        self.dual = DualPushTEnv(cfg, device=self.device)
         self.left = _Side(
             PushTTask(cfg, tol=self.SUCCESS_TOL, planner_kwargs=dict(use_servo=True),
-                      ee_spawn="support"),
+                      ee_spawn="support", env=self.dual.left),
             "YOU")
         self.right = _Side(
             PushTTask(push_t_config(), tol=self.SUCCESS_TOL, planner_kwargs=dict(use_servo=True),
-                      ee_spawn="support"),
+                      ee_spawn="support", env=self.dual.right),
             "AI")
-        _tune_interactive_physics(self.left.task.env)
-        _tune_interactive_physics(self.right.task.env)
+        _tune_interactive_physics(self.dual)
+        self.dual.left.max_frame_substeps = self.dual.max_frame_substeps
+        self.dual.right.max_frame_substeps = self.dual.max_frame_substeps
         # A wall clock keeps the HUD and timeout consistent under CPU load.
         self.selected_round_duration = self.DEFAULT_ROUND_SECONDS
         self.round_duration = self.selected_round_duration
@@ -212,15 +223,15 @@ class PushTVersusSession:
         self.gth = self.left.task.goal_theta
         self._set_difficulty("medium")
         self.reset()
+
     def reset(self):
+        # Shared plant: one RNG sample, identical pose on YOU and AI.
+        rng = np.random.default_rng(self.seed + self.ep)
+        self.dual.reset(rng)
         for side in (self.left, self.right):
-            # Original reset: random starting pose per round, identical on both
-            # sides. T geometry and goal stay fixed in push_t_config().
-            rng = np.random.default_rng(self.seed + self.ep)
-            side.task.env.reset(rng)
             side.task.env.set_ee_radius(
                 float(side.task.cfg.scene.ee_radius) * side.task.ee_scale)
-            side.task.goal = side.task.sample_goal(rng, side.task.observe())
+            side.task.goal = side.task.sample_goal(rng, None)
             side.trail.clear()
             side.action[:] = 0
             side.hold_left = 0
@@ -293,7 +304,8 @@ class PushTVersusSession:
         # Serialize encode+act when many web sessions share one ORT/torch backend.
         with self._inference_lock:
             a = self.policy.act(cur, self.sg, self.bg, self.gth)
-        return (np.asarray(a, dtype=np.float32).reshape(-1) * self.fmax).astype(
+        scale = float(getattr(self, "ai_force_scale", 1.0)) * self.fmax
+        return (np.asarray(a, dtype=np.float32).reshape(-1) * scale).astype(
             np.float32)
 
     def _policy_obs(self, side: _Side) -> dict:
@@ -323,13 +335,12 @@ class PushTVersusSession:
         return (d_s < task.tol and d_b < task.tol
                 and ang < task.ang_tol and vel < task.vel_tol)
 
-    # Decision rate targets (policy queries / wall-clock second). Capped by
-    # tick_hz at runtime so the label stays meaningful as the server rate moves.
-    # Protocol levels stay low|medium|high for existing clients.
+    # Easy/Normal stay winnable: slower AI decisions + weaker force.
+    # Hard keeps a sharp full-strength policy. Protocol: low|medium|high.
     _DIFFICULTY = {
-        "low": {"decision_hz": 5},
-        "medium": {"decision_hz": 10},
-        "high": {"decision_hz": 20},
+        "low": {"decision_hz": 2, "ai_force": 0.32},
+        "medium": {"decision_hz": 4, "ai_force": 0.50},
+        "high": {"decision_hz": 20, "ai_force": 1.0},
     }
 
     def _set_difficulty(self, level: str) -> str:
@@ -339,18 +350,20 @@ class PushTVersusSession:
         cfg = self._DIFFICULTY[key]
         self.difficulty = key
         self.decision_hz = float(cfg["decision_hz"])
+        self.ai_force_scale = float(cfg.get("ai_force", 1.0))
         self.hold = self._base_hold
         self._ai_decision_accum = 0.0
+        # Drop stale full-strength AI force when switching easier mid-round.
+        self.right.action[:] = 0.0
         return key
 
     def _decision_period(self) -> float:
         hz = min(float(self.decision_hz), float(self.tick_hz))
         return 1.0 / max(hz, 1.0)
 
-    def _step_side(self, side: _Side, action: np.ndarray, hold_every: bool = False):
+    def _check_side(self, side: _Side) -> None:
         if side.done:
             return
-        # raw_states + advance_action: avoid observe()/tactile twice per frame.
         st = side.task.env.raw_states()
         side.trail.append((float(st[0, 0]), float(st[0, 1])))
         if self._succeeded_raw(side, st):
@@ -358,10 +371,6 @@ class PushTVersusSession:
             side.done = True
             side.action[:] = 0
             side.task.env.set_force((0.0, 0.0))
-            return
-        side.action = np.asarray(action, dtype=np.float32).reshape(-1)
-        side.task.env.advance_action(side.action)
-        side.t += 1
 
     def tick(self):
         now = time.perf_counter()
@@ -395,18 +404,36 @@ class PushTVersusSession:
         for _ in range(self.SUBSTEPS):
             if self.phase != "race":
                 break
-            self._step_side(self.left, self._player_force())
+
+            a_left = np.zeros(2, dtype=np.float32)
+            if not self.left.done:
+                a_left = self._player_force()
+                self.left.action = np.asarray(a_left, dtype=np.float32).reshape(-1)
+
+            under_budget = (time.perf_counter() - t_tick) < budget
+            a_right = np.zeros(2, dtype=np.float32)
             if not self.right.done:
-                # Wall-clock decision cadence (not a sim-speed percentage).
                 self._ai_decision_accum += dt / max(self.SUBSTEPS, 1)
                 if self._ai_decision_accum > period * 1.25:
                     self._ai_decision_accum = period * 1.25
-                under_budget = (time.perf_counter() - t_tick) < budget
                 if under_budget and self._ai_decision_accum >= period:
                     self._ai_decision_accum -= period
                     self.right.action = self._ai_action(self._policy_obs(self.right))
+                # Under load: zero AI force (legacy: skip AI advance) while
+                # player still steps the shared plant.
                 if under_budget:
-                    self._step_side(self.right, self.right.action)
+                    a_right = np.asarray(self.right.action, dtype=np.float32).reshape(-1)
+
+            # One shared physics plant for YOU + AI (env_id isolation).
+            if not (self.left.done and self.right.done):
+                self.dual.step_pair(a_left, a_right)
+                if not self.left.done:
+                    self.left.t += 1
+                if not self.right.done and under_budget:
+                    self.right.t += 1
+
+            self._check_side(self.left)
+            self._check_side(self.right)
 
             if self.left.ok and not self.right.ok:
                 self.winner = "player"

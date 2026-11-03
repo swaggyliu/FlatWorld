@@ -624,33 +624,50 @@ class PushSceneEnv:
                 np.asarray(snap["joint_control_target"], dtype=np.float32))
         self.rm.updateBBox()
 
-    def _apply_table_friction(self, dt: float):
+    def _apply_table_friction(
+        self,
+        dt: float,
+        V=None,
+        W=None,
+        mass=None,
+        inertia=None,
+        writeback: bool = True,
+    ):
         """Planar Coulomb table drag. N = m * table_g out of the x-y plane.
 
         Kinetic: a = -μ g v̂ (mass cancels). Static: lock if μ_s N Δt can
         kill the remaining momentum. Also a spin torque -μ N r_eff sign(ω)
         so a sliding T does not rotate forever. Skips fixed / huge-mass
         bodies. EE is optional (admittance already damps it).
+
+        Optional host arrays avoid repeat ``.numpy()`` when the caller already
+        synced V/mass/inertia for damping / EE clamp in the same frame.
         """
         sc = self.cfg.scene
         g = float(getattr(sc, "table_g", 0.0))
         if g <= 0.0 or not getattr(self, "planar", False):
-            return
+            return V, W
         dt = float(dt)
         if dt <= 0.0:
-            return
+            return V, W
         mu_k = float(getattr(sc, "table_mu", 0.20))
         mu_s = 1.2 * mu_k
         v_stick = float(getattr(sc, "table_v_stick", 0.03))
         on_ee = bool(getattr(sc, "table_on_ee", False))
         base_mu = max(float(sc.friction), 1e-6)
-        V = self.rm.V.numpy()
-        W = self.rm.RotV.numpy()
-        mass = self.rm.mass.numpy()
-        inertia = self.rm.inertia.numpy()
+        if V is None:
+            V = self.rm.V.numpy()
+        if W is None:
+            W = self.rm.RotV.numpy()
+        if mass is None:
+            mass = self.rm.mass.numpy()
+        if inertia is None:
+            inertia = self.rm.inertia.numpy()
         geom = np.asarray(self.obj_geom, dtype=np.float64)
         mu_body = np.asarray(self.obj_mu, dtype=np.float64)
         fixed = getattr(self, "fixed_slots", set()) or set()
+        touched_v = False
+        touched_w = False
         for i, gid in enumerate(self.rigid_ids):
             if i in fixed or (i == 0 and not on_ee):
                 continue
@@ -670,7 +687,8 @@ class PushSceneEnv:
                 s = ax * dt / speed
                 vx -= s * vx
                 vy -= s * vy
-            _patch_array(self.rm.V, gid, wp.vec2(vx, vy))
+            V[gid] = (vx, vy)
+            touched_v = True
             I = float(inertia[gid])
             if not np.isfinite(I) or I <= 1e-10:
                 continue
@@ -681,7 +699,14 @@ class PushSceneEnv:
                 w = 0.0
             else:
                 w -= np.sign(w) * (tmax / I) * dt
-            _patch_array(self.rm.RotV, gid, float(w))
+            W[gid] = w
+            touched_w = True
+        if writeback:
+            if touched_v:
+                self.rm.V.assign(V)
+            if touched_w:
+                self.rm.RotV.assign(W)
+        return V, W
 
     def _apply_action_advance(self, action: np.ndarray):
         """Clip + apply action for one visual frame. No observation."""
@@ -694,8 +719,11 @@ class PushSceneEnv:
             self.looper.advanceWithTime(
                 sc.frame_dt, max_substeps=getattr(self, "max_frame_substeps", None))
             return
-        if sc.ee_damping > 0.0:
-            v = self.rm.V.numpy()[self.ee_idx]
+        # One host sync for damping; after advance, one sync for friction + clamp.
+        need_damp = float(getattr(sc, "ee_damping", 0.0)) > 0.0
+        if need_damp:
+            V_pre = self.rm.V.numpy()
+            v = V_pre[self.ee_idx]
             a = a - sc.ee_damping * v
             fmax = float(self.cfg.collect.force_max)
             override = getattr(self, "force_cap_override", None)
@@ -705,14 +733,31 @@ class PushSceneEnv:
         self.set_force(a)
         self.looper.advanceWithTime(
             sc.frame_dt, max_substeps=getattr(self, "max_frame_substeps", None))
-        self._apply_table_friction(sc.frame_dt)
-        if sc.ee_vel_max > 0.0:
-            v = self.rm.V.numpy()[self.ee_idx].copy()
-            speed = float(np.hypot(v[0], v[1]))
-            if speed > sc.ee_vel_max:
-                v = v * (sc.ee_vel_max / speed)
-                _patch_array(self.rm.V, self.ee_idx, wp.vec2(float(v[0]), float(v[1])))
-
+        need_friction = (
+            float(getattr(sc, "table_g", 0.0)) > 0.0
+            and getattr(self, "planar", False))
+        need_clamp = float(getattr(sc, "ee_vel_max", 0.0)) > 0.0
+        if need_friction or need_clamp:
+            V = self.rm.V.numpy()
+            W = self.rm.RotV.numpy() if need_friction else None
+            mass = self.rm.mass.numpy() if need_friction else None
+            inertia = self.rm.inertia.numpy() if need_friction else None
+            if need_friction:
+                V, W = self._apply_table_friction(
+                    sc.frame_dt, V=V, W=W, mass=mass, inertia=inertia,
+                    writeback=False)
+            touched_v = False
+            if need_clamp:
+                v = np.asarray(V[self.ee_idx], dtype=np.float64).copy()
+                speed = float(np.hypot(v[0], v[1]))
+                if speed > sc.ee_vel_max:
+                    v = v * (sc.ee_vel_max / speed)
+                    V[self.ee_idx] = (float(v[0]), float(v[1]))
+                    touched_v = True
+            if need_friction or touched_v:
+                self.rm.V.assign(V)
+            if need_friction and W is not None:
+                self.rm.RotV.assign(W)
     def advance_action(self, action: np.ndarray):
         """Force + one visual frame, no observation (solver-CEM inner loop)."""
         self._apply_action_advance(action)

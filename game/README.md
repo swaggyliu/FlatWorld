@@ -24,10 +24,10 @@ bar 0.32 × 0.08. Its goal origin is fixed at (1.50, 0.52), with zero rotation.
 Starting positions and orientations use the original random reset on every
 round. Both players receive identical starting poses and dynamics. `--seed`
 reproduces the sequence of openings (default: 1000).
-The web difficulty buttons are Easy / Normal / Hard. They set the AI **policy
-decision rate** to 5 / 10 / 20 Hz (capped by the server tick), not a slow-motion
-percentage. Physics keeps advancing with the held action; only replan frequency
-changes, so difficulty stays comparable as models improve. The web server
-defaults to 20 Hz with one physics step per tick.
+The web difficulty buttons are Easy / Normal / Hard. They change AI **decision
+rate** (2 / 4 / 20 Hz, capped by the server tick) and **force scale**
+(~0.32 / 0.50 / 1.0) on the same PPO checkpoint — Easy/Normal stay winnable;
+Hard is full strength. Physics keeps advancing with the held action between
+replans. The web server defaults to 20 Hz with one physics step per tick.
 No ground horizon — top-down table feel. Bounce on the spirit is a jelly
 squash/stretch aura (not a coil spring).

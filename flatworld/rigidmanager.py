@@ -3359,6 +3359,12 @@ class RigidManager:
 
         self.pgs_iterations = pgs_iterations
         self.pgs_tol = 1e-5
+        # Host cache: avoid per-substep joint_has_motor.numpy() when no motors.
+        if self.numAnchors > 0:
+            motors = np.asarray(self.joint_has_motor.numpy()[: self.numAnchors])
+            self.has_any_motor = bool(np.any(motors != 0))
+        else:
+            self.has_any_motor = False
 
         self.MAX_CONSTRAINTS = 16 * self.MAX_CONTACTS * 3 + 7 * self.MAX_JOINTS  # 3 per contact and 7 per joints
         self.numConstraints = wp.zeros(1, dtype=int)
@@ -3604,11 +3610,12 @@ class RigidManager:
         elif self.use_pd == 2:
             self.apply_joint_pd_torque_kernel(dt)
 
+        has_ground_geom = int(self.numAnalytical) > 0
         if self.considerRigidRigidContact:
             # The classifier reads the device-side count and resets its output
             # counters even when the BVH produced zero pairs.
             self.classify_collision_pairs_kernel(collision_pairs_field, num_pairs)
-        if self.numRigidGroundContact > 0:
+        if self.numRigidGroundContact > 0 and has_ground_geom:
             # Generate ground pairs directly only when no BVH pairs were
             # classified, or when rigid-rigid broadphase is disabled.
             self._generate_ground_pairs_direct_kernel(
@@ -3616,7 +3623,8 @@ class RigidManager:
             )
 
         maybe_rr = self.considerRigidRigidContact
-        maybe_ground = self.numRigidGroundContact > 0
+        # Skip empty ground detect/assemble when there is no analytical/HF/voxel.
+        maybe_ground = self.numRigidGroundContact > 0 and has_ground_geom
         has_contact_path = maybe_rr or maybe_ground
         has_solve = self.numAnchors > 0 or has_contact_path
 
@@ -5022,35 +5030,36 @@ class RigidManager:
                 self.pgs_parent_row,
             ],
         )
-        if int(self.num_contacts.numpy()[0]) > 0:
-            wp.launch(
-                _assemble_pair_contact_constraints_wp,
-                dim=1,
-                inputs=[
-                    float(dt),
-                    float(self.contact_erp),
-                    int(self.MAX_CONSTRAINTS),
-                    self.num_contacts,
-                    self.contact_rigid_a,
-                    self.contact_rigid_b,
-                    self.contact_point,
-                    self.contact_normal,
-                    self.contact_depth,
-                    self.contact_bounce_vel,
-                    self.contact_tangent1,
-                    self.contact_pgs_indices,
-                    self.rigidParams,
-                    self.contactParams,
-                    self.numConstraints,
-                    self.pgs_bodypair,
-                    self.pgs_Jac_a,
-                    self.pgs_Jac_b,
-                    self.pgs_rhs,
-                    self.pgs_limits,
-                    self.pgs_lambda,
-                    self.pgs_parent_row,
-                ],
-            )
+        # Always launch: empty contact count is cheap on device; avoids a
+        # host sync on num_contacts every substep.
+        wp.launch(
+            _assemble_pair_contact_constraints_wp,
+            dim=1,
+            inputs=[
+                float(dt),
+                float(self.contact_erp),
+                int(self.MAX_CONSTRAINTS),
+                self.num_contacts,
+                self.contact_rigid_a,
+                self.contact_rigid_b,
+                self.contact_point,
+                self.contact_normal,
+                self.contact_depth,
+                self.contact_bounce_vel,
+                self.contact_tangent1,
+                self.contact_pgs_indices,
+                self.rigidParams,
+                self.contactParams,
+                self.numConstraints,
+                self.pgs_bodypair,
+                self.pgs_Jac_a,
+                self.pgs_Jac_b,
+                self.pgs_rhs,
+                self.pgs_limits,
+                self.pgs_lambda,
+                self.pgs_parent_row,
+            ],
+        )
 
     def _compute_contact_forces_kernel(self, dt: float):
         """Compute contact forces from accumulated impulses after PGS solve."""
@@ -5519,7 +5528,7 @@ class RigidManager:
 
     def update_joint_motor_velocity_targets_kernel(self, dt: float):
         """Convert command targets to per-substep velocity targets on device."""
-        if self.numAnchors <= 0:
+        if self.numAnchors <= 0 or not getattr(self, "has_any_motor", False):
             return
         wp.launch(
             _update_joint_motor_velocity_targets_kernel,

@@ -1319,7 +1319,9 @@ class SimplePushTCost:
 class PushTTask(CEMWorldTask):
     def __init__(self, cfg=None, model=None, norm=None, device="cpu", **kwargs):
         cfg = cfg or push_t_config()
-        env = PushTEnv(cfg)
+        env = kwargs.pop("env", None)
+        if env is None:
+            env = PushTEnv(cfg)
         env.ee_spawn = str(kwargs.get("ee_spawn", getattr(cfg.task, "ee_spawn", "default")))
         simple = bool(kwargs.pop("simple_cost", False))
         cost = SimplePushTCost(device=device) if simple else PushTCost(device=device)

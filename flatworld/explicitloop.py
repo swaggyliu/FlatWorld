@@ -375,10 +375,23 @@ class ExplicitLoop(MixedContact):
             f"{self._batched_rigid_prim_count} rigid-primitive, {self._batched_rigid_mesh_count} rigid-mesh, "
             f"{self._batched_hf_count} heightfield, {self._batched_voxel_count} voxel"
         )
+        n_rr = (
+            int(self.rigidManager.numRigidInContact)
+            if self.rigidManager is not None else 0)
+        pure_tiny_rigid = (
+            self._batched_anal_count == 0
+            and self._batched_hf_count == 0
+            and self._batched_voxel_count == 0
+            and self._batched_flex_count == 0
+            and self._unbatched_contacts_count == 0
+            and n_rr > 0
+            and n_rr <= 8
+        )
         rigid_needs_bvh = (
             self.rigidManager is not None
-            and self.rigidManager.numRigidInContact > 1
+            and n_rr > 1
             and self._consider_rigid_rigid_contact
+            and not pure_tiny_rigid
         )
         self.skip_bvh = (self.bvh is None) or (
             self._batched_anal_count == 0
@@ -387,13 +400,23 @@ class ExplicitLoop(MixedContact):
             and self._unbatched_contacts_count == 0
             and not rigid_needs_bvh
         )
+        self._static_rr_pairs = None
+        self._static_rr_pair_count = 0
+        if self.skip_bvh and self._consider_rigid_rigid_contact and n_rr > 1:
+            self._build_static_rigid_pairs()
 
         if self.skip_bvh:
             if self.rigidManager is not None:
                 self.rigidManager.skip_bvh = True
             _assign_scalar(self._use_bvh_domain_mask, 0)
             _assign_scalar(self._has_fem_spring_bvh_pair, 0)
-            print("No BVH broadphase needed for contacts -- skipping BVH in RigidManager")
+            if self._static_rr_pair_count > 0:
+                print(
+                    f"Tiny pure-rigid scene ({n_rr} bodies, "
+                    f"{self._static_rr_pair_count} static pairs) -- skipping BVH"
+                )
+            else:
+                print("No BVH broadphase needed for contacts -- skipping BVH in RigidManager")
 
         # Initial FEM spatial hash build (so first frame has valid data)
         if self._use_fem_spatial_hash and self.femSpringManager is not None:
@@ -453,6 +476,45 @@ class ExplicitLoop(MixedContact):
     def _is_tie_pair(self, idx_a, idx_b):
         return (min(idx_a, idx_b), max(idx_a, idx_b)) in self._tie_pairs
 
+    def _build_static_rigid_pairs(self):
+        """O(N^2) domain pairs for tiny pure-rigid scenes (no BVH).
+
+        Respects category/collide masks and env_id isolation. Stored once and
+        reused every substep when ``skip_bvh`` is set.
+        """
+        contact_ids = [
+            i for i, d in enumerate(self.domains)
+            if getattr(d, "considerContact", False)
+            and d.type == DomainType.RIGID
+        ]
+        pairs = []
+        for a in range(len(contact_ids)):
+            for b in range(a):
+                i, j = contact_ids[a], contact_ids[b]
+                di, dj = self.domains[i], self.domains[j]
+                ci = int(getattr(di, "category_bits", 0xFF))
+                cj = int(getattr(dj, "category_bits", 0xFF))
+                mi = int(getattr(di, "collide_bits", 0xFF))
+                mj = int(getattr(dj, "collide_bits", 0xFF))
+                if (mi & cj) == 0 or (mj & ci) == 0:
+                    continue
+                ei = int(getattr(di, "env_id", -1))
+                ej = int(getattr(dj, "env_id", -1))
+                if ei >= 0 and ej >= 0 and ei != ej:
+                    continue
+                pairs.append((i, j))
+        self._static_rr_pair_count = len(pairs)
+        self._static_rr_pair_count_dev = wp.zeros(1, dtype=int)
+        _assign_scalar(self._static_rr_pair_count_dev, self._static_rr_pair_count)
+        if self._static_rr_pair_count == 0:
+            self._static_rr_pairs = self._bvh_pairs_work
+            return
+        buf = np.zeros((max(self._static_rr_pair_count, 1), 2), dtype=np.int32)
+        for k, (i, j) in enumerate(pairs):
+            buf[k, 0] = i
+            buf[k, 1] = j
+        self._static_rr_pairs = wp.array(buf, dtype=wp.vec2i)
+
     def _scan_bvh_pairs_stamp(self, pairs, num_pairs, stamp):
         wp.launch(
             _scan_bvh_pairs_stamp_kernel,
@@ -497,7 +559,13 @@ class ExplicitLoop(MixedContact):
     def advance(self):
         pairs_field = self._bvh_pairs_work
         num_pairs_work = self._zero_bvh_pair_count
-        if not self.skip_bvh and self.bvh is not None:
+        if self.skip_bvh or self.bvh is None:
+            # No BVH: use static O(N^2) rigid pairs when present; GPU mask
+            # fields are already set once per frame in advanceWithTime().
+            if self._static_rr_pair_count > 0 and self._static_rr_pairs is not None:
+                pairs_field = self._static_rr_pairs
+                num_pairs_work = self._static_rr_pair_count_dev
+        else:
             # Update BVH: full rebuild every 100 steps, refit otherwise
             if self._counter_py % 100 == 0:
                 self.bvh.reset()
@@ -529,10 +597,6 @@ class ExplicitLoop(MixedContact):
                 self._scan_bvh_pairs_stamp(pairs_field, num_pairs_work, next_stamp)
             else:
                 _assign_scalar(self._use_bvh_domain_mask, 0)
-        else:
-            # BVH inactive: GPU fields already set once per frame in
-            # advanceWithTime(); skip per-substep writes.
-            pass
 
         # ── Batched contact kernels (see mixedcontact.py) ──
         self.run_batched_contacts(pairs_field, num_pairs_work)

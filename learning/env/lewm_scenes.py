@@ -23,7 +23,13 @@ from flatworld import (
     RevoluteJoint,
     WeldJoint,
 )
+from definitions import (
+    COLLISION_CATEGORY_ORDINARY_RIGID,
+    COLLISION_MASK_ALL,
+)
 from rigidmanager import _patch_array
+from wp_init import init_warp
+import warp as wp
 
 from learning.configs.default import Config
 from learning.env.flatworld_wrapper import (
@@ -33,6 +39,12 @@ from learning.env.flatworld_wrapper import (
     PushSceneEnv,
 )
 from learning.models.relations import REL_REVOLUTE, REL_WELD
+
+# Push-T stem/bar mutual exclude: EE (ORDINARY) still hits both.
+_CAT_STEM = 0b00010000
+_CAT_BAR = 0b01000000
+_COLLIDE_STEM = COLLISION_MASK_ALL & ~_CAT_BAR
+_COLLIDE_BAR = COLLISION_MASK_ALL & ~_CAT_STEM
 
 
 def _rot(theta: float) -> np.ndarray:
@@ -374,7 +386,11 @@ class PushTEnv(LewmSceneEnv):
 
         self.ee_rigid = BallRigid(2, [0.28, 0.40], sc.ee_radius, sc.ee_mass)
         self.ee_domain = RigidBodyDomain(
-            self.ee_rigid, bcs=[Force([0], [0.0, 0.0])], friction=sc.friction
+            self.ee_rigid,
+            bcs=[Force([0], [0.0, 0.0])],
+            friction=sc.friction,
+            category_bits=COLLISION_CATEGORY_ORDINARY_RIGID,
+            collide_bits=COLLISION_MASK_ALL,
         )
         stem = BoxRigid(2, stem_xy, stem_full, [0.0, 0.0], float(getattr(sc, "stem_mass", 0.45)))
         bar = BoxRigid(2, bar_xy, bar_full, [0.0, 0.0], float(getattr(sc, "bar_mass", 0.40)))
@@ -382,8 +398,20 @@ class PushTEnv(LewmSceneEnv):
         self.obj_types = [OBJ_TYPE_EE, OBJ_TYPE_BOX, OBJ_TYPE_BOX]
         self.obj_half_heights = [sc.ee_radius, self.stem_hh, self.bar_hh]
         self.obj_domains = [
-            RigidBodyDomain(stem, bcs=self._maybe_gravity(), friction=sc.friction),
-            RigidBodyDomain(bar, bcs=self._maybe_gravity(), friction=sc.friction),
+            RigidBodyDomain(
+                stem,
+                bcs=self._maybe_gravity(),
+                friction=sc.friction,
+                category_bits=_CAT_STEM,
+                collide_bits=_COLLIDE_STEM,
+            ),
+            RigidBodyDomain(
+                bar,
+                bcs=self._maybe_gravity(),
+                friction=sc.friction,
+                category_bits=_CAT_BAR,
+                collide_bits=_COLLIDE_BAR,
+            ),
         ]
         self.connected_pairs = {(self.STEM, self.BAR)}
         self.joint_rel = {(self.STEM, self.BAR): REL_WELD}
@@ -661,6 +689,397 @@ class ReacherEnv(LewmSceneEnv):
         _set_pose(self.obj_rigids[1], l2xy, th1 + th2)
         self._angles0 = (th1, th2)
         self._finish_reset(rng)
+
+
+class PushTSideView:
+    """Scoped Push-T plant handle inside a DualPushTEnv (game path only)."""
+
+    planar = True
+    STEM = 1
+    BAR = 2
+    torque_control = False
+
+    def __init__(self, parent: "DualPushTEnv", plant: dict, env_id: int):
+        self._parent = parent
+        self.cfg = parent.cfg
+        self.env_id = int(env_id)
+        self.looper = parent.looper
+        self.rm = parent.rm
+        self.ee_rigid = plant["ee_rigid"]
+        self.ee_domain = plant["ee_domain"]
+        self.obj_rigids = plant["obj_rigids"]
+        self.obj_domains = plant["obj_domains"]
+        self.obj_types = plant["obj_types"]
+        self.obj_types_np = np.asarray(self.obj_types, dtype=np.int64)
+        self.obj_half_heights = plant["obj_half_heights"]
+        self.stem_hw = plant["stem_hw"]
+        self.stem_hh = plant["stem_hh"]
+        self.bar_hw = plant["bar_hw"]
+        self.bar_hh = plant["bar_hh"]
+        self.connected_pairs = {(self.STEM, self.BAR)}
+        self.joint_rel = {(self.STEM, self.BAR): REL_WELD}
+        self.fixed_slots = set()
+        self.ee_spawn = "support"
+        self.ee_idx = self.ee_domain.ndOffset
+        self.rigid_ids = [self.ee_idx] + [d.ndOffset for d in self.obj_domains]
+        self.n_obj = len(self.rigid_ids)
+        self.obj_geom = np.zeros((self.n_obj, 2), dtype=np.float32)
+        sc = self.cfg.scene
+        self.obj_geom[0] = (sc.ee_radius, sc.ee_radius)
+        self.obj_geom[1] = (self.stem_hw, self.stem_hh)
+        self.obj_geom[2] = (self.bar_hw, self.bar_hh)
+        self.base_mass = [sc.ee_mass] + [r.mass for r in self.obj_rigids]
+        self.obj_mass = np.asarray(self.base_mass, dtype=np.float32)
+        self.obj_mu = np.full(self.n_obj, sc.friction, dtype=np.float32)
+        self.force_cap_override = None
+        self.max_frame_substeps = None
+
+    def rel_type_mat(self):
+        from learning.models.relations import empty_rel, set_pair
+        R = empty_rel(self.n_obj)
+        for (i, j), t in self.joint_rel.items():
+            set_pair(R, i, j, t)
+        return R
+
+    def t_goal_parts(self, gx, gy, theta=0.0):
+        return self._parent._t_goal_parts(gx, gy, theta, self)
+
+    def set_force(self, f):
+        _patch_array(self.rm.bcTValues, self.ee_idx,
+                     wp.vec2(float(f[0]), float(f[1])))
+
+    def set_ee_radius(self, radius: float):
+        r = float(max(1e-4, radius))
+        self.ee_rigid.radius = r
+        _patch_array(self.rm.radius, self.ee_idx, r)
+        self.obj_geom[0] = (r, r)
+        self.obj_half_heights[0] = r
+        mass_np = np.asarray(self.rm.mass.numpy())
+        m = float(mass_np[self.ee_idx])
+        _patch_array(self.rm.inertia, self.ee_idx, 0.5 * m * r * r)
+        self.rm.updateBBox()
+
+    def raw_states(self) -> np.ndarray:
+        rm = self.rm
+        ids = np.asarray(self.rigid_ids)
+        params = rm.rigidParams.numpy()
+        quat = rm.quat.numpy()
+        V = rm.V.numpy()
+        RotV = rm.RotV.numpy()
+        pos = params[ids, 0, :].astype(np.float64)
+        theta = np.arctan2(np.sin(quat[ids]), np.cos(quat[ids]))
+        vel = V[ids]
+        om = RotV[ids]
+        return np.stack(
+            [pos[:, 0], pos[:, 1], theta, vel[:, 0], vel[:, 1], om], axis=1
+        ).astype(np.float32)
+
+    def advance_action(self, action: np.ndarray):
+        """Deferred: DualPushTEnv.step_pair advances both plants together."""
+        self._parent._pending[self.env_id] = np.asarray(action, dtype=np.float64).reshape(-1)
+        if all(a is not None for a in self._parent._pending):
+            self._parent._flush_pending()
+
+    def reset(self, rng: np.random.Generator = None) -> dict:
+        return self._parent.reset(rng)
+
+
+class DualPushTEnv:
+    """Two Push-T plants in one ExplicitLoop with env_id isolation (game only).
+
+    Capacity sized for 6 bodies / 2 welds. Training/eval keep single PushTEnv.
+    """
+
+    planar = True
+    rigid_capacity = {
+        "max_nodes": 16,
+        "max_joints": 8,
+        "max_contacts": 128,
+        "max_ground_contacts": 4,
+        "max_ground_pairs": 8,
+        "max_collision_pairs": 128,
+        "max_envs_alloc": 2,
+    }
+
+    def __init__(self, cfg: Config = None, device: str = None):
+        self.cfg = cfg or Config()
+        init_warp(device=device, prefer_cuda=False)
+        sc = self.cfg.scene
+        stem_full = np.asarray(getattr(sc, "stem_ext", (0.08, 0.28)), dtype=np.float64)
+        bar_full = np.asarray(getattr(sc, "bar_ext", (0.32, 0.08)), dtype=np.float64)
+        stem_hw, stem_hh = 0.5 * stem_full[0], 0.5 * stem_full[1]
+        bar_hw, bar_hh = 0.5 * bar_full[0], 0.5 * bar_full[1]
+
+        domains = []
+        joints = []
+        plants = []
+        for eid in (0, 1):
+            stem_xy, bar_xy, weld = self._t_parts(
+                0.70, 0.40, 0.0, stem_hh, bar_hh)
+            ee = BallRigid(2, [0.28, 0.40], sc.ee_radius, sc.ee_mass)
+            ee_dom = RigidBodyDomain(
+                ee,
+                bcs=[Force([0], [0.0, 0.0])],
+                friction=sc.friction,
+                category_bits=COLLISION_CATEGORY_ORDINARY_RIGID,
+                collide_bits=COLLISION_MASK_ALL,
+                env_id=eid,
+            )
+            stem = BoxRigid(
+                2, stem_xy, stem_full, [0.0, 0.0],
+                float(getattr(sc, "stem_mass", 0.45)))
+            bar = BoxRigid(
+                2, bar_xy, bar_full, [0.0, 0.0],
+                float(getattr(sc, "bar_mass", 0.40)))
+            stem_dom = RigidBodyDomain(
+                stem, bcs=[], friction=sc.friction,
+                category_bits=_CAT_STEM, collide_bits=_COLLIDE_STEM, env_id=eid)
+            bar_dom = RigidBodyDomain(
+                bar, bcs=[], friction=sc.friction,
+                category_bits=_CAT_BAR, collide_bits=_COLLIDE_BAR, env_id=eid)
+            base = len(domains)
+            domains.extend([ee_dom, stem_dom, bar_dom])
+            joints.append(WeldJoint(base + 1, base + 2, weld, bcs=[]))
+            plants.append({
+                "ee_rigid": ee,
+                "ee_domain": ee_dom,
+                "obj_rigids": [stem, bar],
+                "obj_domains": [stem_dom, bar_dom],
+                "obj_types": [OBJ_TYPE_EE, OBJ_TYPE_BOX, OBJ_TYPE_BOX],
+                "obj_half_heights": [sc.ee_radius, stem_hh, bar_hh],
+                "stem_hw": stem_hw,
+                "stem_hh": stem_hh,
+                "bar_hw": bar_hw,
+                "bar_hh": bar_hh,
+            })
+
+        damp = float(getattr(sc, "loop_damping", 0.0))
+        self.looper = ExplicitLoop(
+            0.0, domains, joints, useAdapativeDT=True, damping=damp,
+            considerRigidRigidContact=True, use_pd=0,
+            rigid_capacity=dict(self.rigid_capacity))
+        self.rm = self.looper.rigidManager
+        self.views = [
+            PushTSideView(self, plants[0], 0),
+            PushTSideView(self, plants[1], 1),
+        ]
+        self.left = self.views[0]
+        self.right = self.views[1]
+        self._pending = [None, None]
+        self.max_frame_substeps = None
+        for v in self.views:
+            self._apply_base_dynamics(v)
+            self._cache_body_params(v)
+
+    @staticmethod
+    def _t_local(stem_hh, bar_hh):
+        stem = np.array([0.0, stem_hh], dtype=np.float64)
+        bar = np.array([0.0, 2.0 * stem_hh + bar_hh], dtype=np.float64)
+        weld = np.array([0.0, 2.0 * stem_hh], dtype=np.float64)
+        return stem, bar, weld
+
+    @classmethod
+    def _t_parts(cls, cx, cy, theta, stem_hh, bar_hh):
+        stem_l, bar_l, weld_l = cls._t_local(stem_hh, bar_hh)
+        R = _rot(theta)
+        origin = np.array([cx, cy], dtype=np.float64)
+        return origin + R @ stem_l, origin + R @ bar_l, origin + R @ weld_l
+
+    def _t_goal_parts(self, gx, gy, theta, view: PushTSideView):
+        stem, bar, _ = self._t_parts(gx, gy, theta, view.stem_hh, view.bar_hh)
+        return np.asarray(stem, dtype=np.float32), np.asarray(bar, dtype=np.float32)
+
+    def _apply_base_dynamics(self, view: PushTSideView):
+        sc = self.cfg.scene
+        restitution = float(getattr(sc, "restitution", 0.0))
+        for i, gid in enumerate(view.rigid_ids):
+            m = float(view.base_mass[i])
+            if int(view.obj_types[i]) == OBJ_TYPE_BOX:
+                w = 2.0 * float(view.obj_geom[i, 0])
+                h = 2.0 * float(view.obj_geom[i, 1])
+                I = (1.0 / 12.0) * m * (w * w + h * h)
+            else:
+                r = float(view.obj_geom[i, 0])
+                I = 0.5 * m * r * r
+            _patch_array(self.rm.mass, gid, m)
+            _patch_array(self.rm.inertia, gid, float(I))
+            _patch_array(self.rm.contactParams, gid, [float(sc.friction), restitution])
+
+    def _cache_body_params(self, view: PushTSideView):
+        mass_np = np.asarray(self.rm.mass.numpy())
+        cp_np = np.asarray(self.rm.contactParams.numpy())
+        view.obj_mass = np.array(
+            [float(mass_np[gid]) for gid in view.rigid_ids], dtype=np.float32)
+        view.obj_mu = np.array(
+            [float(cp_np[gid, 0]) for gid in view.rigid_ids], dtype=np.float32)
+
+    @staticmethod
+    def _obb_support(xy, hw, hh, th, nvec):
+        n = np.asarray(nvec, dtype=np.float64)
+        nn = float(np.linalg.norm(n))
+        n = n / nn if nn > 1e-8 else np.array([-1.0, 0.0])
+        c, s = float(np.cos(th)), float(np.sin(th))
+        ext = abs(n[0] * c + n[1] * s) * hw + abs(-n[0] * s + n[1] * c) * hh
+        center = np.asarray(xy, dtype=np.float64)
+        return center + n * ext, ext, n
+
+    def _spawn_ee_support(self, view, stem_xy, bar_xy, theta, gap=0.015):
+        """Place EE behind the stem, opposite the task goal (same as PushTEnv)."""
+        ee_r = float(view.obj_geom[0, 0])
+        stem_xy = np.asarray(stem_xy, dtype=np.float64)
+        tc = getattr(self.cfg, "task", None)
+        gx = float(getattr(tc, "goal_x", 1.50))
+        c, s = float(np.cos(theta)), float(np.sin(theta))
+        origin = stem_xy - np.array([-s * view.stem_hh, c * view.stem_hh])
+        err = np.array([gx, float(getattr(tc, "goal_y", 0.52))], dtype=np.float64) - origin
+        hx = -1.0 if err[0] >= 0.0 else 1.0
+        nvec = np.array([hx, 0.0], dtype=np.float64)
+        _, ext, n = self._obb_support(
+            stem_xy, view.stem_hw, view.stem_hh, theta, nvec)
+        stem_m = float(getattr(self.cfg.scene, "stem_mass", 0.45))
+        bar_m = float(getattr(self.cfg.scene, "bar_mass", 0.40))
+        com_y = (stem_m * stem_xy[1] + bar_m * float(bar_xy[1])) / (stem_m + bar_m)
+        ee = stem_xy + n * (ee_r + ext + float(gap))
+        ee[1] = float(com_y)
+        for _ in range(10):
+            ee[0] = float(np.clip(ee[0], 0.18, 2.04))
+            ee[1] = float(np.clip(ee[1], 0.16, 0.92))
+            g_s = _circle_obb_gap(
+                ee, ee_r, stem_xy, view.stem_hw, view.stem_hh, theta)
+            g_b = _circle_obb_gap(
+                ee, ee_r, bar_xy, view.bar_hw, view.bar_hh, theta)
+            if min(g_s, g_b) >= 0.5 * gap:
+                return ee
+            ee = ee + n * 0.025
+        return ee
+
+    def reset(self, rng: np.random.Generator = None):
+        """Identical random pose on both plants; one looper.reset."""
+        rng = rng or np.random.default_rng()
+        sc = self.cfg.scene
+        cx = float(rng.uniform(0.45, 0.95))
+        cy = float(rng.uniform(0.22, 0.85))
+        theta = float(rng.uniform(-2.4, 2.4))
+        for view in self.views:
+            stem_xy, bar_xy, _ = self._t_parts(
+                cx, cy, theta, view.stem_hh, view.bar_hh)
+            _set_pose(view.obj_rigids[0], stem_xy, theta)
+            _set_pose(view.obj_rigids[1], bar_xy, theta)
+            ee = self._spawn_ee_support(view, stem_xy, bar_xy, theta, gap=0.015)
+            _set_pose(view.ee_rigid, ee, 0.0)
+            view.obj_geom[0] = (sc.ee_radius, sc.ee_radius)
+            _patch_array(self.rm.radius, view.ee_idx, float(sc.ee_radius))
+        self.looper.reset()
+        for view in self.views:
+            for i, rigid in enumerate([view.ee_rigid] + view.obj_rigids):
+                gid = view.rigid_ids[i]
+                ang = np.asarray(getattr(rigid, "angle", 0.0)).reshape(-1)
+                th = float(ang[0]) if ang.size else 0.0
+                _patch_array(self.rm.quat, gid, th)
+                _patch_array(self.rm.quat_initial, gid, 0.0)
+            self._apply_base_dynamics(view)
+            self._cache_body_params(view)
+            view.set_force((0.0, 0.0))
+        self.rm.precompute_rigid_transforms()
+        self.rm.updateBBox()
+        self._pending = [None, None]
+        return self.left.raw_states()
+
+    def _prepare_force(self, view: PushTSideView, action, V):
+        sc = self.cfg.scene
+        a = np.asarray(action, dtype=np.float64).reshape(-1)
+        if float(getattr(sc, "ee_damping", 0.0)) > 0.0:
+            v = V[view.ee_idx]
+            a = a - sc.ee_damping * v
+            fmax = float(self.cfg.collect.force_max)
+            override = getattr(view, "force_cap_override", None)
+            if override is not None:
+                fmax = max(fmax, float(override))
+            a = np.clip(a, -fmax, fmax)
+        return a
+
+    def _apply_table_friction_view(self, view, dt, V, W, mass, inertia):
+        sc = self.cfg.scene
+        g = float(getattr(sc, "table_g", 0.0))
+        if g <= 0.0:
+            return
+        mu_k = float(getattr(sc, "table_mu", 0.20))
+        mu_s = 1.2 * mu_k
+        v_stick = float(getattr(sc, "table_v_stick", 0.03))
+        on_ee = bool(getattr(sc, "table_on_ee", False))
+        base_mu = max(float(sc.friction), 1e-6)
+        geom = np.asarray(view.obj_geom, dtype=np.float64)
+        mu_body = np.asarray(view.obj_mu, dtype=np.float64)
+        for i, gid in enumerate(view.rigid_ids):
+            if i == 0 and not on_ee:
+                continue
+            m = float(mass[gid])
+            if not np.isfinite(m) or m <= 1e-8 or m >= 1e8:
+                continue
+            mu = mu_k * (float(mu_body[i]) / base_mu)
+            N = m * g
+            vx, vy = float(V[gid][0]), float(V[gid][1])
+            speed = float(np.hypot(vx, vy))
+            mu_now = mu_s * (float(mu_body[i]) / base_mu) if speed < v_stick else mu
+            fmax = mu_now * N
+            if speed * m <= fmax * dt:
+                vx, vy = 0.0, 0.0
+            elif speed > 1e-9:
+                s = (fmax / m) * dt / speed
+                vx -= s * vx
+                vy -= s * vy
+            V[gid] = (vx, vy)
+            I = float(inertia[gid])
+            if not np.isfinite(I) or I <= 1e-10:
+                continue
+            w = float(W[gid])
+            r_eff = 0.5 * float(np.hypot(geom[i, 0], geom[i, 1]))
+            tmax = mu_now * N * max(r_eff, 1e-4)
+            if I * abs(w) <= tmax * dt:
+                w = 0.0
+            else:
+                w -= np.sign(w) * (tmax / I) * dt
+            W[gid] = w
+
+    def step_pair(self, action0, action1):
+        """Set both EE forces and advance one shared physics frame."""
+        sc = self.cfg.scene
+        need_damp = float(getattr(sc, "ee_damping", 0.0)) > 0.0
+        V_pre = self.rm.V.numpy() if need_damp else None
+        for view, action in ((self.left, action0), (self.right, action1)):
+            a = self._prepare_force(view, action, V_pre) if need_damp else np.asarray(
+                action, dtype=np.float64).reshape(-1)
+            view.set_force(a)
+        max_ss = self.max_frame_substeps
+        if max_ss is None:
+            max_ss = getattr(self.left, "max_frame_substeps", None)
+        self.looper.advanceWithTime(sc.frame_dt, max_substeps=max_ss)
+        need_friction = float(getattr(sc, "table_g", 0.0)) > 0.0
+        need_clamp = float(getattr(sc, "ee_vel_max", 0.0)) > 0.0
+        if need_friction or need_clamp:
+            V = self.rm.V.numpy()
+            W = self.rm.RotV.numpy() if need_friction else None
+            mass = self.rm.mass.numpy() if need_friction else None
+            inertia = self.rm.inertia.numpy() if need_friction else None
+            if need_friction:
+                for view in self.views:
+                    self._apply_table_friction_view(
+                        view, sc.frame_dt, V, W, mass, inertia)
+            if need_clamp:
+                for view in self.views:
+                    v = np.asarray(V[view.ee_idx], dtype=np.float64).copy()
+                    speed = float(np.hypot(v[0], v[1]))
+                    if speed > sc.ee_vel_max:
+                        v = v * (sc.ee_vel_max / speed)
+                        V[view.ee_idx] = (float(v[0]), float(v[1]))
+            self.rm.V.assign(V)
+            if need_friction and W is not None:
+                self.rm.RotV.assign(W)
+        self._pending = [None, None]
+
+    def _flush_pending(self):
+        a0, a1 = self._pending
+        self.step_pair(a0, a1)
 
 
 def make_scene_env(cfg: Config, device: str = None):
