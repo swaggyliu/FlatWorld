@@ -33,6 +33,10 @@ class StateLeWM(nn.Module):
         self.pair_head = mlp([latent_dim * 3, 64, 1])
         self.ground_head = mlp([latent_dim, 32, 1])
         self.ss_prob = 0.6
+        # False: GRU never sees body–plane contact (ablation). Head stays in
+        # the module so checkpoints stay loadable, but it is not supervised
+        # and rollouts pass a zero ground channel.
+        self.use_ground = True
         # None → full action on node 0 (EE). Reacher sets (0, 2).
         self.action_nodes = None
         self.register_buffer("st_mean", torch.zeros(6))
@@ -113,7 +117,7 @@ class StateLeWM(nn.Module):
     def roll_step(self, z, a, h, geom, prev_c, rel_type=None, obj_types=None):
         """One imagined step: pair on edges, ground on the GRU node input."""
         pair_now = self.pair_prob(z)
-        ground_now = self.ground_prob(z)
+        ground_now = self.ground_prob(z) if self.use_ground else None
         z, h, _ = self.predictor.step(
             z, a, h, geom=geom, prev_contact=prev_c, pair_contact=pair_now,
             ground=ground_now, rel_type=rel_type,
@@ -184,7 +188,9 @@ class StateLeWM(nn.Module):
                 pair_now = pair[:, t]
             else:
                 pair_now = self.pair_prob(zt)
-            if use_gt and ground is not None:
+            if not self.use_ground:
+                g_now = None
+            elif use_gt and ground is not None:
                 g_now = ground[:, t]
             else:
                 g_now = self.ground_prob(zt)
@@ -216,8 +222,11 @@ class StateLeWM(nn.Module):
             "actions": actions,
             "pair_logit": self.pair_logit(z) if pair is not None else None,
             "pair_logit_pred": self.pair_logit(z_pred) if pair is not None else None,
-            "ground_logit": self.ground_logit(z) if ground is not None else None,
-            "ground_logit_pred": self.ground_logit(z_pred) if ground is not None else None,
+            "ground_logit": (
+                self.ground_logit(z) if self.use_ground and ground is not None else None),
+            "ground_logit_pred": (
+                self.ground_logit(z_pred)
+                if self.use_ground and ground is not None else None),
             "contact_mask": contact_mask,
         }
 

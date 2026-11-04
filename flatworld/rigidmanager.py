@@ -1445,23 +1445,29 @@ def _generate_ground_pairs_wp(
     num_groundmesh_pairs: wp.array(dtype=int),
     groundprim_pairs_buffer: wp.array(dtype=wp.vec2i),
     groundmesh_pairs_buffer: wp.array(dtype=wp.vec2i),
+    reset_counts: int,
 ):
     tid = wp.tid()
     if tid != 0:
         return
-    if consider_rigid_rigid != 0 and num_pairs[0] > 0:
+    # BVH already classified pairs (including possible ground): skip unless
+    # reset_counts=0, which appends ground onto static RR-only broadphase.
+    if consider_rigid_rigid != 0 and num_pairs[0] > 0 and reset_counts != 0:
         return
-    num_primitive_pairs[0] = 0
-    num_ball_ball_pairs[0] = 0
-    num_box_box_pairs[0] = 0
-    num_box_ball_pairs[0] = 0
-    num_seg_point_pairs[0] = 0
-    num_seg_ball_pairs[0] = 0
-    num_seg_seg_pairs[0] = 0
-    num_mesh_pairs[0] = 0
-    num_mixed_pairs[0] = 0
-    num_groundprim_pairs[0] = 0
-    num_groundmesh_pairs[0] = 0
+    # reset_counts=0 appends ground pairs onto an existing rigid-rigid
+    # classification (tiny scenes that skip BVH and only broadphase RR).
+    if reset_counts != 0:
+        num_primitive_pairs[0] = 0
+        num_ball_ball_pairs[0] = 0
+        num_box_box_pairs[0] = 0
+        num_box_ball_pairs[0] = 0
+        num_seg_point_pairs[0] = 0
+        num_seg_ball_pairs[0] = 0
+        num_seg_seg_pairs[0] = 0
+        num_mesh_pairs[0] = 0
+        num_mixed_pairs[0] = 0
+        num_groundprim_pairs[0] = 0
+        num_groundmesh_pairs[0] = 0
 
     for i in range(num_rigids):
         type_i = rigidDomainIds[i][1]
@@ -3615,12 +3621,20 @@ class RigidManager:
             # The classifier reads the device-side count and resets its output
             # counters even when the BVH produced zero pairs.
             self.classify_collision_pairs_kernel(collision_pairs_field, num_pairs)
-        if self.numRigidGroundContact > 0 and has_ground_geom:
-            # Generate ground pairs directly only when no BVH pairs were
-            # classified, or when rigid-rigid broadphase is disabled.
-            self._generate_ground_pairs_direct_kernel(
-                num_pairs, int(self.considerRigidRigidContact)
-            )
+            if self.skip_bvh and self.numRigidGroundContact > 0 and has_ground_geom:
+                # Static rigid-rigid pairs do not include the floor. Append
+                # body–plane pairs or resting bodies fall through the ground.
+                self._generate_ground_pairs_direct_kernel(
+                    num_pairs, int(self.considerRigidRigidContact), reset_counts=0
+                )
+            elif self.numRigidGroundContact > 0 and has_ground_geom:
+                # Generate ground pairs directly only when no BVH pairs were
+                # classified (kernel early-returns when pairs already exist).
+                self._generate_ground_pairs_direct_kernel(
+                    num_pairs, int(self.considerRigidRigidContact), reset_counts=1
+                )
+        elif self.numRigidGroundContact > 0 and has_ground_geom:
+            self._generate_ground_pairs_direct_kernel(reset_counts=1)
 
         maybe_rr = self.considerRigidRigidContact
         # Skip empty ground detect/assemble when there is no analytical/HF/voxel.
@@ -5493,7 +5507,9 @@ class RigidManager:
             self.updateMeshCoords()
             self._sh_mesh_needs_rebuild = True
 
-    def _generate_ground_pairs_direct_kernel(self, num_pairs=None, consider_rigid_rigid=0):
+    def _generate_ground_pairs_direct_kernel(
+        self, num_pairs=None, consider_rigid_rigid=0, reset_counts: int = 1
+    ):
         """Generate ground-rigid contact pairs directly without BVH broadphase."""
         if num_pairs is None:
             num_pairs = self._zero_pair_count
@@ -5523,6 +5539,7 @@ class RigidManager:
                 self.num_groundmesh_pairs,
                 self.groundprim_pairs_buffer,
                 self.groundmesh_pairs_buffer,
+                int(reset_counts),
             ],
         )
 

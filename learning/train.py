@@ -37,6 +37,7 @@ def _ckpt_dict(model, n_obj, args, epoch, seed, val=None):
         "epoch": epoch,
         "seed": seed,
         "action_nodes": list(model.action_nodes) if getattr(model, "action_nodes", None) else None,
+        "use_ground": bool(getattr(model, "use_ground", True)),
     }
     if val is not None:
         payload["val"] = {k: float(v) for k, v in val.items()}
@@ -99,6 +100,9 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
         tactile_drop_prob=float(getattr(args, "tactile_drop_prob", 0.5)),
     ).to(device)
     model.action_nodes = action_nodes
+    model.use_ground = not bool(getattr(args, "no_ground", False))
+    if not model.use_ground:
+        print("  use_ground=False (GRU ground channel is zero; no ground loss)")
     if action_nodes:
         print(f"  action_nodes={action_nodes}")
     if norm is not None:
@@ -164,7 +168,8 @@ def train_one(args, train_loader, val_loader, n_obj, device, seed, out_name,
             losses = model.compute_loss(
                 out,
                 w_pair=float(getattr(args, "w_pair", 1.5)),
-                w_ground=float(getattr(args, "w_ground", 0.5)),
+                w_ground=(0.0 if not model.use_ground
+                          else float(getattr(args, "w_ground", 0.5))),
                 w_drift=float(getattr(args, "w_drift", 0.3)),
                 w_xy=float(getattr(args, "w_xy", 0.5)),
                 w_th=float(getattr(args, "w_th", 0.5)),
@@ -273,6 +278,9 @@ def main():
                         help="pair focal loss weight")
     parser.add_argument("--w-ground", type=float, default=0.5,
                         help="ground-contact focal loss weight")
+    parser.add_argument("--no-ground", action="store_true",
+                        help="ablation: do not feed body–plane contact into "
+                             "the predictor, and drop the ground loss")
     parser.add_argument("--w-drift", type=float, default=0.3,
                         help="zero-force drift penalty weight")
     parser.add_argument("--w-xy", type=float, default=0.5,

@@ -50,6 +50,7 @@ def _load_one(ckpt_path: str, device: str):
     stride = int(ckpt.get("stride", 1))
     nodes = ckpt.get("action_nodes")
     model.action_nodes = tuple(int(x) for x in nodes) if nodes else None
+    model.use_ground = bool(ckpt.get("use_ground", True))
     return model, norm, stride
 
 
@@ -200,6 +201,7 @@ class PushToGoalTask:
         self.ee_scale = float(ee_scale)
         pk = dict(planner_kwargs or {})
         self.use_solver_cem = bool(pk.pop("use_solver_cem", False))
+        pk.pop("use_hybrid", None)
         self.exec_horizon = int(pk.pop("exec_horizon", 1))
         cost_kw = {k: pk.pop(k) for k in _COST_KEYS if k in pk}
         self.cost = PushToGoalCost(device=device, **cost_kw)
@@ -441,6 +443,11 @@ class PushToGoalTask:
             cur = self._observe()
             target_pos = cur["obj_states"][self.target_idx, :2]
             final_dist = float(np.linalg.norm(target_pos - goal))
+            xy = cur["obj_states"][:, :2]
+            if (not np.isfinite(cur["obj_states"]).all()) or float(np.max(np.abs(xy))) > 8.0:
+                if not np.isfinite(final_dist):
+                    final_dist = 8.0
+                break
             if self._succeeded(cur["obj_states"], goal):
                 success = True
                 settle_frame = t

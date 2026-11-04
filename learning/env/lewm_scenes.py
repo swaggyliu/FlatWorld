@@ -80,9 +80,27 @@ def _circle_obb_gap(ee_xy, ee_r, box_xy, hw, hh, theta):
 
 
 def _aabb_sep(ee_xy, ee_r, box_xy, hw, hh):
+    """Axis-aligned separating gap (positive = separated)."""
     gx = abs(float(ee_xy[0]) - float(box_xy[0])) - (ee_r + hw)
     gy = abs(float(ee_xy[1]) - float(box_xy[1])) - (ee_r + hh)
     return float(max(gx, gy))
+
+
+def _obb_aabb_half(hw, hh, theta):
+    """World-axis AABB half-extents of a rotated box (hw, hh)."""
+    c, s = abs(float(np.cos(theta))), abs(float(np.sin(theta)))
+    return float(c * hw + s * hh), float(s * hw + c * hh)
+
+
+def _ee_t_aabb_clear(ee_xy, ee_r, stem_xy, bar_xy, stem_hw, stem_hh,
+                     bar_hw, bar_hh, theta, clearance: float = 0.02) -> bool:
+    """True if EE circle AABB is clear of both T-box world AABBs."""
+    shw, shh = _obb_aabb_half(stem_hw, stem_hh, theta)
+    bhw, bhh = _obb_aabb_half(bar_hw, bar_hh, theta)
+    return (
+        _aabb_sep(ee_xy, ee_r, stem_xy, shw, shh) >= clearance
+        and _aabb_sep(ee_xy, ee_r, bar_xy, bhw, bhh) >= clearance
+    )
 
 
 class LewmSceneEnv(PushSceneEnv):
@@ -923,10 +941,11 @@ class DualPushTEnv:
         center = np.asarray(xy, dtype=np.float64)
         return center + n * ext, ext, n
 
-    def _spawn_ee_support(self, view, stem_xy, bar_xy, theta, gap=0.015):
+    def _spawn_ee_support(self, view, stem_xy, bar_xy, theta, gap=0.02):
         """Place EE behind the stem, opposite the task goal (same as PushTEnv)."""
         ee_r = float(view.obj_geom[0, 0])
         stem_xy = np.asarray(stem_xy, dtype=np.float64)
+        bar_xy = np.asarray(bar_xy, dtype=np.float64)
         tc = getattr(self.cfg, "task", None)
         gx = float(getattr(tc, "goal_x", 1.50))
         c, s = float(np.cos(theta)), float(np.sin(theta))
@@ -941,31 +960,70 @@ class DualPushTEnv:
         com_y = (stem_m * stem_xy[1] + bar_m * float(bar_xy[1])) / (stem_m + bar_m)
         ee = stem_xy + n * (ee_r + ext + float(gap))
         ee[1] = float(com_y)
-        for _ in range(10):
+        for _ in range(16):
             ee[0] = float(np.clip(ee[0], 0.18, 2.04))
             ee[1] = float(np.clip(ee[1], 0.16, 0.92))
-            g_s = _circle_obb_gap(
-                ee, ee_r, stem_xy, view.stem_hw, view.stem_hh, theta)
-            g_b = _circle_obb_gap(
-                ee, ee_r, bar_xy, view.bar_hw, view.bar_hh, theta)
-            if min(g_s, g_b) >= 0.5 * gap:
+            if _ee_t_aabb_clear(
+                ee, ee_r, stem_xy, bar_xy,
+                view.stem_hw, view.stem_hh, view.bar_hw, view.bar_hh,
+                theta, clearance=float(gap),
+            ):
                 return ee
-            ee = ee + n * 0.025
+            ee = ee + n * 0.03
+        # Fallback: park EE left of both T AABBs with clearance.
+        shw, _ = _obb_aabb_half(view.stem_hw, view.stem_hh, theta)
+        bhw, _ = _obb_aabb_half(view.bar_hw, view.bar_hh, theta)
+        left_edge = min(float(stem_xy[0]) - shw, float(bar_xy[0]) - bhw)
+        ee = np.array([
+            max(0.12, left_edge - ee_r - float(gap)),
+            float(np.clip(stem_xy[1], 0.20, 0.90)),
+        ], dtype=np.float64)
         return ee
 
+    def _sample_clear_opening(self, rng: np.random.Generator, clearance: float = 0.02):
+        """Sample identical T+EE pose with EE/T AABB separation (no penetration)."""
+        view0 = self.views[0]
+        ee_r = float(self.cfg.scene.ee_radius)
+        for _ in range(48):
+            cx = float(rng.uniform(0.45, 0.95))
+            cy = float(rng.uniform(0.22, 0.85))
+            theta = float(rng.uniform(-2.4, 2.4))
+            stem_xy, bar_xy, _ = self._t_parts(
+                cx, cy, theta, view0.stem_hh, view0.bar_hh)
+            ee = self._spawn_ee_support(
+                view0, stem_xy, bar_xy, theta, gap=clearance)
+            if _ee_t_aabb_clear(
+                ee, ee_r, stem_xy, bar_xy,
+                view0.stem_hw, view0.stem_hh, view0.bar_hw, view0.bar_hh,
+                theta, clearance=clearance,
+            ):
+                return stem_xy, bar_xy, theta, ee
+        # Last resort: upright T + EE parked left of both boxes.
+        theta = 0.0
+        stem_xy, bar_xy, _ = self._t_parts(
+            0.70, 0.40, theta, view0.stem_hh, view0.bar_hh)
+        shw, _ = _obb_aabb_half(view0.stem_hw, view0.stem_hh, theta)
+        bhw, _ = _obb_aabb_half(view0.bar_hw, view0.bar_hh, theta)
+        left_edge = min(float(stem_xy[0]) - shw, float(bar_xy[0]) - bhw)
+        ee = np.array([
+            max(0.12, left_edge - ee_r - clearance),
+            float(stem_xy[1]),
+        ], dtype=np.float64)
+        return stem_xy, bar_xy, theta, ee
+
     def reset(self, rng: np.random.Generator = None):
-        """Identical random pose on both plants; one looper.reset."""
+        """Identical random pose on both plants; one looper.reset.
+
+        Rejects openings where EE AABB overlaps either T-box AABB.
+        """
         rng = rng or np.random.default_rng()
         sc = self.cfg.scene
-        cx = float(rng.uniform(0.45, 0.95))
-        cy = float(rng.uniform(0.22, 0.85))
-        theta = float(rng.uniform(-2.4, 2.4))
+        clearance = 0.02
+        stem_xy, bar_xy, theta, ee = self._sample_clear_opening(
+            rng, clearance=clearance)
         for view in self.views:
-            stem_xy, bar_xy, _ = self._t_parts(
-                cx, cy, theta, view.stem_hh, view.bar_hh)
             _set_pose(view.obj_rigids[0], stem_xy, theta)
             _set_pose(view.obj_rigids[1], bar_xy, theta)
-            ee = self._spawn_ee_support(view, stem_xy, bar_xy, theta, gap=0.015)
             _set_pose(view.ee_rigid, ee, 0.0)
             view.obj_geom[0] = (sc.ee_radius, sc.ee_radius)
             _patch_array(self.rm.radius, view.ee_idx, float(sc.ee_radius))
@@ -982,6 +1040,29 @@ class DualPushTEnv:
             view.set_force((0.0, 0.0))
         self.rm.precompute_rigid_transforms()
         self.rm.updateBBox()
+        # Post-reset AABB guard — keep YOU/AI identical if a nudge is needed.
+        view0 = self.views[0]
+        st = view0.raw_states()
+        ee_xy = st[0, :2]
+        stem = st[1, :2]
+        bar = st[2, :2]
+        th = float(st[1, 2])
+        ee_r = float(view0.obj_geom[0, 0])
+        if not _ee_t_aabb_clear(
+            ee_xy, ee_r, stem, bar,
+            view0.stem_hw, view0.stem_hh, view0.bar_hw, view0.bar_hh,
+            th, clearance=clearance,
+        ):
+            shw, _ = _obb_aabb_half(view0.stem_hw, view0.stem_hh, th)
+            bhw, _ = _obb_aabb_half(view0.bar_hw, view0.bar_hh, th)
+            left_edge = min(float(stem[0]) - shw, float(bar[0]) - bhw)
+            nx = left_edge - ee_r - clearance
+            ny = float(np.clip(stem[1], 0.20, 0.90))
+            for view in self.views:
+                _set_pose(view.ee_rigid, [nx, ny], 0.0)
+                _patch_array(self.rm.rigidParams, (view.ee_idx, 0), [nx, ny])
+                _patch_array(self.rm.V, view.ee_idx, wp.vec2(0.0, 0.0))
+            self.rm.updateBBox()
         self._pending = [None, None]
         return self.left.raw_states()
 
