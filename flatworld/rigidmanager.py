@@ -3182,6 +3182,7 @@ class RigidManager:
         self.pgs_lambda = wp.zeros(self.MAX_CONSTRAINTS, dtype=float)
         # For friction rows, parent normal row index; -1 otherwise.
         self.pgs_parent_row = wp.zeros(self.MAX_CONSTRAINTS, dtype=int)
+        self._zero_pair_count = wp.zeros(1, dtype=int)
         if self.pgs_solver == "islands":
             self.pgs_island_parent = wp.zeros(self.MAX_NODES, dtype=int)
             self.pgs_island_rank = wp.zeros(self.MAX_NODES, dtype=int)
@@ -5290,8 +5291,10 @@ class RigidManager:
             self.updateMeshCoords()
             self._sh_mesh_needs_rebuild = True
 
-    def _generate_ground_pairs_direct_kernel(self, num_pairs, consider_rigid_rigid):
+    def _generate_ground_pairs_direct_kernel(self, num_pairs=None, consider_rigid_rigid=0):
         """Generate ground-rigid contact pairs directly without BVH broadphase."""
+        if num_pairs is None:
+            num_pairs = self._zero_pair_count
         wp.launch(
             _generate_ground_pairs_wp,
             dim=1,
