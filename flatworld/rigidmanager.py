@@ -484,6 +484,8 @@ def _classify_collision_pairs_wp(
     tid = wp.tid()
     if tid != 0:
         return
+    if num_pairs[0] <= 0:
+        return
 
     num_primitive_pairs[0] = 0
     num_ball_ball_pairs[0] = 0
