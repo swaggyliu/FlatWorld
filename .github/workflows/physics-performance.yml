@@ -44,7 +44,8 @@ jobs:
           FLATWORLD_DEVICE: "cpu"
         run: |
           mkdir -p benchmark-results
-          python benchmarks/benchmark_2d.py --warmup 1 --repeat 5 --steps 120 | tee benchmark-results/physics-performance.txt
+          set -o pipefail
+          python benchmarks/benchmark_2d.py --warmup 1 --repeat 5 --steps 120 --frame-dt 0.0016666666666666668 2>&1 | tee benchmark-results/physics-performance.txt
 
       - name: Upload benchmark result
         if: always()
