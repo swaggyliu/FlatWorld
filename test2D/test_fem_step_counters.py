@@ -40,15 +40,15 @@ def test_fem_step_uses_host_counters_for_launch_dimensions(monkeypatch):
 def test_node_integration_clears_force_buffer_inline():
     ensure_warp()
     device = "cpu"
-    total_nodes = wp.array([1], dtype=int, device=device)
-    bc_nodes = wp.array([0], dtype=int, device=device)
-    bc_values = wp.array([[0.0, 0.0]], dtype=wp.vec2, device=device)
-    mass = wp.array([1.0], dtype=float, device=device)
+    total_nodes = wp.array(np.array([1], dtype=np.int32), dtype=int, device=device)
+    bc_nodes = wp.array(np.array([0], dtype=np.int32), dtype=int, device=device)
+    bc_values = wp.array(np.array([[0.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=device)
+    mass = wp.array(np.array([1.0], dtype=np.float32), dtype=float, device=device)
     A = wp.array([[0.0, 0.0]], dtype=wp.vec2, device=device)
     V = wp.array([[0.0, 0.0]], dtype=wp.vec2, device=device)
     U = wp.array([[0.0, 0.0]], dtype=wp.vec2, device=device)
     coords = wp.array([[0.0, 0.0]], dtype=wp.vec2, device=device)
-    Fext = wp.array([[2.0, 3.0]], dtype=wp.vec2, device=device)
+    Fext = wp.array(np.array([[2.0, 3.0]], dtype=np.float32), dtype=wp.vec2, device=device)
 
     wp.launch(
         _integrate_nodes_kernel,
