@@ -3,9 +3,9 @@
 Public API: substep, detect_all_contacts, solve_pgs, precompute_rigid_transforms,
 drawAll, processDomains_, processJoints, etc.
 
-PGS is serial: solve_pgs launches a dim=1 kernel that loops constraints
-forward and backward, with early exit on max |Δλ|. Joint rows use
-joint_kernels.assemble_single_joint_rows with the explicit-array signature.
+Serial PGS remains the default. An opt-in contact-island solver groups rows
+by shared rigid bodies and runs independent islands in parallel while preserving
+row order within each island. Joint rows use joint_kernels.assemble_single_joint_rows.
 """
 from __future__ import annotations
 
@@ -264,7 +264,7 @@ def _build_pgs_islands_kernel(
             root = island_parent[aid]
             island_counts[root] = island_counts[root] + 1
 
-    running_offset = 0
+    running_offset = int(0)
     for body in range(max_bodies):
         if island_parent[body] == body and island_counts[body] > 0:
             island_offsets[body] = running_offset
