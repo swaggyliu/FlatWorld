@@ -3305,7 +3305,6 @@ class RigidManager:
 
         Note: Does NOT reset boundary conditions - those should be managed by the caller.
         """
-        self._last_contact_transition = None
         # Reset all dynamic state variables to zero
         _fill_array(self.V, 0.0)
         _fill_array(self.RotV, 0.0)
@@ -4785,36 +4784,7 @@ class RigidManager:
         )
 
     def solve_pgs(self, pgs_iters: int):
-        """Serial PGS; optional snapshots support offline contact learning."""
-        record = bool(getattr(self, "record_contact_transitions", False))
-        snapshot = None
-        if record:
-            nc = min(int(self.num_contacts.numpy()[0]), int(self.MAX_CONTACTS))
-            ng = min(int(self.num_ground_contacts.numpy()[0]), int(self.MAX_GROUND_CONTACTS))
-            nrows = min(int(self.numConstraints.numpy()[0]), int(self.MAX_CONSTRAINTS))
-            snapshot = {
-                "num_pair": nc, "num_ground": ng, "num_rows": nrows,
-                "pair_a": self.contact_rigid_a.numpy()[:nc].copy(),
-                "pair_b": self.contact_rigid_b.numpy()[:nc].copy(),
-                "pair_point": self.contact_point.numpy()[:nc].copy(),
-                "pair_normal": self.contact_normal.numpy()[:nc].copy(),
-                "pair_tangent": self.contact_tangent1.numpy()[:nc].copy(),
-                "pair_depth": self.contact_depth.numpy()[:nc].copy(),
-                "pair_rows": self.contact_pgs_indices.numpy()[:nc].copy(),
-                "ground_rigid": self.ground_contact_rigid.numpy()[:ng].copy(),
-                "ground_point": self.ground_contact_point.numpy()[:ng].copy(),
-                "ground_normal": self.ground_contact_normal.numpy()[:ng].copy(),
-                "ground_tangent": self.ground_contact_tangent1.numpy()[:ng].copy(),
-                "ground_velocity": self.ground_contact_vel.numpy()[:ng].copy(),
-                "ground_depth": self.ground_contact_depth.numpy()[:ng].copy(),
-                "ground_rows": self.ground_contact_pgs_indices.numpy()[:ng].copy(),
-                "pre_v": self.V.numpy().copy(), "pre_omega": self.RotV.numpy().copy(),
-                "pre_pos": self.rigidParams.numpy()[:, 0, :].copy(),
-                "mass": self.mass.numpy().copy(), "inertia": self.inertia.numpy().copy(),
-                "contact_params": self.contactParams.numpy().copy(),
-                "bounce_pair": self.contact_bounce_vel.numpy()[:nc].copy(),
-                "bounce_ground": self.ground_contact_bounce_vel.numpy()[:ng].copy(),
-            }
+        """Serial PGS via dim=1 Warp kernel (forward + backward sweeps)."""
         wp.launch(
             _solve_pgs_kernel,
             dim=1,
@@ -4836,9 +4806,6 @@ class RigidManager:
                 self.pgs_parent_row,
             ],
         )
-        if record and snapshot is not None:
-            snapshot["lambda"] = self.pgs_lambda.numpy()[:snapshot["num_rows"]].copy()
-            self._last_contact_transition = snapshot
 
     def precompute_rigid_transforms(self):
         n = int(self.numRigids + self.numAnalytical)
