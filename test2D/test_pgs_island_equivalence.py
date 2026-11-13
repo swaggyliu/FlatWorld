@@ -46,8 +46,8 @@ def _state(initial_v, device):
     return (
         wp.array(initial_v.copy(), dtype=wp.vec2, device=device),
         wp.zeros(4, dtype=float, device=device),
-        wp.ones(4, dtype=float, device=device),
-        wp.ones(4, dtype=float, device=device),
+        wp.array(np.ones(4, dtype=np.float32), dtype=float, device=device),
+        wp.array(np.ones(4, dtype=np.float32), dtype=float, device=device),
         wp.zeros(4, dtype=float, device=device),
     )
 
@@ -60,9 +60,6 @@ def test_contact_island_pgs_matches_serial_symmetric_sweeps():
     serial_v, serial_rot_v, mass, inertia, serial_lambda = _state(initial_v, device)
     island_v, island_rot_v, _, _, island_lambda = _state(initial_v, device)
 
-    common = [
-        bodypair, jac_a, jac_b, rhs, limits,
-    ]
     wp.launch(
         _solve_pgs_kernel,
         dim=1,
