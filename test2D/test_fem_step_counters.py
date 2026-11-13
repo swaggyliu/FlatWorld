@@ -2,6 +2,7 @@
 
 import warp as wp
 
+import flatworld  # noqa: F401  (adds the package directory to sys.path)
 from femspringmanager import FemSpringManager
 
 
