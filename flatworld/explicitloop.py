@@ -84,6 +84,7 @@ class ExplicitLoop(MixedContact):
         max_contact_velocity=50.0,
         pgs_iterations=50,
         rigid_capacity=None,
+        pgs_solver="serial",
     ):
         """
         Args:
@@ -104,6 +105,7 @@ class ExplicitLoop(MixedContact):
                 rebuilt lazily each substep / every 1/600 s with no velocity buffer.
             rigid_capacity: Optional dict of RigidManager capacity overrides
                 (max_nodes, max_joints, max_contacts, ...).
+            pgs_solver: "serial" (default) or "islands" for independent contact-island PGS.
         """
         ensure_warp()
         self._rigid_capacity = dict(rigid_capacity or {})
@@ -162,6 +164,7 @@ class ExplicitLoop(MixedContact):
                 considerRigidRigidContact=considerRigidRigidContact,
                 use_pd=self.use_pd,
                 pgs_iterations=pgs_iterations,
+                pgs_solver=pgs_solver,
                 **self._rigid_capacity,
             )
             self.stableTime = min(self.rigidManager.stableTime, self.stableTime)
