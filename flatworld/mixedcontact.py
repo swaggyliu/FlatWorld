@@ -495,7 +495,7 @@ def _activate_pairs_by_aabb_kernel(
 @wp.kernel
 def _activate_pairs_kernel(
     pairs: wp.array(dtype=wp.vec2i),
-    num_pairs: int,
+    num_pairs: wp.array(dtype=int),
     pair_a: wp.array(dtype=int),
     pair_b: wp.array(dtype=int),
     active: wp.array(dtype=int),
@@ -506,7 +506,7 @@ def _activate_pairs_kernel(
         active[i] = 0
     # second pass: mark overlaps (each thread scans all BVH pairs — O(n*m) like Taichi)
     if i < num_contact_pairs:
-        for p in range(num_pairs):
+        for p in range(num_pairs[0]):
             a = pairs[p][0]
             b = pairs[p][1]
             pa = wp.max(a, b)
@@ -2283,10 +2283,9 @@ class MixedContact:
         """Activate/deactivate contact pairs based on BVH collision results."""
         n = active.shape[0]
         if not self.skip_bvh:
-            if num_pairs_work > 0:
-                self._launch_activate_pairs(pairs_field, num_pairs_work, pair_a, pair_b, active, n)
-            else:
-                active.fill_(0)
+            # The pair count stays on device; the activation kernel handles
+            # the zero-pair case without a host-side scalar readback.
+            self._launch_activate_pairs(pairs_field, num_pairs_work, pair_a, pair_b, active, n)
         else:
             active.fill_(1)
 
@@ -2309,7 +2308,7 @@ class MixedContact:
         wp.launch(
             _activate_pairs_kernel,
             dim=num_contact_pairs,
-            inputs=[pairs, int(num_pairs), pair_a, pair_b, active, int(num_contact_pairs)],
+            inputs=[pairs, num_pairs, pair_a, pair_b, active, int(num_contact_pairs)],
         )
 
     def _build_active_rigid_mesh_workset(self, total_mesh_items):
