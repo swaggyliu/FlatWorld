@@ -448,7 +448,7 @@ def _mask_allows_pair_func(
 @wp.kernel
 def _classify_collision_pairs_wp(
     pairs: wp.array(dtype=wp.vec2i),
-    num_pairs: int,
+    num_pairs: wp.array(dtype=int),
     num_rigids: int,
     max_collision_pairs: int,
     max_ground_pairs: int,
@@ -484,6 +484,8 @@ def _classify_collision_pairs_wp(
     tid = wp.tid()
     if tid != 0:
         return
+    if num_pairs[0] <= 0:
+        return
 
     num_primitive_pairs[0] = 0
     num_ball_ball_pairs[0] = 0
@@ -497,7 +499,7 @@ def _classify_collision_pairs_wp(
     num_groundprim_pairs[0] = 0
     num_groundmesh_pairs[0] = 0
 
-    for i in range(num_pairs):
+    for i in range(num_pairs[0]):
         domain_a = pairs[i][0]
         domain_b = pairs[i][1]
         rigid_a = domainToRigid[domain_a]
@@ -1230,6 +1232,8 @@ def _update_u_and_bbox_wp(
 
 @wp.kernel
 def _generate_ground_pairs_wp(
+    num_pairs: wp.array(dtype=int),
+    consider_rigid_rigid: int,
     num_rigids: int,
     num_analytical: int,
     max_ground_pairs: int,
@@ -1253,6 +1257,8 @@ def _generate_ground_pairs_wp(
 ):
     tid = wp.tid()
     if tid != 0:
+        return
+    if consider_rigid_rigid != 0 and num_pairs[0] > 0:
         return
     num_primitive_pairs[0] = 0
     num_ball_ball_pairs[0] = 0
@@ -3178,6 +3184,7 @@ class RigidManager:
         self.pgs_lambda = wp.zeros(self.MAX_CONSTRAINTS, dtype=float)
         # For friction rows, parent normal row index; -1 otherwise.
         self.pgs_parent_row = wp.zeros(self.MAX_CONSTRAINTS, dtype=int)
+        self._zero_pair_count = wp.zeros(1, dtype=int)
         if self.pgs_solver == "islands":
             self.pgs_island_parent = wp.zeros(self.MAX_NODES, dtype=int)
             self.pgs_island_rank = wp.zeros(self.MAX_NODES, dtype=int)
@@ -3406,10 +3413,16 @@ class RigidManager:
         elif self.use_pd == 2:
             self.apply_joint_pd_torque_kernel(dt)
 
-        if self.considerRigidRigidContact and num_pairs > 0:
+        if self.considerRigidRigidContact:
+            # The classifier reads the device-side count and resets its output
+            # counters even when the BVH produced zero pairs.
             self.classify_collision_pairs_kernel(collision_pairs_field, num_pairs)
-        elif self.numRigidGroundContact > 0:
-            self._generate_ground_pairs_direct_kernel()
+        if self.numRigidGroundContact > 0:
+            # Generate ground pairs directly only when no BVH pairs were
+            # classified, or when rigid-rigid broadphase is disabled.
+            self._generate_ground_pairs_direct_kernel(
+                num_pairs, int(self.considerRigidRigidContact)
+            )
 
         maybe_rr = self.considerRigidRigidContact
         maybe_ground = self.numRigidGroundContact > 0
@@ -5014,14 +5027,14 @@ class RigidManager:
             ],
         )
 
-    def classify_collision_pairs_kernel(self, pairs, num_pairs: int):
+    def classify_collision_pairs_kernel(self, pairs, num_pairs):
         """Classify collision pairs into typed buffers (Warp kernel)."""
         wp.launch(
             _classify_collision_pairs_wp,
             dim=1,
             inputs=[
                 pairs,
-                int(num_pairs),
+                num_pairs,
                 int(self.numRigids),
                 int(self.MAX_COLLISION_PAIRS),
                 int(self.MAX_GROUND_PAIRS),
@@ -5280,12 +5293,16 @@ class RigidManager:
             self.updateMeshCoords()
             self._sh_mesh_needs_rebuild = True
 
-    def _generate_ground_pairs_direct_kernel(self):
+    def _generate_ground_pairs_direct_kernel(self, num_pairs=None, consider_rigid_rigid=0):
         """Generate ground-rigid contact pairs directly without BVH broadphase."""
+        if num_pairs is None:
+            num_pairs = self._zero_pair_count
         wp.launch(
             _generate_ground_pairs_wp,
             dim=1,
             inputs=[
+                num_pairs,
+                int(consider_rigid_rigid),
                 int(self.numRigids),
                 int(self.numAnalytical),
                 int(self.MAX_GROUND_PAIRS),
