@@ -17,7 +17,7 @@ import warp as wp
 @wp.kernel
 def _scan_bvh_pairs_stamp_kernel(
     pairs: wp.array(dtype=wp.vec2i),
-    num_pairs: int,
+    num_pairs: wp.array(dtype=int),
     stamp: int,
     max_domains: int,
     domain_type: wp.array(dtype=int),
@@ -27,7 +27,7 @@ def _scan_bvh_pairs_stamp_kernel(
     spring_type: int,
 ):
     has_fem_spring_bvh_pair[0] = 0
-    for p in range(num_pairs):
+    for p in range(num_pairs[0]):
         a = pairs[p][0]
         b = pairs[p][1]
         if 0 <= a < max_domains:
@@ -45,7 +45,7 @@ def _scan_bvh_pairs_stamp_kernel(
 @wp.kernel
 def _filter_out_rigid_rigid_pairs_kernel(
     collision_pairs: wp.array(dtype=wp.vec2i),
-    num_pairs: int,
+    num_pairs: wp.array(dtype=int),
     max_domains: int,
     domain_type: wp.array(dtype=int),
     rigid_type: int,
@@ -54,7 +54,7 @@ def _filter_out_rigid_rigid_pairs_kernel(
 ):
     """Copy BVH pairs excluding rigid-rigid pairs when disabled by config."""
     out_count[0] = 0
-    for p in range(num_pairs):
+    for p in range(num_pairs[0]):
         a = collision_pairs[p][0]
         b = collision_pairs[p][1]
         keep = True
@@ -137,6 +137,7 @@ class ExplicitLoop(MixedContact):
         self.aabb = wp.zeros((self._max_domains, 2), dtype=wp.vec2)
         self._bvh_pairs_work = wp.zeros(tree_size, dtype=wp.vec2i)
         self._bvh_pairs_work_count = wp.zeros(1, dtype=int)
+        self._zero_bvh_pair_count = wp.zeros(1, dtype=int)
         self._bvh_domain_stamp = wp.zeros(self._max_domains, dtype=int)
         self._bvh_active_stamp = wp.zeros(1, dtype=int)
         _assign_scalar(self._bvh_active_stamp, 1)
@@ -458,7 +459,7 @@ class ExplicitLoop(MixedContact):
             dim=1,
             inputs=[
                 pairs,
-                int(num_pairs),
+                num_pairs,
                 int(stamp),
                 int(self._max_domains),
                 self._domain_type,
@@ -484,7 +485,7 @@ class ExplicitLoop(MixedContact):
             dim=1,
             inputs=[
                 self.bvh.collision_pairs,
-                int(num_pairs),
+                num_pairs,
                 int(self._max_domains),
                 self._domain_type,
                 int(DomainType.RIGID),
@@ -494,11 +495,11 @@ class ExplicitLoop(MixedContact):
         )
 
     def advance(self):
-        num_bvh_pairs = 0
         pairs_field = self._bvh_pairs_work
-        num_pairs_work = 0
+        num_pairs_work = self._zero_bvh_pair_count
+
         if not self.skip_bvh and self.bvh is not None:
-            # Update BVH: full rebuild every 100 steps, refit otherwise
+            # Update BVH: full rebuild every 100 steps, refit otherwise.
             if self._counter_py % 100 == 0:
                 self.bvh.reset()
                 self.bvh.update_objects(self.aabb, 1)
@@ -513,70 +514,58 @@ class ExplicitLoop(MixedContact):
                 self.bvh.detectInnerCollision_per_env()
             else:
                 self.bvh.detectInnerCollision()
-            num_bvh_pairs = int(self.bvh.pair_count.numpy()[0])
-            num_pairs_work = num_bvh_pairs
+
             pairs_field = self.bvh.collision_pairs
-            if (not self._consider_rigid_rigid_contact) and num_bvh_pairs > 0:
-                self._filter_out_rigid_rigid_pairs(num_bvh_pairs)
-                num_pairs_work = int(self._bvh_pairs_work_count.numpy()[0])
+            num_pairs_work = self.bvh.pair_count
+            if not self._consider_rigid_rigid_contact:
+                # Keep the filtered count on device; downstream kernels consume
+                # it directly instead of synchronizing the scalar to the host.
+                self._filter_out_rigid_rigid_pairs(num_pairs_work)
                 pairs_field = self._bvh_pairs_work
+                num_pairs_work = self._bvh_pairs_work_count
 
             if self._needs_bvh_domain_mask:
-                if num_pairs_work > 0:
-                    # Keep this counter independent from _counter_py: reset()
-                    # rewinds the simulation counter but does not clear the stamp array.
-                    next_stamp = self._next_bvh_domain_stamp()
-                    _assign_scalar(self._bvh_active_stamp, next_stamp)
-                    _assign_scalar(self._use_bvh_domain_mask, 1)
-                    self._scan_bvh_pairs_stamp(pairs_field, num_pairs_work, next_stamp)
-                else:
-                    _assign_scalar(self._use_bvh_domain_mask, 1)
-                    _assign_scalar(self._has_fem_spring_bvh_pair, 0)
+                # Keep this counter independent from _counter_py: reset()
+                # rewinds the simulation counter but does not clear the stamp array.
+                next_stamp = self._next_bvh_domain_stamp()
+                _assign_scalar(self._bvh_active_stamp, next_stamp)
+                _assign_scalar(self._use_bvh_domain_mask, 1)
+                self._scan_bvh_pairs_stamp(pairs_field, num_pairs_work, next_stamp)
             else:
                 _assign_scalar(self._use_bvh_domain_mask, 0)
-                _assign_scalar(self._has_fem_spring_bvh_pair, 1 if num_pairs_work > 0 else 0)
-        else:
-            # BVH inactive: GPU fields already set once per frame in
-            # advanceWithTime(); skip per-substep writes.
-            pass
 
-        # ── Batched contact kernels (see mixedcontact.py) ──
+        # Batched contact and rigid kernels consume the device-side pair count.
         self.run_batched_contacts(pairs_field, num_pairs_work)
 
-        # Calculate FEM domains
+        # Calculate FEM domains.
         if self.femSpringManager is not None:
             self.femSpringManager.substep(self.dt, self.damping)
 
-        # Rigid body substep
+        # Rigid body substep.
         if self.rigidManager is not None:
             N = max(1, self.rigidManager.stableTime // self.dt)
             self.rigid_update_times += 1
             if self.rigid_update_times % N == 0:
                 if hasattr(self, "_fem_contact_aabb_lb") and hasattr(self, "_bc_rigid_mesh_node_count"):
-                    self._compute_fem_contact_aabb(int(_host_np(self._bc_rigid_mesh_node_count)[0]))
-                    self.rigidManager.substep(
-                        pairs_field,
-                        num_pairs_work,
-                        N * self.dt,
-                        self.damping,
-                        fem_lb=self._fem_contact_aabb_lb,
-                        fem_ub=self._fem_contact_aabb_ub,
-                        fem_margin=getattr(self, "_rigid_sh_contact_margin", 0.0),
-                    )
+                    num_mesh_nodes = int(self._bc_rigid_mesh_node_count.numpy()[0])
+                    if num_mesh_nodes > 0:
+                        self._compute_fem_contact_aabb(num_mesh_nodes)
+                        self.rigidManager.substep(
+                            pairs_field,
+                            num_pairs_work,
+                            self.dt,
+                            self.damping,
+                            fem_lb=self._fem_contact_aabb_lb,
+                            fem_ub=self._fem_contact_aabb_ub,
+                            fem_margin=self._sh_contact_margin,
+                        )
+                    else:
+                        self.rigidManager.substep(pairs_field, num_pairs_work, self.dt, self.damping)
                 else:
-                    self.rigidManager.substep(pairs_field, num_pairs_work, N * self.dt, self.damping)
-
-            N2 = max(1, self.rigidManager.get_sh_update_interval() // self.dt)
-            if self.rigid_update_times % N2 == 0:
-                self._rigid_contact_prefilter_dirty = True
-                self._rigid_mesh_aabb_dirty = True
-
-                if hasattr(self, "_bc_rigid_skip_epoch"):
-                    self._bc_rigid_skip_epoch.fill_(-1)
+                    self.rigidManager.substep(pairs_field, num_pairs_work, self.dt, self.damping)
 
         self._counter_py += 1
 
-    # ===================== Fixed-frame stepping helpers =====================
     def advanceWithTime(
         self,
         frame_dt: float = 1.0 / 60.0,
