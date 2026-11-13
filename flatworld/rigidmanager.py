@@ -200,6 +200,143 @@ def _solve_pgs_kernel(
                         done = 1
 
 
+@wp.func
+def _pgs_find_root(body: int, parent: wp.array(dtype=int)) -> int:
+    root = body
+    while parent[root] != root:
+        root = parent[root]
+    return root
+
+
+@wp.kernel
+def _build_pgs_islands_kernel(
+    numConstraints: wp.array(dtype=int),
+    max_constraints: int,
+    max_bodies: int,
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    island_parent: wp.array(dtype=int),
+    island_rank: wp.array(dtype=int),
+    island_offsets: wp.array(dtype=int),
+    island_counts: wp.array(dtype=int),
+    island_cursor: wp.array(dtype=int),
+    island_rows: wp.array(dtype=int),
+):
+    """Build deterministic per-body contact-island CSR in one ordered pass."""
+    if wp.tid() != 0:
+        return
+
+    for body in range(max_bodies):
+        island_parent[body] = body
+        island_rank[body] = 0
+        island_offsets[body] = 0
+        island_counts[body] = 0
+        island_cursor[body] = 0
+
+    n_constraints = int(wp.min(numConstraints[0], max_constraints))
+
+    # Union bodies coupled by each constraint. Ground rows belong to aid's
+    # island; rows with aid < 0 are no-ops in _solve_pgs_single.
+    for row in range(n_constraints):
+        bodypair = pgs_bodypair[row]
+        aid = bodypair[0]
+        bid = bodypair[1]
+        if aid >= 0 and aid < max_bodies and bid >= 0 and bid < max_bodies:
+            root_a = _pgs_find_root(aid, island_parent)
+            root_b = _pgs_find_root(bid, island_parent)
+            if root_a != root_b:
+                rank_a = island_rank[root_a]
+                rank_b = island_rank[root_b]
+                if rank_a < rank_b:
+                    island_parent[root_a] = root_b
+                elif rank_a > rank_b:
+                    island_parent[root_b] = root_a
+                else:
+                    island_parent[root_b] = root_a
+                    island_rank[root_a] = rank_a + 1
+
+    # Compress roots before counting and packing rows.
+    for body in range(max_bodies):
+        island_parent[body] = _pgs_find_root(body, island_parent)
+
+    for row in range(n_constraints):
+        aid = pgs_bodypair[row][0]
+        if aid >= 0 and aid < max_bodies:
+            root = island_parent[aid]
+            island_counts[root] = island_counts[root] + 1
+
+    running_offset = 0
+    for body in range(max_bodies):
+        if island_parent[body] == body and island_counts[body] > 0:
+            island_offsets[body] = running_offset
+            island_cursor[body] = running_offset
+            running_offset = running_offset + island_counts[body]
+
+    # Preserve original row order within each island.
+    for row in range(n_constraints):
+        aid = pgs_bodypair[row][0]
+        if aid >= 0 and aid < max_bodies:
+            root = island_parent[aid]
+            slot = island_cursor[root]
+            island_rows[slot] = row
+            island_cursor[root] = slot + 1
+
+
+@wp.kernel
+def _solve_pgs_islands_kernel(
+    pgs_iters: int,
+    pgs_tol: float,
+    max_bodies: int,
+    island_parent: wp.array(dtype=int),
+    island_offsets: wp.array(dtype=int),
+    island_counts: wp.array(dtype=int),
+    island_rows: wp.array(dtype=int),
+    V: wp.array(dtype=wp.vec2),
+    RotV: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    inertia: wp.array(dtype=float),
+    pgs_bodypair: wp.array(dtype=wp.vec2i),
+    pgs_Jac_a: wp.array(dtype=wp.vec3),
+    pgs_Jac_b: wp.array(dtype=wp.vec3),
+    pgs_rhs: wp.array(dtype=float),
+    pgs_limits: wp.array(dtype=wp.vec2),
+    pgs_lambda: wp.array(dtype=float),
+    pgs_parent_row: wp.array(dtype=int),
+):
+    """Run symmetric PGS independently per connected contact island."""
+    island = wp.tid()
+    if island >= max_bodies:
+        return
+    if island_parent[island] != island:
+        return
+    row_count = island_counts[island]
+    if row_count <= 0:
+        return
+
+    row_offset = island_offsets[island]
+    done = int(0)
+    for _iter in range(pgs_iters):
+        if done == 0:
+            max_d = float(0.0)
+            for j in range(row_count):
+                row = island_rows[row_offset + j]
+                d = _solve_pgs_single(
+                    row, V, RotV, mass, inertia, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+                    pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+                )
+                if d > max_d:
+                    max_d = d
+            for j in range(row_count):
+                row = island_rows[row_offset + row_count - 1 - j]
+                d = _solve_pgs_single(
+                    row, V, RotV, mass, inertia, pgs_bodypair, pgs_Jac_a, pgs_Jac_b,
+                    pgs_rhs, pgs_limits, pgs_lambda, pgs_parent_row,
+                )
+                if d > max_d:
+                    max_d = d
+            if _iter >= 15 and pgs_tol > 0.0 and max_d < pgs_tol:
+                done = 1
+
+
 @wp.kernel
 def _assemble_joint_constraints_wp(
     dt: float,
@@ -2483,7 +2620,7 @@ def _update_mesh_coords_wp(
 class RigidManager:
     def __init__(self, d, domains, joints, bvh=None, skip_spatial_hash=False, considerRigidRigidContact=True, use_pd=0, pgs_iterations=50,
                  max_nodes=None, max_joints=None, max_contacts=None, max_ground_contacts=None,
-                 max_ground_pairs=None, max_collision_pairs=None, max_envs_alloc=None):
+                 max_ground_pairs=None, max_collision_pairs=None, max_envs_alloc=None, pgs_solver="serial"):
         """Initialize RigidManager and allocate Warp arrays for rigids and state.
 
         Args:
@@ -2500,6 +2637,9 @@ class RigidManager:
 
         assert d == 2, "RigidManager is 2D-only"
 
+        if pgs_solver not in ("serial", "islands"):
+            raise ValueError("pgs_solver must be either 'serial' or 'islands'")
+        self.pgs_solver = pgs_solver
         self.skip_spatial_hash = skip_spatial_hash
         self.use_pd = use_pd
         self.considerRigidRigidContact = considerRigidRigidContact
@@ -3038,6 +3178,13 @@ class RigidManager:
         self.pgs_lambda = wp.zeros(self.MAX_CONSTRAINTS, dtype=float)
         # For friction rows, parent normal row index; -1 otherwise.
         self.pgs_parent_row = wp.zeros(self.MAX_CONSTRAINTS, dtype=int)
+        if self.pgs_solver == "islands":
+            self.pgs_island_parent = wp.zeros(self.MAX_NODES, dtype=int)
+            self.pgs_island_rank = wp.zeros(self.MAX_NODES, dtype=int)
+            self.pgs_island_offsets = wp.zeros(self.MAX_NODES, dtype=int)
+            self.pgs_island_counts = wp.zeros(self.MAX_NODES, dtype=int)
+            self.pgs_island_cursor = wp.zeros(self.MAX_NODES, dtype=int)
+            self.pgs_island_rows = wp.zeros(self.MAX_CONSTRAINTS, dtype=int)
 
         # Adjust rigid poses to satisfy joint limits
         # self.adjust_rigid_poses_for_joint_limits()
@@ -4784,7 +4931,50 @@ class RigidManager:
         )
 
     def solve_pgs(self, pgs_iters: int):
-        """Serial PGS via dim=1 Warp kernel (forward + backward sweeps)."""
+        """Solve constraints with serial PGS or independent contact islands."""
+        if self.pgs_solver == "islands":
+            wp.launch(
+                _build_pgs_islands_kernel,
+                dim=1,
+                inputs=[
+                    self.numConstraints,
+                    int(self.MAX_CONSTRAINTS),
+                    int(self.MAX_NODES),
+                    self.pgs_bodypair,
+                    self.pgs_island_parent,
+                    self.pgs_island_rank,
+                    self.pgs_island_offsets,
+                    self.pgs_island_counts,
+                    self.pgs_island_cursor,
+                    self.pgs_island_rows,
+                ],
+            )
+            wp.launch(
+                _solve_pgs_islands_kernel,
+                dim=int(self.MAX_NODES),
+                inputs=[
+                    int(pgs_iters),
+                    float(self.pgs_tol),
+                    int(self.MAX_NODES),
+                    self.pgs_island_parent,
+                    self.pgs_island_offsets,
+                    self.pgs_island_counts,
+                    self.pgs_island_rows,
+                    self.V,
+                    self.RotV,
+                    self.mass,
+                    self.inertia,
+                    self.pgs_bodypair,
+                    self.pgs_Jac_a,
+                    self.pgs_Jac_b,
+                    self.pgs_rhs,
+                    self.pgs_limits,
+                    self.pgs_lambda,
+                    self.pgs_parent_row,
+                ],
+            )
+            return
+
         wp.launch(
             _solve_pgs_kernel,
             dim=1,
