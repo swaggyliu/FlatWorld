@@ -357,6 +357,10 @@ def _integrate_nodes_kernel(
     U[i] = U[i] + du
     coords[i] = coords[i] + du
 
+    # Fext is consumed only by this node's integration above. Clear it here
+    # to avoid a separate device kernel launch after integration.
+    Fext[i] = wp.vec2(0.0, 0.0)
+
 
 @wp.kernel
 def _update_bbox_kernel(
@@ -1007,12 +1011,6 @@ class FemSpringManager:
 
         self.updateBBox()
 
-        if n_nodes > 0:
-            wp.launch(
-                _clear_fext_kernel,
-                dim=n_nodes,
-                inputs=[self.totalNodes, self.Fext],
-            )
 
     def updateBBox(self):
         """Compute FEM/spring domain bboxes into ``self.aabb``."""
