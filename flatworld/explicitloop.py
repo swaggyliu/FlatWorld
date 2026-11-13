@@ -507,7 +507,10 @@ class ExplicitLoop(MixedContact):
 
             if self._needs_bvh_domain_mask:
                 if num_pairs_work > 0:
-                    next_stamp = int(self._bvh_active_stamp.numpy()[0]) + 1
+                    # The stamp only needs to be unique per substep. Derive it
+                    # from the Python-side counter instead of reading a one-element
+                    # device array back to the host (which synchronizes the GPU).
+                    next_stamp = self._counter_py + 2
                     if next_stamp > 2000000000:
                         self._bvh_domain_stamp.zero_()
                         next_stamp = 1
