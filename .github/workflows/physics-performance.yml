@@ -1,0 +1,55 @@
+name: Physics performance baseline
+
+on:
+  push:
+    branches:
+      - "perf/**"
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run complete 2D regression suite
+        env:
+          CI: "true"
+          HEADLESS: "1"
+          FLATWORLD_DEVICE: "cpu"
+        run: |
+          python -m pytest test2D -q --tb=short --timeout=180
+
+      - name: Benchmark 10k spring-mass scenario
+        env:
+          CI: "true"
+          HEADLESS: "1"
+          FLATWORLD_DEVICE: "cpu"
+        run: |
+          mkdir -p benchmark-results
+          python benchmarks/benchmark_2d.py --warmup 1 --repeat 5 --steps 120 | tee benchmark-results/physics-performance.txt
+
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatworld-physics-performance
+          path: benchmark-results/physics-performance.txt
+          if-no-files-found: ignore
