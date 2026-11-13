@@ -4920,8 +4920,6 @@ class RigidManager:
             _reset_contact_caches_wp,
             dim=1,
             inputs=[
-                num_pairs,
-                int(consider_rigid_rigid),
                 int(self.numRigids),
                 int(self.numAnalytical),
                 int(max(self.num_envs, 1)),
