@@ -22,7 +22,7 @@ from flatworld import (
 from test_utils import create_gui_if_available, init_sim
 
 
-def test_2Dspring(headless=False):
+def test_2Dspring(headless=False, max_steps=None):
     init_sim()
 
     numEl = 100
@@ -55,20 +55,26 @@ def test_2Dspring(headless=False):
 
     gui = create_gui_if_available("SPRING2D", res=(720, 720)) if not headless else None
     t = 0.0
-    while (gui is None or gui.running) and t < 0.1:
-        # advance one visual frame using adaptive substeps
+    steps = 0
+    while (gui is None or gui.running) and (
+        steps < max_steps if max_steps is not None else t < 0.1
+    ):
+        # Advance one visual frame using adaptive substeps.
         looper.advanceWithTime(frame_dt)
         t += frame_dt
+        steps += 1
 
-        # render
-        pos = looper.femSpringManager.coords.numpy()[: looper.femSpringManager.totalNodes.numpy()[0]]
-        e2n = looper.femSpringManager.connectivity.numpy()[: looper.femSpringManager.totalElements.numpy()[0]]
-        a, b = pos[e2n[:, 0]], pos[e2n[:, 1]]
+        # Only read simulation state for rendering. In headless mode, defer
+        # device-to-host copies until the simulation has finished.
         if gui is not None:
-            gui.circles(pos, radius=2, color=0xFFAA33)
+            pos_frame = looper.femSpringManager.coords.numpy()[: looper.femSpringManager.totalNodes.numpy()[0]]
+            e2n = looper.femSpringManager.connectivity.numpy()[: looper.femSpringManager.totalElements.numpy()[0]]
+            a, b = pos_frame[e2n[:, 0]], pos_frame[e2n[:, 1]]
+            gui.circles(pos_frame, radius=2, color=0xFFAA33)
             gui.lines(a, b, color=colors[0])
             gui.show()
 
+    pos = looper.femSpringManager.coords.numpy()[: looper.femSpringManager.totalNodes.numpy()[0]]
     min = np.min(pos, axis=0)
     max = np.max(pos, axis=0)
     print("Final position bounds:", min, max)
@@ -81,5 +87,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--headless", action="store_true", help="Run without GUI (auto-detected if no display available)"
     )
+    parser.add_argument(
+        "--steps", type=int, default=None, help="Run a fixed number of visual frames (benchmark mode)"
+    )
     args = parser.parse_args()
-    test_2Dspring(headless=args.headless)
+    if args.steps is not None and args.steps < 1:
+        parser.error("--steps must be >= 1")
+    test_2Dspring(headless=args.headless, max_steps=args.steps)
