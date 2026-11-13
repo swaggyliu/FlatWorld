@@ -498,7 +498,7 @@ class ExplicitLoop(MixedContact):
         pairs_field = self._bvh_pairs_work
         num_pairs_work = self._zero_bvh_pair_count
 
-        if not self.skip_bvh and self.bvh is not None:
+        if self.bvh is not None:
             # Update BVH: full rebuild every 100 steps, refit otherwise.
             if self._counter_py % 100 == 0:
                 self.bvh.reset()
@@ -557,7 +557,7 @@ class ExplicitLoop(MixedContact):
                             self.damping,
                             fem_lb=self._fem_contact_aabb_lb,
                             fem_ub=self._fem_contact_aabb_ub,
-                            fem_margin=self._sh_contact_margin,
+                            fem_margin=getattr(self, "_rigid_sh_contact_margin", 0.0),
                         )
                     else:
                         self.rigidManager.substep(pairs_field, num_pairs_work, self.dt, self.damping)
