@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import sys
+import time
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -55,6 +56,7 @@ def test_2Dspring(headless=False, max_steps=None, frame_dt=1.0 / 60.0):
     gui = create_gui_if_available("SPRING2D", res=(720, 720)) if not headless else None
     t = 0.0
     steps = 0
+    simulation_start = time.perf_counter()
     while (gui is None or gui.running) and (
         steps < max_steps if max_steps is not None else t < 0.1
     ):
@@ -74,6 +76,9 @@ def test_2Dspring(headless=False, max_steps=None, frame_dt=1.0 / 60.0):
             gui.show()
 
     pos = looper.femSpringManager.coords.numpy()[: looper.femSpringManager.totalNodes.numpy()[0]]
+    simulation_elapsed = time.perf_counter() - simulation_start
+    if max_steps is not None:
+        print(f"FLATWORLD_SIMULATION_SECONDS={simulation_elapsed:.9f}")
     min = np.min(pos, axis=0)
     max = np.max(pos, axis=0)
     print("Final position bounds:", min, max)
