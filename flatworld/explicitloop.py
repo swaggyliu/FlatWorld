@@ -179,7 +179,11 @@ class ExplicitLoop(MixedContact):
         self.useAdapative = useAdapativeDT
         self.damping = damping
         self.contacts = []
-        self._counter_py = 0  # Python-side counter (avoids scalar sync per substep)
+        self._counter_py = 0  # Python-side simulation counter (resettable)
+        # BVH domain stamps must remain unique across simulation resets because
+        # _bvh_domain_stamp is not cleared by reset(). Keep a separate monotonic
+        # counter so resetting the simulation clock cannot revive stale entries.
+        self._bvh_stamp_counter_py = 1
 
         # Contact subcycling: auto-compute from stable-time ratio after contacts are built.
         self._rigid_contact_subcycle = 1
@@ -462,6 +466,15 @@ class ExplicitLoop(MixedContact):
             ],
         )
 
+    def _next_bvh_domain_stamp(self):
+        """Return a stamp that cannot alias stale BVH entries after reset()."""
+        next_stamp = self._bvh_stamp_counter_py + 1
+        if next_stamp > 2000000000:
+            self._bvh_domain_stamp.zero_()
+            next_stamp = 1
+        self._bvh_stamp_counter_py = next_stamp
+        return next_stamp
+
     def _filter_out_rigid_rigid_pairs(self, num_pairs):
         wp.launch(
             _filter_out_rigid_rigid_pairs_kernel,
@@ -507,13 +520,9 @@ class ExplicitLoop(MixedContact):
 
             if self._needs_bvh_domain_mask:
                 if num_pairs_work > 0:
-                    # The stamp only needs to be unique per substep. Derive it
-                    # from the Python-side counter instead of reading a one-element
-                    # device array back to the host (which synchronizes the GPU).
-                    next_stamp = self._counter_py + 2
-                    if next_stamp > 2000000000:
-                        self._bvh_domain_stamp.zero_()
-                        next_stamp = 1
+                    # Keep this counter independent from _counter_py: reset()
+                    # rewinds the simulation counter but does not clear the stamp array.
+                    next_stamp = self._next_bvh_domain_stamp()
                     _assign_scalar(self._bvh_active_stamp, next_stamp)
                     _assign_scalar(self._use_bvh_domain_mask, 1)
                     self._scan_bvh_pairs_stamp(pairs_field, num_pairs_work, next_stamp)
