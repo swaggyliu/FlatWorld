@@ -37,6 +37,23 @@ def env_joint_pairs(env) -> np.ndarray:
     return np.asarray(rows, dtype=np.int32)
 
 
+def _start_contact_series(env):
+    if not bool(getattr(getattr(env, "rm", None), "record_contact_transitions", False)):
+        return None
+    return {key: [value] for key, value in env.solver_contact_samples().items()}
+
+
+def _append_contact_series(series, env):
+    if series is None:
+        return
+    for key, value in env.solver_contact_samples().items():
+        series[key].append(value)
+
+
+def _contact_series_payload(series):
+    return {} if series is None else {"contact_" + k: np.stack(v) for k, v in series.items()}
+
+
 def apply_barriers(a: np.ndarray, cfg: Config, ee_pos: np.ndarray,
                    ee_r: float = None, y_hi: float = None) -> np.ndarray:
     """Soft workspace walls shared by ALL collection modes.
@@ -338,6 +355,7 @@ def run_torque_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config)
     masks = [obs["contact_mask"]]
     sums = [obs["tactile_summary"]]
     pair0, ground0 = env.refresh_solver_contacts()
+    contact_series = _start_contact_series(env)
     pairs = [pair0]
     grounds = [ground0]
     actions = []
@@ -354,6 +372,7 @@ def run_torque_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config)
         masks.append(obs["contact_mask"])
         sums.append(obs["tactile_summary"])
         p, g = env.solver_contacts()
+        _append_contact_series(contact_series, env)
         pairs.append(p)
         grounds.append(g)
     return {
@@ -366,6 +385,7 @@ def run_torque_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config)
         "tactile_summary": np.stack(sums),
         "pair_contact": np.stack(pairs),
         "ground_contact": np.stack(grounds),
+        **_contact_series_payload(contact_series),
         "rel_type": env_rel_type(env),
         "joint_pairs": env_joint_pairs(env),
     }
@@ -387,6 +407,7 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
     masks = [obs["contact_mask"]]
     sums = [obs["tactile_summary"]]
     pair0, ground0 = env.refresh_solver_contacts()
+    contact_series = _start_contact_series(env)
     pairs = [pair0]
     grounds = [ground0]
     actions = []
@@ -447,6 +468,7 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
             masks.append(obs["contact_mask"])
             sums.append(obs["tactile_summary"])
             p, g = env.solver_contacts()
+            _append_contact_series(contact_series, env)
             pairs.append(p)
             grounds.append(g)
             continue
@@ -504,6 +526,7 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         masks.append(obs["contact_mask"])
         sums.append(obs["tactile_summary"])
         p, g = env.solver_contacts()
+        _append_contact_series(contact_series, env)
         pairs.append(p)
         grounds.append(g)
 
@@ -516,7 +539,8 @@ def run_rollout(env: PushSceneEnv, rng: np.random.Generator, cfg: Config) -> dic
         "contact_mask": np.stack(masks),                  # (T+1, K)
         "tactile_summary": np.stack(sums),                # (T+1, 4)
         "pair_contact": np.stack(pairs),                  # (T+1, N, N) solver
-        "ground_contact": np.stack(grounds),              # (T+1, N) solver
+        "ground_contact": np.stack(grounds),
+        **_contact_series_payload(contact_series),              # (T+1, N) solver
         "rel_type": env_rel_type(env),                    # (N, N) 0=contact 1=rev 2=weld 3=pris 4=none
         "joint_pairs": env_joint_pairs(env),              # (M, 3) (i, j, type)
     }
@@ -546,6 +570,8 @@ def main():
     parser.add_argument("--out", type=str, default=None, help="output directory")
     parser.add_argument("--start-index", type=int, default=0,
                         help="first rollout index (resume after interruption)")
+    parser.add_argument("--record-contact-transitions", action="store_true",
+                        help="record pre-PGS contact features and solved impulses")
     parser.add_argument("--contact-rich", action="store_true",
                         help="Push-T: raise table_mu + mix spin for denser "
                              "contact/rotation (eval scene stays default)")
@@ -590,6 +616,8 @@ def main():
 
     rng = np.random.default_rng(cfg.collect.seed)
     env = make_scene_env(cfg)
+    if args.record_contact_transitions and hasattr(env, "rm"):
+        env.rm.record_contact_transitions = True
     print(f"task={args.task}  n_obj={env.n_obj}  kinds={env.obj_types}  "
           f"rollouts={cfg.collect.num_rollouts}  out={out_dir}")
 
