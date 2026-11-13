@@ -49,7 +49,8 @@ jobs:
         run: |
           mkdir -p benchmark-results
           set -o pipefail
-          python benchmarks/benchmark_2d.py --warmup 1 --repeat 5 --steps 120 --frame-dt 0.0008333333333333334 2>&1 | tee benchmark-results/physics-performance.txt
+          python benchmarks/benchmark_2d.py --warmup 2 --repeat 10 --steps 120 --frame-dt 0.0008333333333333334 2>&1 | tee benchmark-results/physics-performance.txt
+          grep -q '^FLATWORLD_BENCHMARK=' benchmark-results/physics-performance.txt
 
       - name: Upload benchmark result
         if: always()

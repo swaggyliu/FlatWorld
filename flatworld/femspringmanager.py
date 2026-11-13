@@ -939,9 +939,12 @@ class FemSpringManager:
         self.femStep(float(dt), float(damping))
 
     def femStep(self, dt: float, damping: float):
-        n_fem = int(self.totalFEMElements.numpy()[0])
-        n_tot = int(self.totalElements.numpy()[0])
-        n_nodes = int(self.totalNodes.numpy()[0])
+        # Host-side counters are maintained by addFemDomain/addSpringDomain and
+        # mirror the device scalars. Reading these scalars with .numpy() on every
+        # substep forces a device-to-host synchronization before each kernel launch.
+        n_fem = self._n_fem_elems
+        n_tot = self._n_elems
+        n_nodes = self._n_nodes
 
         if n_fem > 0:
             wp.launch(
