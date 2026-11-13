@@ -52,6 +52,16 @@ jobs:
           python benchmarks/benchmark_2d.py --warmup 2 --repeat 10 --steps 120 --frame-dt 0.0008333333333333334 2>&1 | tee benchmark-results/physics-performance.txt
           grep -q '^FLATWORLD_BENCHMARK=' benchmark-results/physics-performance.txt
 
+      - name: Benchmark serial versus contact-island PGS
+        env:
+          CI: "true"
+          HEADLESS: "1"
+          FLATWORLD_DEVICE: "cpu"
+        run: |
+          set -o pipefail
+          python benchmarks/benchmark_pgs_islands.py --islands 256 --warmup 2 --repeat 10 2>&1 | tee -a benchmark-results/physics-performance.txt
+          grep -q '^FLATWORLD_PGS_BENCHMARK=' benchmark-results/physics-performance.txt
+
       - name: Upload benchmark result
         if: always()
         uses: actions/upload-artifact@v4
