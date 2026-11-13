@@ -82,6 +82,13 @@ def test_2Dspring(headless=False, max_steps=None, frame_dt=1.0 / 60.0):
         assert np.allclose(max, [0.85, 0.072], atol=1e-2), "Max position out of expected range."
     else:
         assert np.all(np.isfinite(pos)), "Simulation produced non-finite positions."
+        # Uniform gravity should translate the undeformed spring lattice by
+        # -0.5 * g * T^2. The small benchmark dt makes this a useful physical
+        # sanity check in addition to the finite-state guard.
+        simulated_time = max_steps * frame_dt
+        expected_shift = -50.0 * simulated_time * simulated_time
+        assert np.allclose(min, [0.25, 0.25 + expected_shift], atol=1e-2), "Benchmark minimum position drifted."
+        assert np.allclose(max, [0.85, 0.85 + expected_shift], atol=1e-2), "Benchmark maximum position drifted."
 
 
 if __name__ == "__main__":
