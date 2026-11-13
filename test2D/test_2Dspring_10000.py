@@ -22,7 +22,7 @@ from flatworld import (
 from test_utils import create_gui_if_available, init_sim
 
 
-def test_2Dspring(headless=False, max_steps=None):
+def test_2Dspring(headless=False, max_steps=None, frame_dt=1.0 / 60.0):
     init_sim()
 
     numEl = 100
@@ -49,7 +49,6 @@ def test_2Dspring(headless=False, max_steps=None):
 
     femdomains = [domain1]
 
-    frame_dt = 1.0 / 60.0
     looper = ExplicitLoop(0.0, femdomains, useAdapativeDT=True)
     colors = [0xFF0033, 0xFF00FF, 0xFFFF00]
 
@@ -93,7 +92,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--steps", type=int, default=None, help="Run a fixed number of visual frames (benchmark mode)"
     )
+    parser.add_argument(
+        "--frame-dt", type=float, default=1.0 / 60.0, help="Simulated time advanced per frame"
+    )
     args = parser.parse_args()
     if args.steps is not None and args.steps < 1:
         parser.error("--steps must be >= 1")
-    test_2Dspring(headless=args.headless, max_steps=args.steps)
+    if not np.isfinite(args.frame_dt) or args.frame_dt <= 0.0:
+        parser.error("--frame-dt must be a finite positive number")
+    test_2Dspring(headless=args.headless, max_steps=args.steps, frame_dt=args.frame_dt)
