@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--steps", type=int, default=120, help="Fixed simulation frames per sample")
     parser.add_argument(
-        "--frame-dt", type=float, default=1.0 / 600.0,
+        "--frame-dt", type=float, default=1.0 / 1200.0,
         help="Simulated time advanced per frame; use a small stable interval for long runs",
     )
     args = parser.parse_args()
