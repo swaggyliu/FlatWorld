@@ -81,6 +81,41 @@ def _as_float(v) -> float:
 
 
 
+@wp.kernel
+def _update_joint_motor_velocity_targets_kernel(
+    dt: float,
+    num_anchors: int,
+    joint_has_motor: wp.array(dtype=int),
+    joint_motor_target_mode: wp.array(dtype=int),
+    joint_control_target: wp.array(dtype=float),
+    joint_params: wp.array(dtype=vec6f),
+    joint_motor_target_vel: wp.array(dtype=float),
+):
+    j = wp.tid()
+    if j >= num_anchors:
+        return
+    if joint_has_motor[j] == 0:
+        return
+
+    mode = joint_motor_target_mode[j]
+    if mode == 2:
+        # Hold mode: retain the previously integrated velocity target.
+        return
+
+    cmd = joint_control_target[j]
+    if mode == 1:
+        vel_target = joint_motor_target_vel[j] + cmd * dt
+        vel_limit = joint_params[j][4]
+        if vel_limit > 0.0:
+            if vel_target > vel_limit:
+                vel_target = vel_limit
+            elif vel_target < -vel_limit:
+                vel_target = -vel_limit
+        joint_motor_target_vel[j] = vel_target
+    else:
+        joint_motor_target_vel[j] = cmd
+
+
 # ---------------------------------------------------------------------------
 # Serial PGS (dim=1) — critical path kept as real Warp kernels
 # ---------------------------------------------------------------------------
@@ -5327,24 +5362,22 @@ class RigidManager:
         )
 
     def update_joint_motor_velocity_targets_kernel(self, dt: float):
-        """Convert command targets to per-substep velocity targets for motor rows."""
+        """Convert command targets to per-substep velocity targets on device."""
         if self.numAnchors <= 0:
             return
-        for j in range(self.numAnchors):
-            if int(self.joint_has_motor.numpy()[j]) == 0:
-                continue
-            mode = int(self.joint_motor_target_mode.numpy()[j])
-            cmd = float(self.joint_control_target.numpy()[j])
-            vel_limit = float(self.joint_params.numpy()[j][4])
-            if mode == 2:
-                continue
-            if mode == 1:
-                vel_target = float(self.joint_motor_target_vel.numpy()[j]) + cmd * float(dt)
-                if vel_limit > 0.0:
-                    vel_target = max(min(vel_target, vel_limit), -vel_limit)
-                _patch_array(self.joint_motor_target_vel, j, vel_target)
-            else:
-                _patch_array(self.joint_motor_target_vel, j, cmd)
+        wp.launch(
+            _update_joint_motor_velocity_targets_kernel,
+            dim=self.numAnchors,
+            inputs=[
+                float(dt),
+                int(self.numAnchors),
+                self.joint_has_motor,
+                self.joint_motor_target_mode,
+                self.joint_control_target,
+                self.joint_params,
+                self.joint_motor_target_vel,
+            ],
+        )
 
     def apply_joint_pd_velocity_kernel(self, dt: float):
         """PD control with per-joint stiffness/damping — VELOCITY-MOTOR output.
