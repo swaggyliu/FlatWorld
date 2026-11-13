@@ -5298,6 +5298,8 @@ class RigidManager:
             _generate_ground_pairs_wp,
             dim=1,
             inputs=[
+                num_pairs,
+                int(consider_rigid_rigid),
                 int(self.numRigids),
                 int(self.numAnalytical),
                 int(self.MAX_GROUND_PAIRS),
