@@ -403,7 +403,7 @@ class ExplicitLoop(MixedContact):
         if self._use_rigid_spatial_hash and self.rigidManager is not None and self.rigidManager.spatialHash is not None:
             margin = getattr(self, "_rigid_sh_contact_margin", 0.0)
             if hasattr(self, "_fem_contact_aabb_lb") and hasattr(self, "_bc_rigid_mesh_node_count"):
-                self._compute_fem_contact_aabb(int(_host_np(self._bc_rigid_mesh_node_count)[0]))
+                self._compute_fem_contact_aabb(int(getattr(self, "_bc_rigid_mesh_node_count_host", 0)))
                 print("contact margin for spatial hash:", margin)
                 self.rigidManager.populate_spatial_hash_filtered(
                     fem_lb=self._fem_contact_aabb_lb,
@@ -547,7 +547,7 @@ class ExplicitLoop(MixedContact):
             self.rigid_update_times += 1
             if self.rigid_update_times % N == 0:
                 if hasattr(self, "_fem_contact_aabb_lb") and hasattr(self, "_bc_rigid_mesh_node_count"):
-                    self._compute_fem_contact_aabb(int(_host_np(self._bc_rigid_mesh_node_count)[0]))
+                    self._compute_fem_contact_aabb(int(getattr(self, "_bc_rigid_mesh_node_count_host", 0)))
                     self.rigidManager.substep(
                         pairs_field,
                         num_pairs_work,
@@ -690,6 +690,7 @@ class ExplicitLoop(MixedContact):
 
         if hasattr(self, "_fixed_rigid_mesh_tie_initialized"):
             _assign_scalar(self._fixed_rigid_mesh_tie_initialized, 0)
+            self._fixed_rigid_mesh_tie_initialized_host = False
 
         if hasattr(self, "_fixed_rigid_mesh_tie_found_count"):
             _assign_scalar(self._fixed_rigid_mesh_tie_found_count, 0)
