@@ -1667,7 +1667,7 @@ class MixedContact:
 
             flex_tie_initialized = (
                 hasattr(self, "_fixed_flexflex_tie_initialized")
-                and int(_host_np(self._fixed_flexflex_tie_initialized)[0]) == 1
+                and bool(getattr(self, "_fixed_flexflex_tie_initialized_host", False))
             )
 
             need_flex_hash_refresh = self._nontied_flex_item_count > 0 or (
@@ -1678,9 +1678,10 @@ class MixedContact:
                     self.femSpringManager.maybe_rebuild_fem_spatial_hash(self.dt)
 
             if self._tied_flex_item_count > 0:
-                if int(_host_np(self._fixed_flexflex_tie_initialized)[0]) == 0:
+                if not getattr(self, "_fixed_flexflex_tie_initialized_host", False):
                     self._launch_initialize_fem_fem_ties_once(self._batched_flex_count)
                     _assign_scalar(self._fixed_flexflex_tie_initialized, 1)
+                    self._fixed_flexflex_tie_initialized_host = True
                     print(
                         f"Initialized FEM-FEM ties: resolved "
                         f"{int(_host_np(self._fixed_flexflex_tie_found_count)[0])} / "
@@ -1716,7 +1717,7 @@ class MixedContact:
             if self._batched_rigid_mesh_count > 0:
                 tie_initialized = (
                     hasattr(self, "_fixed_rigid_mesh_tie_initialized")
-                    and int(_host_np(self._fixed_rigid_mesh_tie_initialized)[0]) == 1
+                    and bool(getattr(self, "_fixed_rigid_mesh_tie_initialized_host", False))
                 )
                 needs_mesh_element_aabb = self._nontied_rigid_mesh_item_count > 0 or (
                     self._tied_rigid_mesh_item_count > 0 and not tie_initialized
@@ -1726,9 +1727,10 @@ class MixedContact:
                     self._rigid_mesh_aabb_dirty = False
 
                 if self._tied_rigid_mesh_item_count > 0:
-                    if int(_host_np(self._fixed_rigid_mesh_tie_initialized)[0]) == 0:
+                    if not getattr(self, "_fixed_rigid_mesh_tie_initialized_host", False):
                         self._launch_initialize_fem_rigid_mesh_ties(self._batched_rigid_mesh_count)
                         _assign_scalar(self._fixed_rigid_mesh_tie_initialized, 1)
+                        self._fixed_rigid_mesh_tie_initialized_host = True
                     self._launch_apply_fem_rigid_mesh_ties(self._batched_rigid_mesh_count)
 
                 if self._nontied_rigid_mesh_item_count > 0:
@@ -1940,6 +1942,7 @@ class MixedContact:
                     self._bc_flex_tie_weights.fill_(0.0)
                     self._bc_flex_tie_gap.fill_(0.0)
                     self._fixed_flexflex_tie_initialized = wp.zeros(1, dtype=int)
+                    self._fixed_flexflex_tie_initialized_host = False
                     self._fixed_flexflex_tie_found_count = wp.zeros(1, dtype=int)
 
                 self._flex_pair_domain_ids = [
@@ -2088,6 +2091,7 @@ class MixedContact:
                     self._fixed_rigid_mesh_tie_enabled = wp.zeros(1, dtype=int)
                     _assign_scalar(self._fixed_rigid_mesh_tie_enabled, 1)
                     self._fixed_rigid_mesh_tie_initialized = wp.zeros(1, dtype=int)
+                    self._fixed_rigid_mesh_tie_initialized_host = False
                     self._fixed_rigid_mesh_tie_found_count = wp.zeros(1, dtype=int)
                     self._bc_rigid_skip_epoch = _wp_int(n_mesh)
                     self._bc_rigid_skip_epoch.fill_(-1)
@@ -2098,7 +2102,8 @@ class MixedContact:
 
                     self._bc_rigid_mesh_nodes = _from_numpy_i32(mesh_nodes_unique)
                     self._bc_rigid_mesh_node_count = wp.zeros(1, dtype=int)
-                    _assign_scalar(self._bc_rigid_mesh_node_count, len(mesh_nodes_unique))
+                    self._bc_rigid_mesh_node_count_host = len(mesh_nodes_unique)
+                    _assign_scalar(self._bc_rigid_mesh_node_count, self._bc_rigid_mesh_node_count_host)
                     self._bc_rigid_mesh_rigid_ids = _from_numpy_i32(mesh_rigid_ids)
                     self._bc_rigid_mesh_rigid_margin = _from_numpy_f32(rigid_margin)
                     self._bc_rigid_mesh_rigid_count = wp.zeros(1, dtype=int)
@@ -2377,7 +2382,7 @@ class MixedContact:
     def _launch_prefilter_mesh_node_activity(self):
         rm = self.rigidManager
         fsm = self.femSpringManager
-        n = int(_host_np(self._bc_rigid_mesh_node_count)[0])
+        n = int(getattr(self, "_bc_rigid_mesh_node_count_host", 0))
         if n <= 0:
             return
         wp.launch(
