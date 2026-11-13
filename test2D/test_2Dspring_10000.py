@@ -78,8 +78,11 @@ def test_2Dspring(headless=False, max_steps=None):
     min = np.min(pos, axis=0)
     max = np.max(pos, axis=0)
     print("Final position bounds:", min, max)
-    assert np.allclose(min, [0.25, -0.5278], atol=1e-2), "Min position out of expected range."
-    assert np.allclose(max, [0.85, 0.072], atol=1e-2), "Max position out of expected range."
+    if max_steps is None:
+        assert np.allclose(min, [0.25, -0.5278], atol=1e-2), "Min position out of expected range."
+        assert np.allclose(max, [0.85, 0.072], atol=1e-2), "Max position out of expected range."
+    else:
+        assert np.all(np.isfinite(pos)), "Simulation produced non-finite positions."
 
 
 if __name__ == "__main__":
