@@ -209,6 +209,69 @@ def _apply_joint_pd_velocity_kernel(
         motor_vel[j] = vel_target
 
 
+@wp.kernel
+def _apply_joint_pd_torque_kernel(
+    num_anchors: int,
+    dt: float,
+    revolute_type: int,
+    joint_id_a: wp.array(dtype=int),
+    joint_id_b: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    kpd_field: wp.array(dtype=wp.vec2),
+    joint_params: wp.array(dtype=vec6f),
+    quat: wp.array(dtype=float),
+    quat_initial: wp.array(dtype=float),
+    rot_v: wp.array(dtype=float),
+    control_target: wp.array(dtype=float),
+    inertia: wp.array(dtype=float),
+    motor_mode: wp.array(dtype=int),
+    accumulated_rotational_impulse: wp.array(dtype=float),
+):
+    """Compute independent joint torques and atomically accumulate body impulses."""
+    j = wp.tid()
+    if j >= num_anchors:
+        return
+    if joint_type[j] != revolute_type:
+        return
+
+    rigid_a = joint_id_a[j]
+    rigid_b = joint_id_b[j]
+    motor_mode[j] = 2
+
+    kp = kpd_field[j][0]
+    kd = kpd_field[j][1]
+    vel_limit = joint_params[j][4]
+    effort_limit = joint_params[j][5]
+    angle = (quat[rigid_b] - quat_initial[rigid_b]) - (quat[rigid_a] - quat_initial[rigid_a])
+    w_rel = rot_v[rigid_b] - rot_v[rigid_a]
+    angle_delta = control_target[j] - angle
+    pos_err = wp.atan2(wp.sin(angle_delta), wp.cos(angle_delta))
+    torque = kp * pos_err - kd * w_rel
+
+    if wp.abs(pos_err) < 1.0e-3 and wp.abs(w_rel) < 1.0e-3:
+        torque = 0.0
+
+    if effort_limit > 0.0:
+        torque = effort_limit * wp.tanh(torque / (effort_limit + 1.0e-6))
+        torque = wp.min(wp.max(torque, -effort_limit), effort_limit)
+
+    alpha_per_tau = 1.0 / (inertia[rigid_a] + 1.0e-6) + 1.0 / (inertia[rigid_b] + 1.0e-6)
+    if vel_limit > 0.0 and dt > 0.0 and alpha_per_tau > 0.0:
+        tau_min = (-vel_limit - w_rel) / (dt * alpha_per_tau)
+        tau_max = (vel_limit - w_rel) / (dt * alpha_per_tau)
+        torque = wp.min(wp.max(torque, tau_min), tau_max)
+
+    if effort_limit > 0.0 and dt > 0.0 and alpha_per_tau > 0.0:
+        max_acc = effort_limit * alpha_per_tau
+        stopping_err = 0.5 * w_rel * w_rel / (max_acc + 1.0e-6)
+        if wp.abs(pos_err) < stopping_err and pos_err * w_rel > 0.0:
+            brake_torque = -w_rel / (dt * (alpha_per_tau + 1.0e-9))
+            torque = wp.min(wp.max(brake_torque, -effort_limit), effort_limit)
+
+    wp.atomic_add(accumulated_rotational_impulse, rigid_a, -torque * dt)
+    wp.atomic_add(accumulated_rotational_impulse, rigid_b, torque * dt)
+
+
 # ---------------------------------------------------------------------------
 # Serial PGS (dim=1) — critical path kept as real Warp kernels
 # ---------------------------------------------------------------------------
@@ -5502,81 +5565,30 @@ class RigidManager:
         )
 
     def apply_joint_pd_torque_kernel(self, dt: float):
-        """PD control with per-joint stiffness/damping — TORQUE output.
-
-        Computes τ = kp * (target − angle) − kd * ω_rel
-
-        The physics engine's ``apply_motor_torques_kernel`` will convert
-        to world frame and apply ±τ on the connected bodies as accumulated_rotational_impulse
-        (external torque), identical to how MuJoCo / Isaac Lab operate.
-        """
+        """Compute joint PD torques on device and accumulate body impulses atomically."""
         if self.numAnchors <= 0:
             return
-        joint_id_a = self.joint_id_a.numpy()
-        joint_id_b = self.joint_id_b.numpy()
-        joint_type = self.joint_type.numpy()
-        kpd = self.kpd_field.numpy()
-        joint_params = self.joint_params.numpy()
-        quat = self.quat.numpy()
-        quat_initial = self.quat_initial.numpy()
-        rot_v = self.RotV.numpy()
-        control_target = self.joint_control_target.numpy()
-        inertia = self.inertia.numpy()
-        motor_modes = self.joint_motor_target_mode.numpy().copy()
-        accum_rot = self.accumulated_rotational_impulse.numpy().copy()
-
-        for j in range(self.numAnchors):
-            rigid_a = int(joint_id_a[j])
-            rigid_b = int(joint_id_b[j])
-            jointType = int(joint_type[j])
-
-            kp = float(kpd[j][0])
-            kd = float(kpd[j][1])
-            vel_limit = float(joint_params[j][4])
-            effort_lim = float(joint_params[j][5])
-            target_pos = float(control_target[j])
-
-            if jointType == 1:  # JointType.Revolute
-                motor_modes[j] = 2
-                qa = float(quat[rigid_a])
-                q0a = float(quat_initial[rigid_a])
-                qb = float(quat[rigid_b])
-                q0b = float(quat_initial[rigid_b])
-                wa = float(rot_v[rigid_a])
-                wb = float(rot_v[rigid_b])
-
-                angle = (qb - q0b) - (qa - q0a)
-                w_rel = wb - wa
-                pos_err = float(np.arctan2(np.sin(target_pos - angle), np.cos(target_pos - angle)))
-                torque_mag = kp * pos_err - kd * w_rel
-
-                if abs(pos_err) < 1e-3 and abs(w_rel) < 1e-3:
-                    torque_mag = 0.0
-
-                if effort_lim > 0.0:
-                    torque_mag = effort_lim * float(np.tanh(torque_mag / (effort_lim + 1e-6)))
-                    torque_mag = min(max(torque_mag, -effort_lim), effort_lim)
-
-                inertia_a = float(inertia[rigid_a])
-                inertia_b = float(inertia[rigid_b])
-                alpha_per_tau = 1.0 / (inertia_a + 1e-6) + 1.0 / (inertia_b + 1e-6)
-                if vel_limit > 0.0 and dt > 0.0 and alpha_per_tau > 0.0:
-                    tau_min = (-vel_limit - w_rel) / (dt * alpha_per_tau)
-                    tau_max = (vel_limit - w_rel) / (dt * alpha_per_tau)
-                    torque_mag = min(max(torque_mag, tau_min), tau_max)
-
-                if effort_lim > 0.0 and dt > 0.0 and alpha_per_tau > 0.0:
-                    max_acc = effort_lim * alpha_per_tau
-                    stopping_err = 0.5 * w_rel * w_rel / (max_acc + 1e-6)
-                    if abs(pos_err) < stopping_err and pos_err * w_rel > 0.0:
-                        brake_tau = -w_rel / (dt * (alpha_per_tau + 1e-9))
-                        torque_mag = min(max(brake_tau, -effort_lim), effort_lim)
-
-                accum_rot[rigid_a] -= torque_mag * dt
-                accum_rot[rigid_b] += torque_mag * dt
-
-        self.joint_motor_target_mode.assign(motor_modes)
-        self.accumulated_rotational_impulse.assign(accum_rot)
+        wp.launch(
+            _apply_joint_pd_torque_kernel,
+            dim=self.numAnchors,
+            inputs=[
+                int(self.numAnchors),
+                float(dt),
+                int(JointType.Revolute),
+                self.joint_id_a,
+                self.joint_id_b,
+                self.joint_type,
+                self.kpd_field,
+                self.joint_params,
+                self.quat,
+                self.quat_initial,
+                self.RotV,
+                self.joint_control_target,
+                self.inertia,
+                self.joint_motor_target_mode,
+                self.accumulated_rotational_impulse,
+            ],
+        )
 
     def _calculate_bc_for_index(self, idx, dt):
         """Accumulate boundary-condition forces/torques into accumulated_impulse
