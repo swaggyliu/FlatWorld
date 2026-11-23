@@ -116,6 +116,99 @@ def _update_joint_motor_velocity_targets_kernel(
         joint_motor_target_vel[j] = cmd
 
 
+@wp.kernel
+def _apply_joint_pd_velocity_kernel(
+    num_anchors: int,
+    control_dt: float,
+    revolute_type: int,
+    prismatic_type: int,
+    joint_id_a: wp.array(dtype=int),
+    joint_id_b: wp.array(dtype=int),
+    joint_axis: wp.array(dtype=wp.vec2),
+    joint_type: wp.array(dtype=int),
+    kpd_field: wp.array(dtype=wp.vec2),
+    joint_params: wp.array(dtype=vec6f),
+    quat: wp.array(dtype=float),
+    quat_initial: wp.array(dtype=float),
+    rot_v: wp.array(dtype=float),
+    control_target: wp.array(dtype=float),
+    rigid_params: wp.array(dtype=wp.vec2, ndim=2),
+    lin_v: wp.array(dtype=wp.vec2),
+    motor_mode: wp.array(dtype=int),
+    motor_vel: wp.array(dtype=float),
+):
+    j = wp.tid()
+    if j >= num_anchors:
+        return
+
+    rigid_a = joint_id_a[j]
+    rigid_b = joint_id_b[j]
+    kind = joint_type[j]
+    kp = kpd_field[j][0]
+    kd = kpd_field[j][1]
+    lower_limit = joint_params[j][2]
+    upper_limit = joint_params[j][3]
+    vel_limit = joint_params[j][4]
+
+    if kind == revolute_type:
+        motor_mode[j] = 0
+        qa = quat[rigid_a]
+        q0a = quat_initial[rigid_a]
+        qb = quat[rigid_b]
+        q0b = quat_initial[rigid_b]
+        wa = rot_v[rigid_a]
+        wb = rot_v[rigid_b]
+
+        angle = (qb - q0b) - (qa - q0a)
+        target_pos = control_target[j]
+        if lower_limit < upper_limit:
+            if target_pos < lower_limit:
+                target_pos = lower_limit
+            elif target_pos > upper_limit:
+                target_pos = upper_limit
+
+        angle_delta = target_pos - angle
+        pos_err = wp.atan2(wp.sin(angle_delta), wp.cos(angle_delta))
+        w_rel = wb - wa
+        vel_target = kp / control_dt * pos_err - kd * w_rel
+
+        if control_dt > 0.0:
+            max_vel_from_error = 0.5 * wp.abs(pos_err) / control_dt
+            if vel_target > max_vel_from_error:
+                vel_target = max_vel_from_error
+            elif vel_target < -max_vel_from_error:
+                vel_target = -max_vel_from_error
+        if vel_limit > 0.0:
+            if vel_target > vel_limit:
+                vel_target = vel_limit
+            elif vel_target < -vel_limit:
+                vel_target = -vel_limit
+        motor_vel[j] = vel_target
+
+    elif kind == prismatic_type:
+        target_pos = control_target[j]
+        axis_world = joint_axis[j]
+        pos_a = rigid_params[rigid_a, 0]
+        pos_b = rigid_params[rigid_b, 0]
+        rel_pos = wp.dot(pos_b - pos_a, axis_world)
+        pos_err = target_pos - rel_pos
+        vel_err = wp.dot(lin_v[rigid_b] - lin_v[rigid_a], axis_world)
+        vel_target = kp * pos_err - kd * vel_err
+
+        if control_dt > 0.0:
+            max_vel_from_error = 0.5 * wp.abs(pos_err) / control_dt
+            if vel_target > max_vel_from_error:
+                vel_target = max_vel_from_error
+            elif vel_target < -max_vel_from_error:
+                vel_target = -max_vel_from_error
+        if vel_limit > 0.0:
+            if vel_target > vel_limit:
+                vel_target = vel_limit
+            elif vel_target < -vel_limit:
+                vel_target = -vel_limit
+        motor_vel[j] = vel_target
+
+
 # ---------------------------------------------------------------------------
 # Serial PGS (dim=1) — critical path kept as real Warp kernels
 # ---------------------------------------------------------------------------
@@ -5380,96 +5473,33 @@ class RigidManager:
         )
 
     def apply_joint_pd_velocity_kernel(self, dt: float):
-        """PD control with per-joint stiffness/damping — VELOCITY-MOTOR output.
-
-        Computes a velocity target from the PD position error and writes it
-        to the anchor's RotV so the constraint-solver velocity motor enforces
-        it implicitly.  This avoids the instability caused by coupling
-        explicit accumulated_rotational_impulse torques with the iterative PGS position constraint.
-
-        Velocity target:  ω_target = kp · (θ_target − θ)
-        The kd gain is used as optional pre-damping: the effective velocity
-        written is  ω_target − (kd/kp) · ω_rel  when kp > 0.
-        """
+        """Compute per-joint PD velocity targets on device."""
         if self.numAnchors <= 0:
             return
-        joint_id_a = self.joint_id_a.numpy()
-        joint_id_b = self.joint_id_b.numpy()
-        joint_axis = self.joint_axis.numpy()
-        joint_type = self.joint_type.numpy()
-        kpd = self.kpd_field.numpy()
-        joint_params = self.joint_params.numpy()
-        quat = self.quat.numpy()
-        quat_initial = self.quat_initial.numpy()
-        rot_v = self.RotV.numpy()
-        control_target = self.joint_control_target.numpy()
-        rigid_params = self.rigidParams.numpy()
-        lin_v = self.V.numpy()
-        motor_modes = self.joint_motor_target_mode.numpy().copy()
-        motor_vels = self.joint_motor_target_vel.numpy().copy()
-
-        for j in range(self.numAnchors):
-            rigid_a = int(joint_id_a[j])
-            rigid_b = int(joint_id_b[j])
-            axis_local = joint_axis[j]
-            jointType = int(joint_type[j])
-
-            kp = float(kpd[j][0])
-            kd = float(kpd[j][1])
-            lower_limit = float(joint_params[j][2])
-            upper_limit = float(joint_params[j][3])
-            vel_limit = float(joint_params[j][4])
-
-            if jointType == JointType.Revolute:
-                motor_modes[j] = 0
-                qa = float(quat[rigid_a])
-                q0a = float(quat_initial[rigid_a])
-                qb = float(quat[rigid_b])
-                q0b = float(quat_initial[rigid_b])
-                wa = float(rot_v[rigid_a])
-                wb = float(rot_v[rigid_b])
-
-                angle = (qb - q0b) - (qa - q0a)
-                target_pos = float(control_target[j])
-
-                if lower_limit < upper_limit:
-                    target_pos = min(max(target_pos, lower_limit), upper_limit)
-
-                pos_err = float(np.arctan2(np.sin(target_pos - angle), np.cos(target_pos - angle)))
-                w_rel = wb - wa
-                ctrl_dt = float(self.control_dt)
-                vel_target = kp / ctrl_dt * pos_err - kd * w_rel
-                max_step_gain = 0.5
-                if ctrl_dt > 0.0:
-                    max_vel_from_error = max_step_gain * abs(pos_err) / ctrl_dt
-                    vel_target = min(max(vel_target, -max_vel_from_error), max_vel_from_error)
-                if vel_limit > 0.0:
-                    vel_target = min(max(vel_target, -vel_limit), vel_limit)
-                motor_vels[j] = vel_target
-            elif jointType == JointType.Prismatic:
-                target_pos = float(control_target[j])
-                posA = rigid_params[rigid_a, 0]
-                posB = rigid_params[rigid_b, 0]
-                axis_world = np.asarray(axis_local, dtype=np.float32).reshape(-1)
-                rel_pos = float(np.dot(posB - posA, axis_world[:2]))
-                pos_err = target_pos - rel_pos
-
-                vel_err = float(np.dot(lin_v[rigid_b] - lin_v[rigid_a], axis_world[:2]))
-                vel_target = kp * pos_err - kd * vel_err
-
-                max_step_gain = 0.5
-                ctrl_dt = float(self.control_dt)
-                if ctrl_dt > 0.0:
-                    max_vel_from_error = max_step_gain * abs(pos_err) / ctrl_dt
-                    vel_target = min(max(vel_target, -max_vel_from_error), max_vel_from_error)
-
-                if vel_limit > 0.0:
-                    vel_target = min(max(vel_target, -vel_limit), vel_limit)
-
-                motor_vels[j] = vel_target
-
-        self.joint_motor_target_mode.assign(motor_modes)
-        self.joint_motor_target_vel.assign(motor_vels)
+        wp.launch(
+            _apply_joint_pd_velocity_kernel,
+            dim=self.numAnchors,
+            inputs=[
+                int(self.numAnchors),
+                float(self.control_dt),
+                int(JointType.Revolute),
+                int(JointType.Prismatic),
+                self.joint_id_a,
+                self.joint_id_b,
+                self.joint_axis,
+                self.joint_type,
+                self.kpd_field,
+                self.joint_params,
+                self.quat,
+                self.quat_initial,
+                self.RotV,
+                self.joint_control_target,
+                self.rigidParams,
+                self.V,
+                self.joint_motor_target_mode,
+                self.joint_motor_target_vel,
+            ],
+        )
 
     def apply_joint_pd_torque_kernel(self, dt: float):
         """PD control with per-joint stiffness/damping — TORQUE output.
